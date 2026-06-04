@@ -1,4 +1,14 @@
+import base64
 import json
+import mimetypes
+import random
+import string
+import uuid
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import requests
+from functions import upload_file
 
 
 def extract_system(messages):
@@ -45,3 +55,154 @@ def extract_tool_results(messages):
         if i["role"] == "tool":
             tools_final += f"""Tool result for {i["name"]}:\n{i["content"]}. Tool Call ID: {i["tool_call_id"]}\n"""
     return tools_final if tools_final != "" else None
+
+
+def extract_and_upload_files(messages, auth_token):
+    result_fileids = []
+    for i in messages:
+        if isinstance(i["content"],str):
+            continue
+        for j in i["content"]:
+            if j["type"] == "text":
+                continue
+            elif j["type"] == "image_url":
+                if j["image_url"]["url"].startswith("http"):
+                    url_path = urlsplit(j["image_url"]["url"]).path
+                    filename = Path(url_path).name
+                    mime_type, _ = mimetypes.guess_type(filename)
+                    file_bytes = requests.get(j["image_url"]["url"]).content
+
+                    for k in upload_file(file_bytes, filename, mime_type, auth_token):
+                        if k[0] == "uploaded":
+                            continue
+                        elif k[0] == "success":
+                            result_fileids.append(k[1])
+                        else:
+                            print("Error while uploading file.")
+
+                else:
+                    mimetype_base, base64_data = url.split(",")
+                    mime_type = mimetype_base.split(":")[1].split(";")[0]
+                    filename = (
+                        "inline_uploaded_"
+                        + str(uuid.uuid4())
+                        + mimetypes.guess_extension(mime_type)
+                    )
+                    data_bytes = base64.b64decode(
+                        base64_data.split("data:")[1].encode()
+                    )
+                    for k in upload_file(data_bytes, filename, mime_type, auth_token):
+                        if k[0] == "uploaded":
+                            continue
+                        elif k[0] == "success":
+                            result_fileids.append(k[1])
+                        else:
+                            print("Error while uploading file.")
+            elif j["type"] == "file":
+                if "file_id" in j["file"]:
+                    result_fileids.append(j"file_id"])
+                if "file_data" j["file"]:
+                    filename = j["file"]["filename"]
+                    mimetype_base, base64_data = j["image_url"]["url"].split(",")
+
+                    mime_type = mimetype_base.split(":")[1].split(";")[0]
+                    data_bytes = base64.b64decode(
+                        base64_data.split("data:")[1].encode()
+                    )
+                    for k in upload_file(data_bytes, filename, mime_type, auth_token):
+                        if k[0] == "uploaded":
+                            continue
+                        elif k[0] == "success":
+                            result_fileids.append(k[1])
+                        else:
+                            print("Error while uploading file.")
+            elif j["type"] == "document" or j["type"] == "image":
+                if j["source"]["type"] == "base64":
+                    base64_data =j["source"]["data"].split(",")[0]
+                    mime_type = j["source"]["media_type"]
+                    filename = (
+                        "inline_uploaded_"
+                        + str(uuid.uuid4())
+                        + mimetypes.guess_extension(mime_type)
+                    )
+                    data_bytes = base64.b64decode(
+                        base64_data.split("data:")[1].encode()
+                    )
+                    for k in upload_file(data_bytes, filename, mime_type, auth_token):
+                        if k[0] == "uploaded":
+                            continue
+                        elif k[0] == "success":
+                            result_fileids.append(k[1])
+                        else:
+                            print("Error while uploading file.")
+                elif j["source"]["type"] == "file":
+                    result_fileids.append(j["source"]["file_id"])
+    return result_fileids
+
+
+def extract_user_msg(messages):
+    for i in messages[::-1]:
+        if i["role"] == "user":
+            if isinstance(i["content"],str):
+                return i["content"]
+            else:
+                for j in i["content"]:
+                    if j["type"] == "text":
+                        return j["text"]
+
+
+def build_prompt(messages, tools, is_first_message=False):
+    final_prompt=""
+    tools_extract = extract_tools(tools)
+    if tools_extract:
+        final_prompt += f"""[TOOLS]\n{tools_extract}\n\n"""
+    if is_first_message:
+        system_prompt = extract_system(messages)
+        final_prompt += f"[SYSTEM]\n{system_prompt}\n\n"
+    tools_result_extract = extract_tool_results(messages)
+    if tools_result_extract:
+        final_prompt += f"""[TOOL RESULTS]\n{tools_result_extract}\n\n"""
+    final_prompt += f"""[USER]\n{extract_user_msg(messages)}\n\n"""
+    if tools_extract:
+        final_prompt += """If you need to use a tool, after your full response write on the last line:
+TOOL_CALL: tool_name({"param": "value"})
+You can call as many tools you want to call in similar way. If no tool needed, write nothing extra.
+"""
+    return final_prompt
+
+
+def parse_tool_call(response_text):
+    tools_called = []
+    lines = response_text.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    for i in lines:
+        if "TOOL: " in i:
+            lines.pop(i)
+            tool_data = i.split("TOOL_CALL: ")[1]
+            tool_split = tool_data.split("(")
+            tool_name = tool_split[0]
+            tool_args = tool_split[1].split(")")[0]
+            tool_args_json = json.loads(tool_args)
+            characters = string.ascii_letters + string.digits
+            call_id = "call_" + "".join(random.choices(characters, k=8))
+            if tool_name not in ["computer_use", "bash", "text_editor"]:
+                tools_called.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": tool_name, "arguments": tool_args_json},
+                    }
+                )
+            else:
+                tools_called.append(
+                    {
+                        "id": call_id,
+                        "type": tool_name,
+                        "function": {"name": tool_name, "arguments": tool_args_json},
+                    }
+                )
+    if tools_called == []:
+        return (response_text, None)
+    response_text_new = "\n".join(lines)
+    return (response_text_new, tools_called)
