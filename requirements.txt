@@ -1,0 +1,8 @@
+wasmtime
+numpy
+playwright
+requests
+litellm[proxy]
+prisma
+pgserver
+uvicorn
