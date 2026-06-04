@@ -60,7 +60,7 @@ def extract_tool_results(messages):
 def extract_and_upload_files(messages, auth_token):
     result_fileids = []
     for i in messages:
-        if isinstance(i["content"],str):
+        if isinstance(i["content"], str):
             continue
         for j in i["content"]:
             if j["type"] == "text":
@@ -81,7 +81,7 @@ def extract_and_upload_files(messages, auth_token):
                             print("Error while uploading file.")
 
                 else:
-                    mimetype_base, base64_data = url.split(",")
+                    mimetype_base, base64_data = j["image_url"]["url"].split(",")
                     mime_type = mimetype_base.split(":")[1].split(";")[0]
                     filename = (
                         "inline_uploaded_"
@@ -100,10 +100,10 @@ def extract_and_upload_files(messages, auth_token):
                             print("Error while uploading file.")
             elif j["type"] == "file":
                 if "file_id" in j["file"]:
-                    result_fileids.append(j"file_id"])
-                if "file_data" j["file"]:
+                    result_fileids.append(j["file_id"])
+                if "file_data" in j["file"]:
                     filename = j["file"]["filename"]
-                    mimetype_base, base64_data = j["image_url"]["url"].split(",")
+                    mimetype_base, base64_data = j["file_data"].split(",")
 
                     mime_type = mimetype_base.split(":")[1].split(";")[0]
                     data_bytes = base64.b64decode(
@@ -118,16 +118,14 @@ def extract_and_upload_files(messages, auth_token):
                             print("Error while uploading file.")
             elif j["type"] == "document" or j["type"] == "image":
                 if j["source"]["type"] == "base64":
-                    base64_data =j["source"]["data"].split(",")[0]
+                    base64_data = j["source"]["data"].split(",")[1]
                     mime_type = j["source"]["media_type"]
                     filename = (
                         "inline_uploaded_"
                         + str(uuid.uuid4())
                         + mimetypes.guess_extension(mime_type)
                     )
-                    data_bytes = base64.b64decode(
-                        base64_data.split("data:")[1].encode()
-                    )
+                    data_bytes = base64.b64decode(base64_data.encode())
                     for k in upload_file(data_bytes, filename, mime_type, auth_token):
                         if k[0] == "uploaded":
                             continue
@@ -143,7 +141,7 @@ def extract_and_upload_files(messages, auth_token):
 def extract_user_msg(messages):
     for i in messages[::-1]:
         if i["role"] == "user":
-            if isinstance(i["content"],str):
+            if isinstance(i["content"], str):
                 return i["content"]
             else:
                 for j in i["content"]:
@@ -152,13 +150,14 @@ def extract_user_msg(messages):
 
 
 def build_prompt(messages, tools, is_first_message=False):
-    final_prompt=""
+    final_prompt = ""
     tools_extract = extract_tools(tools)
     if tools_extract:
         final_prompt += f"""[TOOLS]\n{tools_extract}\n\n"""
     if is_first_message:
         system_prompt = extract_system(messages)
-        final_prompt += f"[SYSTEM]\n{system_prompt}\n\n"
+        if system_prompt:
+            final_prompt += f"[SYSTEM]\n{system_prompt}\n\n"
     tools_result_extract = extract_tool_results(messages)
     if tools_result_extract:
         final_prompt += f"""[TOOL RESULTS]\n{tools_result_extract}\n\n"""
@@ -174,15 +173,15 @@ You can call as many tools you want to call in similar way. If no tool needed, w
 def parse_tool_call(response_text):
     tools_called = []
     lines = response_text.split("\n")
+    new_lines = []
     while lines and not lines[-1].strip():
         lines.pop()
     for i in lines:
-        if "TOOL: " in i:
-            lines.pop(i)
+        if "TOOL_CALL: " in i:
             tool_data = i.split("TOOL_CALL: ")[1]
-            tool_split = tool_data.split("(")
-            tool_name = tool_split[0]
-            tool_args = tool_split[1].split(")")[0]
+            tool_split = tool_data[tool_data.find("(") + 1 :]
+            tool_name = tool_data[: tool_data.find("(")].strip()
+            tool_args = tool_split.rsplit(")", 1)[0]
             tool_args_json = json.loads(tool_args)
             characters = string.ascii_letters + string.digits
             call_id = "call_" + "".join(random.choices(characters, k=8))
@@ -202,7 +201,10 @@ def parse_tool_call(response_text):
                         "function": {"name": tool_name, "arguments": tool_args_json},
                     }
                 )
+        else:
+            new_lines.append(i)
     if tools_called == []:
         return (response_text, None)
-    response_text_new = "\n".join(lines)
+
+    response_text_new = "\n".join(new_lines)
     return (response_text_new, tools_called)

@@ -149,7 +149,7 @@ def send_message(
         "model_type": model_type,
         "prompt": message,
         "ref_file_ids": file_ids,
-        "thinking_enabled": False,
+        "thinking_enabled": thinking,
         "search_enabled": True,
         "preempt": False,
         "action": None,
