@@ -9,8 +9,8 @@ class DeeperSeekerProvider(CustomLLM):
         if not os.path.exists("auth_token.txt"):
             print("Auth Token not added, run add_auth_token.txt to add it first.")
             print("For more see docs.")
-            exit()
-        self.auth_token = open("auth_token.txt").read()
+            os._exit(0)
+        self.auth_token = open("auth_token.txt").read().strip()
 
     def completion(self, model, messages, kwargs):
         pass

@@ -1,10 +1,11 @@
 import base64
 import json
+import mimetypes
 import os
 import time
+from datetime import datetime, timezone
 
 import requests
-import mimetypes
 import wasmtime
 
 wasm_path = "wasm/deepseek_pow_solver.wasm"
@@ -138,8 +139,38 @@ def send_message(
     thinking=False,
     search=False,
     model_type=None,
-    file_ids=[],
+    file_ids_=[],
 ):
+    if model_type == "expert":
+        file_ids_ = []
+    elif model_type == "vision" and file_ids != []:
+        headers = get_headers(auth_token)
+        file_ids = []
+        for i in file_ids_:
+            json_data = {
+                "file_id": i,
+                "to_model_type": "vision",
+            }
+            response = requests.post(
+                "https://chat.deepseek.com/api/v0/file/fork_file_task",
+                headers=headers,
+                json=json_data,
+            ).json()
+            status = response["data"]["biz_data"]["status"]
+            file_id = response["data"]["biz_data"]["id"]
+            while status in ["PENDING", "PARSING"]:
+                time.sleep(0.3)
+                resp = requests.get(
+                    "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids="
+                    + file_id,
+                    headers=headers,
+                    cookies=COOKIE,
+                ).json()
+                status = response["data"]["biz_data"]["files"][0]["status"]
+            file_ids.append(file_id)
+    else:
+        file_ids = file_ids_
+
     url = "https://chat.deepseek.com/api/v0/chat/completion"
     headers = get_headers(
         auth_token, solve_create_pow("/api/v0/chat/completion", auth_token)
@@ -208,7 +239,7 @@ def upload_file(file_bytes, file_name, file_content_type, auth_token):
     ).json()
     file_id = response["data"]["biz_data"]["id"]
     yield ("uploaded", file_id)
-    js_data = response["data"]["biz_data"]["files"][0]
+    js_data = response["data"]["biz_data"]
     status = js_data["status"]
     headers = get_headers(auth_token)
     while status in ["PENDING", "PARSING"]:
@@ -223,22 +254,18 @@ def upload_file(file_bytes, file_name, file_content_type, auth_token):
         status = js_data["status"]
 
     if status == "SUCCESS":
-        tp_data=dt = datetime.fromtimestamp(js_data["updated_at"], timezone.utc)
+        tp_data = datetime.fromtimestamp(js_data["updated_at"], timezone.utc)
         yield (
             "success",
             {
                 "file_id": file_id,
                 "openai_timestamp": int(js_data["updated_at"]),
-                "filename":js_data["file_name"],
-                "mime_type": mimetypes.guess_extension(js_data["file_name"]),
-                "size":js_data['file_size'],
-                "anthropic_timestamp":tp_data.strftime("%Y-%m-%dT%H:%M:%SZ")
-
+                "size": js_data["file_size"],
+                "anthropic_timestamp": tp_data.strftime("%Y-%m-%dT%H:%M:%SZ"),
             },
         )
     else:
-        "type": "file",
-  yield ("error", file_id)
+        yield ("error", file_id)
 
 
 def get_file_content(auth_token, file_id):
@@ -248,6 +275,7 @@ def get_file_content(auth_token, file_id):
         headers=headers,
         cookies=COOKIE,
     ).json()
+    yield mimetypes.guess_type(resp["data"]["biz_data"]["files"][0]["file_name"])[0]
     file_path = (
         "https://files.deepseeksvc.com/api"
         + resp["data"]["biz_data"]["files"][0]["signed_path"]
