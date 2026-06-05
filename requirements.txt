@@ -6,3 +6,5 @@ litellm[proxy]
 prisma
 pgserver
 uvicorn
+dotenv
+psycopg2-binary

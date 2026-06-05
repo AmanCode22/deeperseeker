@@ -4,6 +4,7 @@ import os
 import time
 
 import requests
+import mimetypes
 import wasmtime
 
 wasm_path = "wasm/deepseek_pow_solver.wasm"
@@ -207,7 +208,8 @@ def upload_file(file_bytes, file_name, file_content_type, auth_token):
     ).json()
     file_id = response["data"]["biz_data"]["id"]
     yield ("uploaded", file_id)
-    status = response["data"]["biz_data"]["status"]
+    js_data = response["data"]["biz_data"]["files"][0]
+    status = js_data["status"]
     headers = get_headers(auth_token)
     while status in ["PENDING", "PARSING"]:
         yield ("uploaded", file_id)
@@ -217,12 +219,26 @@ def upload_file(file_bytes, file_name, file_content_type, auth_token):
             headers=headers,
             cookies=COOKIE,
         ).json()
-        status = resp["data"]["biz_data"]["files"][0]["status"]
+        js_data = resp["data"]["biz_data"]["files"][0]
+        status = js_data["status"]
 
     if status == "SUCCESS":
-        yield ("success", file_id)
+        tp_data=dt = datetime.fromtimestamp(js_data["updated_at"], timezone.utc)
+        yield (
+            "success",
+            {
+                "file_id": file_id,
+                "openai_timestamp": int(js_data["updated_at"]),
+                "filename":js_data["file_name"],
+                "mime_type": mimetypes.guess_extension(js_data["file_name"]),
+                "size":js_data['file_size'],
+                "anthropic_timestamp":tp_data.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            },
+        )
     else:
-        yield ("error", file_id)
+        "type": "file",
+  yield ("error", file_id)
 
 
 def get_file_content(auth_token, file_id):

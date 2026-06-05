@@ -14,7 +14,8 @@ litellm_settings:
     - provider: "deeperseeker"
       custom_handler: "deeperseeker_plugin.deeperseeker_instance"
 
-general_settings:
-  master_key: "dkseeker"
-  ui_username: "admin"
-  database_url: "postgresql://postgres:@/postgres?host=litellm_db"
+users:
+  - user_id: "admin"
+    role: "proxy_admin"
+  - user_id: "default_user_id"
+    role: "proxy_admin"

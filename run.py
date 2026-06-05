@@ -1,10 +1,16 @@
 import asyncio
 import os
-import subprocess
 import threading
+from contextlib import asynccontextmanager
 
 import pgserver
 import uvicorn
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from litellm.proxy.proxy_server import app, initialize, proxy_config, user_api_key_cache
+
+security_scheme = HTTPBearer()
 
 db = pgserver.get_server("./litellm_db")
 raw_uri = db.get_uri()
@@ -12,12 +18,12 @@ raw_uri = db.get_uri()
 socket_dir = raw_uri.split("host=")[1].split("&")[0]
 unix_socket_path = os.path.join(socket_dir, ".s.PGSQL.5432")
 
-TCP_PORT = 5432
-db_uri = f"postgresql://postgres@127.0.0.1:{TCP_PORT}/postgres"
+
+db_uri = f"postgresql://postgres@127.0.0.1:5432/postgres"
 print(f"Database URI: {db_uri}")
 
+load_dotenv()
 os.environ["DATABASE_URL"] = db_uri
-os.environ["LITELLM_MASTER_KEY"] = "dkseeker"
 
 
 async def pipe(reader, writer):
@@ -58,8 +64,8 @@ def run_bridge_thread():
     asyncio.set_event_loop(loop)
 
     async def start_server():
-        server = await asyncio.start_server(handle_tcp_client, "127.0.0.1", TCP_PORT)
-        print(f"Started bridge for pgserver on port {TCP_PORT}")
+        server = await asyncio.start_server(handle_tcp_client, "127.0.0.1", 5432)
+        print(f"Started bridge for pgserver on port 5432")
         async with server:
             await server.serve_forever()
 
@@ -69,20 +75,30 @@ def run_bridge_thread():
 bridge_thread = threading.Thread(target=run_bridge_thread, daemon=True)
 bridge_thread.start()
 
-import time
 
-time.sleep(1)
+@app.post("/customfile")
+async def files_api_ovveride(
+    credentials: HTTPAuthorizationCredentials = Depends(security_scheme),
+):
+    api_key = credentials.credentials
+    key_row = await user_api_key_cache.async_get(api_key)
+    return key_row
 
-from litellm.proxy.proxy_server import app, initialize, proxy_config
 
-config_path = "config.yaml"
+original_lifespan = app.router.lifespan_context
 
 
-@app.on_event("startup")
-async def startup_event():
-    await initialize(config=config_path, master_key="dkseeker")
-    await proxy_config.load_config(router=app.router, config_file_path=config_path)
+@asynccontextmanager
+async def custom_lifespan(fastapi_app: FastAPI):
+    print("Running litellm server")
 
+    await initialize(config="config.yaml")
+
+    async with original_lifespan(fastapi_app) as state:
+        yield state
+
+
+app.router.lifespan_context = custom_lifespan
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=4000)
