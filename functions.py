@@ -182,7 +182,7 @@ def send_message(
         "prompt": message,
         "ref_file_ids": file_ids,
         "thinking_enabled": thinking,
-        "search_enabled": True,
+        "search_enabled": search,
         "preempt": False,
         "action": None,
     }
@@ -285,31 +285,3 @@ def get_file_content(auth_token, file_id):
         for chunk in data.iter_content(chunk_size=8192):
             if chunk:
                 yield chunk
-
-
-def list_api_keys():
-    if not os.path.exists("api_keys.json"):
-        with open("api_keys.json", "w") as f:
-            f.write("{}")
-            return {}
-    return json.load(open("api_keys.json"))
-
-
-def create_api_key(api_key):
-    current_list = json.load(open("api_keys.json"))
-    current_list[api_key] = "NOT_CREATED_YET"
-    with open("api_keys.json", "w") as f:
-        json.dump(current_list, f)
-
-
-def get_api_key_session_id(api_key, auth_token):
-    api_keys = json.load(open("api_keys.json"))
-    if api_key not in api_keys.keys():
-        return None
-    session_id = api_keys[api_key]
-    if session_id == "NOT_CREATED_YET":
-        session_id = create_new_chat(auth_token)
-        with open("api_keys.json", "w") as f:
-            api_keys[api_key] = session_id
-            json.dump(api_keys, f)
-    return session_id
