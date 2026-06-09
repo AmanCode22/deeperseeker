@@ -234,7 +234,123 @@ class DeeperSeekerProvider(CustomLLM):
             choices=[
                 StreamingChoices(
                     index=0,
-                    delta=ChatCompletionStreamResponseDelta(content=None),
+                    delta=ChatCompletionStreamResponseDelta(
+                        role="assistant", content=None
+                    ),
+                    finish_reason="tool_calls" if tools_called else "stop",
+                )
+            ],
+            metadata={
+                "session_id": session_id,
+                "parent_message_id": parent_message_id + 2,
+            },
+        )
+
+    async def astreaming(self, model, messages, kwargs):
+        metadata = kwargs.get("metadata", {})
+        if (
+            metadata == {}
+            or metadata.get("session_id") is None
+            or metadata.get("parent_message_id") is None
+        ):
+            session_id = await asyncio.to_thread(create_new_chat, self.auth_token)
+            parent_message_id = 0
+        else:
+            session_id = metadata["session_id"]
+            parent_message_id = metadata["parent_message_id"]
+        file_ids = await asyncio.to_thread(
+            extract_and_upload_files, messages, self.auth_token
+        )
+        tools = kwargs.get("tools", [])
+        prompt = await asyncio.to_thread(
+            build_prompt, messages, tools, parent_message_id == 0
+        )
+        generator_message = await asyncio.to_thread(
+            send_message,
+            session_id,
+            self.auth_token,
+            prompt,
+            parent_message_id,
+            kwargs.get("thinking", False),
+            kwargs.get("search_needed", False),
+            None if model == "instant" else model,
+            file_ids,
+        )
+        completion_id = f"chatcmpl-{uuid.uuid4()}"
+        created_time = int(time.time())
+        response = ""
+        END = object()
+        while True:
+            chunk = await asyncio.to_thread(next, generator_message, END)
+            if chunk is END:
+                break
+            response += chunk
+        parsed, tools_called = await asyncio.to_thread(parse_tool_call, response)
+        parsed_stream = [parsed[i : i + 12] for i in range(0, len(parsed), 12)]
+        for i in parsed_stream:
+            await asyncio.sleep(0)
+            yield ModelResponseStream(
+                id=completion_id,
+                object="chat.completion.chunk",
+                created=created_time,
+                model=model,
+                choices=[
+                    StreamingChoices(
+                        index=0,
+                        delta=ChatCompletionStreamResponseDelta(
+                            role="assistant", content=i
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+            )
+        if tools_called:
+            for tool_index, j in enumerate(tools_called):
+                tool_id = j["id"]
+                name = j["function"]["name"]
+                args = j["function"]["arguments"]
+                args = json.dumps(args)
+                arg_chunks = [args[k : k + 8] for k in range(0, len(args), 8)]
+                for chunk_id, arg_piece in enumerate(arg_chunks):
+                    if chunk_id == 0:
+                        delta_tool = ChatCompletionDeltaToolCall(
+                            index=tool_index,
+                            id=tool_id,
+                            type="function",
+                            function=FunctionDelta(name=name, arguments=arg_piece),
+                        )
+                    else:
+                        delta_tool = ChatCompletionDeltaToolCall(
+                            index=tool_index,
+                            function=FunctionDelta(arguments=arg_piece),
+                        )
+                    yield ModelResponseStream(
+                        id=completion_id,
+                        object="chat.completion.chunk",
+                        created=created_time,
+                        model=model,
+                        choices=[
+                            StreamingChoices(
+                                index=0,
+                                delta=ChatCompletionStreamResponseDelta(
+                                    role="assistant", tool_calls=[delta_tool]
+                                ),
+                                finish_reason=None,
+                            )
+                        ],
+                    )
+
+        yield ModelResponseStream(
+            id=completion_id,
+            object="chat.completion.chunk",
+            created=created_time,
+            model=model,
+            choices=[
+                StreamingChoices(
+                    index=0,
+                    delta=ChatCompletionStreamResponseDelta(
+                        role="assistant", content=None
+                    ),
                     finish_reason="tool_calls" if tools_called else "stop",
                 )
             ],
