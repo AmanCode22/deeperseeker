@@ -151,13 +151,13 @@ def send_message(
                 "file_id": i,
                 "to_model_type": "vision",
             }
-            response = requests.post(
+            resp = requests.post(
                 "https://chat.deepseek.com/api/v0/file/fork_file_task",
                 headers=headers,
                 json=json_data,
             ).json()
-            status = response["data"]["biz_data"]["status"]
-            file_id = response["data"]["biz_data"]["id"]
+            status = resp["data"]["biz_data"]["status"]
+            file_id = resp["data"]["biz_data"]["id"]
             while status in ["PENDING", "PARSING"]:
                 time.sleep(0.3)
                 resp = requests.get(
@@ -166,7 +166,7 @@ def send_message(
                     headers=headers,
                     cookies=COOKIE,
                 ).json()
-                status = response["data"]["biz_data"]["files"][0]["status"]
+                status = resp["data"]["biz_data"]["files"][0]["status"]
             file_ids.append(file_id)
     else:
         file_ids = file_ids_

@@ -1,13 +1,13 @@
 model_list:
   - model_name: instant
     litellm_params:
-      model: "deeperseeker/deepseek-v4-flash"
+      model: "instant"
   - model_name: vision
     litellm_params:
-      model: "deeperseeker/deepseek-v4-vision"
+      model: "vision"
   - model_name: expert
     litellm_params:
-      model: "deeperseeker/deepseek-v4-pro"
+      model: "expert"
 
 litellm_settings:
   custom_provider_map:
