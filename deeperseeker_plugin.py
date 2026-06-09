@@ -6,14 +6,13 @@ import uuid
 
 from functions import create_new_chat, send_message
 from litellm import (
-    ChatCompletionDeltaToolCall,
-    ChatCompletionStreamResponseDelta,
     FunctionDelta,
     ModelResponse,
     ModelResponseStream,
-    StreamingChoices,
 )
 from litellm.llms.custom_llm import CustomLLM
+from litellm.types.utils import ChatCompletionDeltaToolCall, StreamingChoices
+from litellm.types.utils import Delta as ChatCompletionStreamResponseDelta
 from plugin_helper import build_prompt, extract_and_upload_files, parse_tool_call
 
 
