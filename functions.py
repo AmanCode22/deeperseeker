@@ -141,9 +141,11 @@ def send_message(
     model_type=None,
     file_ids_=[],
 ):
+    if parent_message_id == 0:
+        parent_message_id = None
     if model_type == "expert":
-        file_ids_ = []
-    elif model_type == "vision" and file_ids != []:
+        file_ids = []
+    elif model_type == "vision" and file_ids_ != []:
         headers = get_headers(auth_token)
         file_ids = []
         for i in file_ids_:
@@ -155,6 +157,7 @@ def send_message(
                 "https://chat.deepseek.com/api/v0/file/fork_file_task",
                 headers=headers,
                 json=json_data,
+                cookies=COOKIE,
             ).json()
             status = resp["data"]["biz_data"]["status"]
             file_id = resp["data"]["biz_data"]["id"]
@@ -186,6 +189,7 @@ def send_message(
         "preempt": False,
         "action": None,
     }
+
     with requests.post(
         url, cookies=COOKIE, headers=headers, json=json_data, stream=True
     ) as r:

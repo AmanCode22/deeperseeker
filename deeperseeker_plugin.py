@@ -5,12 +5,9 @@ import time
 import uuid
 
 from functions import create_new_chat, send_message
-from litellm import (
-    ModelResponse,
-    ModelResponseStream,
-)
+from litellm import ModelResponse, token_counter
 from litellm.llms.custom_llm import CustomLLM
-from litellm.types.utils import ChatCompletionDeltaToolCall, StreamingChoices
+from litellm.types.utils import ChatCompletionDeltaToolCall
 from litellm.types.utils import Delta as ChatCompletionStreamResponseDelta
 from litellm.types.utils import Function as FunctionDelta
 from plugin_helper import build_prompt, extract_and_upload_files, parse_tool_call
@@ -25,7 +22,7 @@ class DeeperSeekerProvider(CustomLLM):
             os._exit(0)
         self.auth_token = open("auth_token.txt").read().strip()
 
-    def completion(self, model, messages, kwargs):
+    def completion(self, model, messages, **kwargs):
         metadata = kwargs.get("metadata", {})
         if (
             metadata == {}
@@ -54,6 +51,14 @@ class DeeperSeekerProvider(CustomLLM):
         for i in generator_message:
             response += i
         parsed, tools_called = parse_tool_call(response)
+        output_tokens = token_counter(
+            model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
+            text=response,
+        )
+        input_tokens = token_counter(
+            model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
+            messages=messages,
+        )
         response = ModelResponse(
             id="chatcmpl-" + str(uuid.uuid4()),
             object="chat.completion",
@@ -74,11 +79,17 @@ class DeeperSeekerProvider(CustomLLM):
                     },
                 }
             ],
+            usage={
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
         )
         return response
 
-    async def acompletion(self, model, messages, kwargs):
+    async def acompletion(self, model, messages, **kwargs):
         metadata = kwargs.get("metadata", {})
+
         if (
             metadata == {}
             or metadata.get("session_id") is None
@@ -89,6 +100,7 @@ class DeeperSeekerProvider(CustomLLM):
         else:
             session_id = metadata["session_id"]
             parent_message_id = metadata["parent_message_id"]
+
         file_ids = await asyncio.to_thread(
             extract_and_upload_files, messages, self.auth_token
         )
@@ -115,7 +127,14 @@ class DeeperSeekerProvider(CustomLLM):
                 break
             response += chunk
         parsed, tools_called = await asyncio.to_thread(parse_tool_call, response)
-
+        output_tokens = token_counter(
+            model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
+            text=response,
+        )
+        input_tokens = token_counter(
+            model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
+            messages=messages,
+        )
         response = ModelResponse(
             id="chatcmpl-" + str(uuid.uuid4()),
             object="chat.completion",
@@ -136,10 +155,15 @@ class DeeperSeekerProvider(CustomLLM):
                     },
                 }
             ],
+            usage={
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
         )
         return response
 
-    def streaming(self, model, messages, kwargs):
+    def streaming(self, model, messages, **kwargs):
         metadata = kwargs.get("metadata", {})
         if (
             metadata == {}
@@ -169,27 +193,36 @@ class DeeperSeekerProvider(CustomLLM):
         for i in generator_message:
             response += i
         parsed, tools_called = parse_tool_call(response)
+        output_tokens = token_counter(
+            model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
+            text=response,
+        )
+        input_tokens = token_counter(
+            model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
+            messages=messages,
+        )
         completion_id = f"chatcmpl-{uuid.uuid4()}"
         created_time = int(time.time())
         parsed_stream = [parsed[i : i + 12] for i in range(0, len(parsed), 12)]
 
         for i in parsed_stream:
-            yield ModelResponseStream(
-                id=completion_id,
-                object="chat.completion.chunk",
-                created=created_time,
-                model=model,
-                choices=[
-                    StreamingChoices(
-                        index=0,
-                        delta=ChatCompletionStreamResponseDelta(
-                            role="assistant", content=i
-                        ),
-                        finish_reason=None,
-                    )
+            yield {
+                "finish_reason": None,
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "is_finished": False,
+                "usage": None,
+                "text": i,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": i},
+                        "finish_reason": None,
+                    }
                 ],
-            )
-
+            }
         if tools_called:
             for tool_index, i in enumerate(tools_called):
                 tool_id = i["id"]
@@ -210,43 +243,58 @@ class DeeperSeekerProvider(CustomLLM):
                             index=tool_index,
                             function=FunctionDelta(arguments=arg_piece),
                         )
-                    yield ModelResponseStream(
-                        id=completion_id,
-                        object="chat.completion.chunk",
-                        created=created_time,
-                        model=model,
-                        choices=[
-                            StreamingChoices(
-                                index=0,
-                                delta=ChatCompletionStreamResponseDelta(
-                                    role="assistant", tool_calls=[delta_tool]
-                                ),
-                                finish_reason=None,
-                            )
+                    yield {
+                        "usage": None,
+                        "finish_reason": None,
+                        "is_finished": False,
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "text": "",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "tool_calls": [
+                                        delta_tool.model_dump()
+                                        if hasattr(delta_tool, "model_dump")
+                                        else delta_tool
+                                    ],
+                                },
+                                "finish_reason": None,
+                            }
                         ],
-                    )
+                    }
 
-        yield ModelResponseStream(
-            id=completion_id,
-            object="chat.completion.chunk",
-            created=created_time,
-            model=model,
-            choices=[
-                StreamingChoices(
-                    index=0,
-                    delta=ChatCompletionStreamResponseDelta(
-                        role="assistant", content=None
-                    ),
-                    finish_reason="tool_calls" if tools_called else "stop",
-                )
+        yield {
+            "usage": {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+            "finish_reason": "tool_calls" if tools_called else "stop",
+            "is_finished": True,
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": model,
+            "text": "",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": None},
+                    "finish_reason": "tool_calls" if tools_called else "stop",
+                }
             ],
-            metadata={
+            "metadata": {
                 "session_id": session_id,
                 "parent_message_id": parent_message_id + 2,
             },
-        )
+        }
 
-    async def astreaming(self, model, messages, kwargs):
+    async def astreaming(self, model, messages, **kwargs):
         metadata = kwargs.get("metadata", {})
         if (
             metadata == {}
@@ -285,25 +333,35 @@ class DeeperSeekerProvider(CustomLLM):
             if chunk is END:
                 break
             response += chunk
+        output_tokens = token_counter(
+            model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
+            text=response,
+        )
+        input_tokens = token_counter(
+            model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
+            messages=messages,
+        )
         parsed, tools_called = await asyncio.to_thread(parse_tool_call, response)
         parsed_stream = [parsed[i : i + 12] for i in range(0, len(parsed), 12)]
         for i in parsed_stream:
             await asyncio.sleep(0)
-            yield ModelResponseStream(
-                id=completion_id,
-                object="chat.completion.chunk",
-                created=created_time,
-                model=model,
-                choices=[
-                    StreamingChoices(
-                        index=0,
-                        delta=ChatCompletionStreamResponseDelta(
-                            role="assistant", content=i
-                        ),
-                        finish_reason=None,
-                    )
+            yield {
+                "finish_reason": None,
+                "is_finished": False,
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "text": i,
+                "usage": None,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": i},
+                        "finish_reason": None,
+                    }
                 ],
-            )
+            }
         if tools_called:
             for tool_index, j in enumerate(tools_called):
                 tool_id = j["id"]
@@ -324,41 +382,55 @@ class DeeperSeekerProvider(CustomLLM):
                             index=tool_index,
                             function=FunctionDelta(arguments=arg_piece),
                         )
-                    yield ModelResponseStream(
-                        id=completion_id,
-                        object="chat.completion.chunk",
-                        created=created_time,
-                        model=model,
-                        choices=[
-                            StreamingChoices(
-                                index=0,
-                                delta=ChatCompletionStreamResponseDelta(
-                                    role="assistant", tool_calls=[delta_tool]
-                                ),
-                                finish_reason=None,
-                            )
+                    yield {
+                        "finish_reason": None,
+                        "is_finished": False,
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "usage": None,
+                        "text": "",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "tool_calls": [
+                                        delta_tool.model_dump()
+                                        if hasattr(delta_tool, "model_dump")
+                                        else delta_tool
+                                    ],
+                                },
+                                "finish_reason": None,
+                            }
                         ],
-                    )
-
-        yield ModelResponseStream(
-            id=completion_id,
-            object="chat.completion.chunk",
-            created=created_time,
-            model=model,
-            choices=[
-                StreamingChoices(
-                    index=0,
-                    delta=ChatCompletionStreamResponseDelta(
-                        role="assistant", content=None
-                    ),
-                    finish_reason="tool_calls" if tools_called else "stop",
-                )
+                    }
+        yield {
+            "usage": {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+            "finish_reason": "tool_calls" if tools_called else "stop",
+            "is_finished": True,
+            "id": completion_id,
+            "text": "",
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": None},
+                    "finish_reason": "tool_calls" if tools_called else "stop",
+                }
             ],
-            metadata={
+            "metadata": {
                 "session_id": session_id,
                 "parent_message_id": parent_message_id + 2,
             },
-        )
+        }
 
 
 deeperseeker_instance = DeeperSeekerProvider()

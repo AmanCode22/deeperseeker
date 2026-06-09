@@ -1,18 +1,13 @@
 model_list:
   - model_name: instant
     litellm_params:
-      model: "instant"
+      model: "deeperseeker/instant"
   - model_name: vision
     litellm_params:
-      model: "vision"
+      model: "deeperseeker/vision"
   - model_name: expert
     litellm_params:
-      model: "expert"
-
-litellm_settings:
-  custom_provider_map:
-    - provider: "deeperseeker"
-      custom_handler: "deeperseeker_plugin.deeperseeker_instance"
+      model: "deeperseeker/expert"
 
 users:
   - user_id: "admin"
@@ -24,6 +19,13 @@ files_settings:
   - custom_llm_provider: "openai"
     api_key: "none"
     api_base: "http://localhost:4000/customfiles"
+
+litellm_settings:
+  custom_provider_map:
+    - {
+        "provider": "deeperseeker",
+        "custom_handler": deeperseeker_plugin.deeperseeker_instance,
+      }
 
 general_settings:
   pass_through_endpoints:
