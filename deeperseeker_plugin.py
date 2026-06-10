@@ -1,5 +1,7 @@
 import asyncio
 import os
+import sqlite3
+import threading
 import time
 import uuid
 
@@ -20,19 +22,60 @@ class DeeperSeekerProvider(CustomLLM):
             print("For more see docs.")
             os._exit(0)
         self.auth_token = open("auth_token.txt").read().strip()
+        self.sqlite_con = sqlite3.connect(
+            "api_key_metadata.sqlite", check_same_thread=False
+        )
+        self.db_lock = threading.Lock()
+        self.run_sqlite_init()
+
+    def put_api_key_metadata(self, api_key, session_id, parent_message_id):
+        with self.db_lock:
+            cursor = self.sqlite_con.cursor()
+            cursor.execute(
+                """
+                INSERT INTO api_key_metadata (api_key,session_id, parent_message_id)
+                VALUES (?, ?, ?)
+                ON CONFLICT(api_key,session_id)
+                DO UPDATE SET
+                    parent_message_id = excluded.parent_message_id;
+            """,
+                (api_key, session_id, parent_message_id),
+            )
+            self.sqlite_con.commit()
+
+    def get_api_key_metadata(self, api_key):
+        with self.db_lock:
+            cursor = self.sqlite_con.cursor()
+            cursor.execute(
+                """SELECT
+                session_id,
+            parent_message_id
+            FROM api_key_metadata
+            WHERE api_key = ? ;""",
+                (api_key,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            else:
+                return row
+
+    def run_sqlite_init(self):
+        with self.db_lock:
+            cursor = self.sqlite_con.cursor()
+            with open("schema.sql", "r") as file:
+                sql_script = file.read()
+            cursor.executescript(sql_script)
+            self.sqlite_con.commit()
 
     def completion(self, model, messages, **kwargs):
-        metadata = kwargs.get("metadata", {})
-        if (
-            metadata == {}
-            or metadata.get("session_id") is None
-            or metadata.get("parent_message_id") is None
-        ):
+        api_key = kwargs.get("litellm_params").get("user_api_key")
+        metadata = self.get_api_key_metadata(api_key)
+        if not metadata:
             session_id = create_new_chat(self.auth_token)
             parent_message_id = 0
         else:
-            session_id = metadata["session_id"]
-            parent_message_id = metadata["parent_message_id"]
+            session_id, parent_message_id = metadata
         file_ids = extract_and_upload_files(messages, self.auth_token)
         tools = kwargs.get("tools", [])
         prompt = build_prompt(messages, tools, parent_message_id == 0)
@@ -78,6 +121,7 @@ class DeeperSeekerProvider(CustomLLM):
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             messages=messages,
         )
+        self.put_api_key_metadata(api_key, session_id, parent_message_id + 2)
         response = ModelResponse(
             id="chatcmpl-" + str(uuid.uuid4()),
             object="chat.completion",
@@ -92,10 +136,6 @@ class DeeperSeekerProvider(CustomLLM):
                         "content": response,
                     },
                     "finish_reason": "tool_calls" if tools_called else "stop",
-                    "metadata": {
-                        "session_id": session_id,
-                        "parent_message_id": parent_message_id + 2,
-                    },
                 }
             ],
             usage={
@@ -107,19 +147,13 @@ class DeeperSeekerProvider(CustomLLM):
         return response
 
     async def acompletion(self, model, messages, **kwargs):
-        metadata = kwargs.get("metadata", {})
-
-        if (
-            metadata == {}
-            or metadata.get("session_id") is None
-            or metadata.get("parent_message_id") is None
-        ):
+        api_key = kwargs.get("litellm_params").get("user_api_key")
+        metadata = await asyncio.to_thread(self.get_api_key_metadata, api_key)
+        if not metadata:
             session_id = await asyncio.to_thread(create_new_chat, self.auth_token)
             parent_message_id = 0
         else:
-            session_id = metadata["session_id"]
-            parent_message_id = metadata["parent_message_id"]
-
+            session_id, parent_message_id = metadata
         file_ids = await asyncio.to_thread(
             extract_and_upload_files, messages, self.auth_token
         )
@@ -174,6 +208,9 @@ class DeeperSeekerProvider(CustomLLM):
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             messages=messages,
         )
+        await asyncio.to_thread(
+            self.put_api_key_metadata, api_key, session_id, parent_message_id + 2
+        )
         response = ModelResponse(
             id="chatcmpl-" + str(uuid.uuid4()),
             object="chat.completion",
@@ -188,10 +225,6 @@ class DeeperSeekerProvider(CustomLLM):
                         "content": response,
                     },
                     "finish_reason": "tool_calls" if tools_called else "stop",
-                    "metadata": {
-                        "session_id": session_id,
-                        "parent_message_id": parent_message_id + 2,
-                    },
                 }
             ],
             usage={
@@ -203,17 +236,13 @@ class DeeperSeekerProvider(CustomLLM):
         return response
 
     def streaming(self, model, messages, **kwargs):
-        metadata = kwargs.get("metadata", {})
-        if (
-            metadata == {}
-            or metadata.get("session_id") is None
-            or metadata.get("parent_message_id") is None
-        ):
+        api_key = kwargs.get("litellm_params").get("user_api_key")
+        metadata = self.get_api_key_metadata(api_key)
+        if not metadata:
             session_id = create_new_chat(self.auth_token)
             parent_message_id = 0
         else:
-            session_id = metadata["session_id"]
-            parent_message_id = metadata["parent_message_id"]
+            session_id, parent_message_id = metadata
         file_ids = extract_and_upload_files(messages, self.auth_token)
         tools = kwargs.get("tools", [])
         prompt = build_prompt(messages, tools, parent_message_id == 0)
@@ -344,7 +373,7 @@ class DeeperSeekerProvider(CustomLLM):
                             }
                         ],
                     }
-
+        self.put_api_key_metadata(api_key, session_id, parent_message_id + 2)
         yield {
             "usage": {
                 "prompt_tokens": input_tokens,
@@ -365,24 +394,16 @@ class DeeperSeekerProvider(CustomLLM):
                     "finish_reason": "tool_calls" if tools_called else "stop",
                 }
             ],
-            "metadata": {
-                "session_id": session_id,
-                "parent_message_id": parent_message_id + 2,
-            },
         }
 
     async def astreaming(self, model, messages, **kwargs):
-        metadata = kwargs.get("metadata", {})
-        if (
-            metadata == {}
-            or metadata.get("session_id") is None
-            or metadata.get("parent_message_id") is None
-        ):
+        api_key = kwargs.get("litellm_params").get("user_api_key")
+        metadata = await asyncio.to_thread(self.get_api_key_metadata, api_key)
+        if not metadata:
             session_id = await asyncio.to_thread(create_new_chat, self.auth_token)
             parent_message_id = 0
         else:
-            session_id = metadata["session_id"]
-            parent_message_id = metadata["parent_message_id"]
+            session_id, parent_message_id = metadata
         file_ids = await asyncio.to_thread(
             extract_and_upload_files, messages, self.auth_token
         )
@@ -521,6 +542,9 @@ class DeeperSeekerProvider(CustomLLM):
                             }
                         ],
                     }
+        await asyncio.to_thread(
+            self.put_api_key_metadata, api_key, session_id, parent_message_id + 2
+        )
         yield {
             "usage": {
                 "prompt_tokens": input_tokens,
@@ -541,10 +565,6 @@ class DeeperSeekerProvider(CustomLLM):
                     "finish_reason": "tool_calls" if tools_called else "stop",
                 }
             ],
-            "metadata": {
-                "session_id": session_id,
-                "parent_message_id": parent_message_id + 2,
-            },
         }
 
 

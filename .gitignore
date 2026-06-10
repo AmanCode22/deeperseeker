@@ -2,3 +2,4 @@ litellm_db/
 auth_token.json
 aws_cookies_deepseek.json
 __pycache__/
+api_key_metadata.sqlite
