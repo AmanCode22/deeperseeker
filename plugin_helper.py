@@ -163,48 +163,34 @@ def build_prompt(messages, tools, is_first_message=False):
         final_prompt += f"""[TOOL RESULTS]\n{tools_result_extract}\n\n"""
     final_prompt += f"""[USER]\n{extract_user_msg(messages)}\n\n"""
     if tools_extract:
-        final_prompt += """If you need to use a tool, after your full response write on the last line:
-TOOL_CALL: tool_name({"param": "value"})
-You can call as many tools you want to call in similar way. If no tool needed, write nothing extra.
-"""
+        final_prompt += """If you need to call a tool, emit it like this — anywhere in your response:
+        <tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>"""
     return final_prompt
 
 
-def parse_tool_call(response_text):
+def parse_tool_call(tools_list):
     tools_called = []
-    lines = response_text.split("\n")
-    new_lines = []
-    while lines and not lines[-1].strip():
-        lines.pop()
-    for i in lines:
-        if "TOOL_CALL: " in i:
-            tool_data = i.split("TOOL_CALL: ")[1]
-            tool_split = tool_data[tool_data.find("(") + 1 :]
-            tool_name = tool_data[: tool_data.find("(")].strip()
-            tool_args = tool_split.rsplit(")", 1)[0]
-            tool_args_json = json.loads(tool_args)
-            characters = string.ascii_letters + string.digits
-            call_id = "call_" + "".join(random.choices(characters, k=8))
-            if tool_name not in ["computer_use", "bash", "text_editor"]:
-                tools_called.append(
-                    {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": tool_name, "arguments": tool_args_json},
-                    }
-                )
-            else:
-                tools_called.append(
-                    {
-                        "id": call_id,
-                        "type": tool_name,
-                        "function": {"name": tool_name, "arguments": tool_args_json},
-                    }
-                )
+    for i in tools_list:
+        i = i.strip()
+        tool_json = json.loads(i.split("<tool_call>")[1].split("</tool_call>")[0])
+        characters = string.ascii_letters + string.digits
+        call_id = "call_" + "".join(random.choices(characters, k=8))
+        tool_name = tool_json["name"]
+        tool_args = tool_json["arguments"]
+        if tool_name not in ["computer_use", "bash", "text_editor"]:
+            tools_called.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": tool_args},
+                }
+            )
         else:
-            new_lines.append(i)
-    if tools_called == []:
-        return (response_text, None)
-
-    response_text_new = "\n".join(new_lines)
-    return (response_text_new, tools_called)
+            tools_called.append(
+                {
+                    "id": call_id,
+                    "type": tool_name,
+                    "function": {"name": tool_name, "arguments": tool_args},
+                }
+            )
+    return tools_called

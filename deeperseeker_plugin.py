@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import time
 import uuid
@@ -48,9 +47,29 @@ class DeeperSeekerProvider(CustomLLM):
             file_ids,
         )
         response = ""
+        tools_txt = []
+        tool_coming = False
+        current_tool_txt = ""
         for i in generator_message:
-            response += i
-        parsed, tools_called = parse_tool_call(response)
+            if tool_coming:
+                current_tool_txt += i
+                if (
+                    len(current_tool_txt) >= 15
+                    and "<tool_call>" not in current_tool_txt
+                ):
+                    tool_coming = False
+                    response += current_tool_txt
+                    current_tool_txt = ""
+                elif "</tool_call>" in current_tool_txt:
+                    tools_txt.append(current_tool_txt)
+                    current_tool_txt = ""
+                    tool_coming = False
+            elif "<" in i:
+                tool_coming = True
+                current_tool_txt += i
+            else:
+                response += i
+        tools_called = parse_tool_call(tools_txt)
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             text=response,
@@ -70,7 +89,7 @@ class DeeperSeekerProvider(CustomLLM):
                     "message": {
                         "tool_calls": tools_called,
                         "role": "assistant",
-                        "content": parsed,
+                        "content": response,
                     },
                     "finish_reason": "tool_calls" if tools_called else "stop",
                     "metadata": {
@@ -121,12 +140,32 @@ class DeeperSeekerProvider(CustomLLM):
         )
         END = object()
         response = ""
+        tools_txt = []
+        tool_coming = False
+        current_tool_txt = ""
         while True:
             chunk = await asyncio.to_thread(next, generator_message, END)
             if chunk is END:
                 break
-            response += chunk
-        parsed, tools_called = await asyncio.to_thread(parse_tool_call, response)
+            if tool_coming:
+                current_tool_txt += chunk
+                if (
+                    len(current_tool_txt) >= 15
+                    and "<tool_call>" not in current_tool_txt
+                ):
+                    tool_coming = False
+                    response += current_tool_txt
+                    current_tool_txt = ""
+                elif "</tool_call>" in current_tool_txt:
+                    tools_txt.append(current_tool_txt)
+                    current_tool_txt = ""
+                    tool_coming = False
+            elif "<" in chunk:
+                tool_coming = True
+                current_tool_txt += chunk
+            else:
+                response += chunk
+        tools_called = await asyncio.to_thread(parse_tool_call, tools_txt)
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             text=response,
@@ -146,7 +185,7 @@ class DeeperSeekerProvider(CustomLLM):
                     "message": {
                         "tool_calls": tools_called,
                         "role": "assistant",
-                        "content": parsed,
+                        "content": response,
                     },
                     "finish_reason": "tool_calls" if tools_called else "stop",
                     "metadata": {
@@ -188,11 +227,70 @@ class DeeperSeekerProvider(CustomLLM):
             None if model == "instant" else model,
             file_ids,
         )
+        tools_txt = []
+        tool_coming = False
         response = ""
-
+        current_tool_txt = ""
+        completion_id = f"chatcmpl-{uuid.uuid4()}"
+        created_time = int(time.time())
         for i in generator_message:
-            response += i
-        parsed, tools_called = parse_tool_call(response)
+            if tool_coming:
+                current_tool_txt += i
+                if (
+                    len(current_tool_txt) >= 15
+                    and "<tool_call>" not in current_tool_txt
+                ):
+                    tool_coming = False
+                    response += current_tool_txt
+                    yield {
+                        "finish_reason": None,
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "is_finished": False,
+                        "usage": None,
+                        "text": current_tool_txt,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": current_tool_txt,
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    current_tool_txt = ""
+                elif "</tool_call>" in current_tool_txt:
+                    tools_txt.append(current_tool_txt)
+                    current_tool_txt = ""
+                    tool_coming = False
+            elif "<" in i:
+                tool_coming = True
+                current_tool_txt += i
+            else:
+                response += i
+                yield {
+                    "finish_reason": None,
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "is_finished": False,
+                    "usage": None,
+                    "text": i,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": i},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+
+        tools_called = parse_tool_call(tools_txt)
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             text=response,
@@ -201,34 +299,13 @@ class DeeperSeekerProvider(CustomLLM):
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             messages=messages,
         )
-        completion_id = f"chatcmpl-{uuid.uuid4()}"
-        created_time = int(time.time())
-        parsed_stream = [parsed[i : i + 12] for i in range(0, len(parsed), 12)]
 
-        for i in parsed_stream:
-            yield {
-                "finish_reason": None,
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model,
-                "is_finished": False,
-                "usage": None,
-                "text": i,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": i},
-                        "finish_reason": None,
-                    }
-                ],
-            }
         if tools_called:
             for tool_index, i in enumerate(tools_called):
                 tool_id = i["id"]
                 name = i["function"]["name"]
                 args = i["function"]["arguments"]
-                args = json.dumps(args)
+
                 arg_chunks = [args[j : j + 8] for j in range(0, len(args), 8)]
                 for chunk_id, arg_piece in enumerate(arg_chunks):
                     if chunk_id == 0:
@@ -324,15 +401,74 @@ class DeeperSeekerProvider(CustomLLM):
             None if model == "instant" else model,
             file_ids,
         )
+        response = ""
+        current_tool_txt = ""
         completion_id = f"chatcmpl-{uuid.uuid4()}"
         created_time = int(time.time())
-        response = ""
+        tool_coming = False
+        tools_txt = []
         END = object()
         while True:
             chunk = await asyncio.to_thread(next, generator_message, END)
             if chunk is END:
                 break
-            response += chunk
+            if tool_coming:
+                current_tool_txt += chunk
+                if (
+                    len(current_tool_txt) >= 15
+                    and "<tool_call>" not in current_tool_txt
+                ):
+                    tool_coming = False
+                    response += current_tool_txt
+                    yield {
+                        "finish_reason": None,
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "is_finished": False,
+                        "usage": None,
+                        "text": current_tool_txt,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": current_tool_txt,
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    current_tool_txt = ""
+                elif "</tool_call>" in current_tool_txt:
+                    tools_txt.append(current_tool_txt)
+                    current_tool_txt = ""
+                    tool_coming = False
+            elif "<" in chunk:
+                tool_coming = True
+                current_tool_txt += chunk
+            else:
+                response += chunk
+                yield {
+                    "finish_reason": None,
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "is_finished": False,
+                    "usage": None,
+                    "text": chunk,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": chunk},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+
+        tools_called = parse_tool_call(tools_txt)
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             text=response,
@@ -341,33 +477,12 @@ class DeeperSeekerProvider(CustomLLM):
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             messages=messages,
         )
-        parsed, tools_called = await asyncio.to_thread(parse_tool_call, response)
-        parsed_stream = [parsed[i : i + 12] for i in range(0, len(parsed), 12)]
-        for i in parsed_stream:
-            await asyncio.sleep(0)
-            yield {
-                "finish_reason": None,
-                "is_finished": False,
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model,
-                "text": i,
-                "usage": None,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": i},
-                        "finish_reason": None,
-                    }
-                ],
-            }
+
         if tools_called:
             for tool_index, j in enumerate(tools_called):
                 tool_id = j["id"]
                 name = j["function"]["name"]
                 args = j["function"]["arguments"]
-                args = json.dumps(args)
                 arg_chunks = [args[k : k + 8] for k in range(0, len(args), 8)]
                 for chunk_id, arg_piece in enumerate(arg_chunks):
                     if chunk_id == 0:
