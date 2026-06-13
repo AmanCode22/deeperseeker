@@ -419,28 +419,6 @@ class DeeperSeekerProvider(CustomLLM):
                     continue
 
                 before_tool, tool_useful = chunk.split("<", 1)
-
-                if not tool_useful:
-                    yield {
-                        "finish_reason": None,
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model,
-                        "is_finished": False,
-                        "usage": None,
-                        "text": chunk,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"role": "assistant", "content": chunk},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    response += chunk
-                    continue
-
                 tools_called = True
                 tool_coming = True
                 if before_tool:
@@ -697,27 +675,6 @@ class DeeperSeekerProvider(CustomLLM):
                     continue
 
                 before_tool, tool_useful = chunk.split("<", 1)
-
-                if not tool_useful:
-                    yield {
-                        "finish_reason": None,
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model,
-                        "is_finished": False,
-                        "usage": None,
-                        "text": chunk,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"role": "assistant", "content": chunk},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    response += chunk
-                    continue
 
                 tool_coming = True
                 if before_tool:
