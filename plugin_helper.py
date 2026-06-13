@@ -172,7 +172,9 @@ def parse_tool_call(tools_list):
     tools_called = []
     for i in tools_list:
         i = i.strip()
-        tool_json = json.loads(i.split("<tool_call>")[1].split("</tool_call>")[0])
+        tool_json = json.loads(
+            i.replace("<tool_call>", "").replace("</tool_call>", "").strip()
+        )
         characters = string.ascii_letters + string.digits
         call_id = "call_" + "".join(random.choices(characters, k=8))
         tool_name = tool_json["name"]
@@ -194,3 +196,26 @@ def parse_tool_call(tools_list):
                 }
             )
     return tools_called
+
+
+def parse_tool_call_streaming(tool_txt):
+    tool_txt = tool_txt.strip()
+    tool_json = json.loads(
+        tool_txt.replace("<tool_call>", "").replace("</tool_call>", "").strip()
+    )
+    characters = string.ascii_letters + string.digits
+    call_id = "call_" + "".join(random.choices(characters, k=8))
+    tool_name = tool_json["name"]
+    tool_args = tool_json["arguments"]
+    if tool_name not in ["computer_use", "bash", "text_editor"]:
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": tool_name, "arguments": tool_args},
+        }
+    else:
+        return {
+            "id": call_id,
+            "type": tool_name,
+            "function": {"name": tool_name, "arguments": tool_args},
+        }

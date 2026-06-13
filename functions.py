@@ -206,14 +206,16 @@ def send_message(
                     return
                 data = json.loads(json_str)
 
-                if "v" in data and "response" not in str(data["v"]):
-                    yield data["v"]
+                if "v" in data:
+                    if isinstance(data["v"], dict) and "response" in data["v"]:
+                        fragments = data["v"]["response"].get("fragments")
+                        if fragments:
+                            yield fragments[0]["content"]
+                    elif isinstance(data["v"], str):
+                        yield data["v"]
+
                 elif data.get("o") == "APPEND":
-                    yield data["v"]
-                elif "v" in data and "response" in data["v"]:
-                    fragments = data["v"]["response"]["fragments"]
-                    if fragments:
-                        yield fragments[0]["content"]
+                    yield data.get("v", "")
 
 
 def upload_file(file_bytes, file_name, file_content_type, auth_token):

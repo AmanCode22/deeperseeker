@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sqlite3
 import threading
@@ -11,7 +12,12 @@ from litellm.llms.custom_llm import CustomLLM
 from litellm.types.utils import ChatCompletionDeltaToolCall
 from litellm.types.utils import Delta as ChatCompletionStreamResponseDelta
 from litellm.types.utils import Function as FunctionDelta
-from plugin_helper import build_prompt, extract_and_upload_files, parse_tool_call
+from plugin_helper import (
+    build_prompt,
+    extract_and_upload_files,
+    parse_tool_call,
+    parse_tool_call_streaming,
+)
 
 
 class DeeperSeekerProvider(CustomLLM):
@@ -69,7 +75,7 @@ class DeeperSeekerProvider(CustomLLM):
             self.sqlite_con.commit()
 
     def completion(self, model, messages, **kwargs):
-        api_key = kwargs.get("litellm_params").get("user_api_key")
+        api_key = kwargs.get("litellm_params").get("metadata").get("user_api_key")
         metadata = self.get_api_key_metadata(api_key)
         if not metadata:
             session_id = create_new_chat(self.auth_token)
@@ -113,6 +119,7 @@ class DeeperSeekerProvider(CustomLLM):
             else:
                 response += i
         tools_called = parse_tool_call(tools_txt)
+
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             text=response,
@@ -147,7 +154,7 @@ class DeeperSeekerProvider(CustomLLM):
         return response
 
     async def acompletion(self, model, messages, **kwargs):
-        api_key = kwargs.get("litellm_params").get("user_api_key")
+        api_key = kwargs.get("litellm_params").get("metadata").get("user_api_key")
         metadata = await asyncio.to_thread(self.get_api_key_metadata, api_key)
         if not metadata:
             session_id = await asyncio.to_thread(create_new_chat, self.auth_token)
@@ -200,6 +207,7 @@ class DeeperSeekerProvider(CustomLLM):
             else:
                 response += chunk
         tools_called = await asyncio.to_thread(parse_tool_call, tools_txt)
+
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             text=response,
@@ -236,7 +244,7 @@ class DeeperSeekerProvider(CustomLLM):
         return response
 
     def streaming(self, model, messages, **kwargs):
-        api_key = kwargs.get("litellm_params").get("user_api_key")
+        api_key = kwargs.get("litellm_params").get("metadata").get("user_api_key")
         metadata = self.get_api_key_metadata(api_key)
         if not metadata:
             session_id = create_new_chat(self.auth_token)
@@ -256,21 +264,24 @@ class DeeperSeekerProvider(CustomLLM):
             None if model == "instant" else model,
             file_ids,
         )
-        tools_txt = []
         tool_coming = False
         response = ""
-        current_tool_txt = ""
         completion_id = f"chatcmpl-{uuid.uuid4()}"
         created_time = int(time.time())
-        for i in generator_message:
+        current_tool_txt = ""
+        tool_index = 0
+        tools_called = False
+
+        for chunk in generator_message:
             if tool_coming:
-                current_tool_txt += i
-                if (
-                    len(current_tool_txt) >= 15
-                    and "<tool_call>" not in current_tool_txt
-                ):
-                    tool_coming = False
-                    response += current_tool_txt
+                current_tool_txt += chunk
+
+                is_tool_tag = (
+                    "<tool_call>".startswith(current_tool_txt)
+                    or "<tool_call>" in current_tool_txt
+                )
+
+                if not is_tool_tag and len(current_tool_txt) >= 15:
                     yield {
                         "finish_reason": None,
                         "id": completion_id,
@@ -291,35 +302,176 @@ class DeeperSeekerProvider(CustomLLM):
                             }
                         ],
                     }
-                    current_tool_txt = ""
-                elif "</tool_call>" in current_tool_txt:
-                    tools_txt.append(current_tool_txt)
+                    response += current_tool_txt
                     current_tool_txt = ""
                     tool_coming = False
-            elif "<" in i:
-                tool_coming = True
-                current_tool_txt += i
-            else:
-                response += i
-                yield {
-                    "finish_reason": None,
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": model,
-                    "is_finished": False,
-                    "usage": None,
-                    "text": i,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": i},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
+                    continue
 
-        tools_called = parse_tool_call(tools_txt)
+                if "</tool_call>" in current_tool_txt:
+                    raw, left_resp = current_tool_txt.split("</tool_call>", 1)
+                    tool_json = parse_tool_call_streaming(raw + "</tool_call>")
+                    tool_id = tool_json["id"]
+                    name = tool_json["function"]["name"]
+                    args = tool_json["function"]["arguments"]
+                    args_str = json.dumps(args)
+                    arg_chunks = [
+                        args_str[k : k + 8] for k in range(0, len(args_str), 8)
+                    ]
+                    for chunk_id, arg_piece in enumerate(arg_chunks):
+                        delta_tool = (
+                            {
+                                "index": tool_index,
+                                "id": tool_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arg_piece},
+                            }
+                            if chunk_id == 0
+                            else {
+                                "index": tool_index,
+                                "function": {"arguments": arg_piece},
+                            }
+                        )
+                        yield {
+                            "usage": None,
+                            "finish_reason": None,
+                            "is_finished": False,
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": model,
+                            "text": "",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "role": "assistant",
+                                        "tool_calls": [delta_tool],
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    tool_index += 1
+
+                    if "<" in left_resp:
+                        current_tool_txt = left_resp
+                        tool_coming = True
+                    elif left_resp:
+                        yield {
+                            "finish_reason": None,
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": model,
+                            "is_finished": False,
+                            "usage": None,
+                            "text": left_resp,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "role": "assistant",
+                                        "content": left_resp,
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        response += left_resp
+                        current_tool_txt = ""
+                        tool_coming = False
+                    else:
+                        current_tool_txt = ""
+                        tool_coming = False
+
+            else:
+                if "<" not in chunk:
+                    yield {
+                        "finish_reason": None,
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "is_finished": False,
+                        "usage": None,
+                        "text": chunk,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": chunk},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    response += chunk
+                    continue
+
+                before_tool, tool_useful = chunk.split("<", 1)
+
+                if not tool_useful:
+                    yield {
+                        "finish_reason": None,
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "is_finished": False,
+                        "usage": None,
+                        "text": chunk,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": chunk},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    response += chunk
+                    continue
+
+                tools_called = True
+                tool_coming = True
+                if before_tool:
+                    yield {
+                        "finish_reason": None,
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "is_finished": False,
+                        "usage": None,
+                        "text": before_tool,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": before_tool},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    response += before_tool
+                current_tool_txt = "<" + tool_useful
+
+        if tool_coming and current_tool_txt:
+            yield {
+                "finish_reason": None,
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "is_finished": False,
+                "usage": None,
+                "text": current_tool_txt,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": current_tool_txt},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            response += current_tool_txt
+
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             text=response,
@@ -328,51 +480,6 @@ class DeeperSeekerProvider(CustomLLM):
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             messages=messages,
         )
-
-        if tools_called:
-            for tool_index, i in enumerate(tools_called):
-                tool_id = i["id"]
-                name = i["function"]["name"]
-                args = i["function"]["arguments"]
-
-                arg_chunks = [args[j : j + 8] for j in range(0, len(args), 8)]
-                for chunk_id, arg_piece in enumerate(arg_chunks):
-                    if chunk_id == 0:
-                        delta_tool = ChatCompletionDeltaToolCall(
-                            index=tool_index,
-                            id=tool_id,
-                            type="function",
-                            function=FunctionDelta(name=name, arguments=arg_piece),
-                        )
-                    else:
-                        delta_tool = ChatCompletionDeltaToolCall(
-                            index=tool_index,
-                            function=FunctionDelta(arguments=arg_piece),
-                        )
-                    yield {
-                        "usage": None,
-                        "finish_reason": None,
-                        "is_finished": False,
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model,
-                        "text": "",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "role": "assistant",
-                                    "tool_calls": [
-                                        delta_tool.model_dump()
-                                        if hasattr(delta_tool, "model_dump")
-                                        else delta_tool
-                                    ],
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
         self.put_api_key_metadata(api_key, session_id, parent_message_id + 2)
         yield {
             "usage": {
@@ -397,7 +504,7 @@ class DeeperSeekerProvider(CustomLLM):
         }
 
     async def astreaming(self, model, messages, **kwargs):
-        api_key = kwargs.get("litellm_params").get("user_api_key")
+        api_key = kwargs.get("litellm_params").get("metadata").get("user_api_key")
         metadata = await asyncio.to_thread(self.get_api_key_metadata, api_key)
         if not metadata:
             session_id = await asyncio.to_thread(create_new_chat, self.auth_token)
@@ -422,25 +529,30 @@ class DeeperSeekerProvider(CustomLLM):
             None if model == "instant" else model,
             file_ids,
         )
+        tool_coming = False
         response = ""
-        current_tool_txt = ""
         completion_id = f"chatcmpl-{uuid.uuid4()}"
         created_time = int(time.time())
-        tool_coming = False
-        tools_txt = []
+        current_tool_txt = ""
+        tool_index = 0
+        tools_called = False
         END = object()
+
         while True:
             chunk = await asyncio.to_thread(next, generator_message, END)
+            await asyncio.to_thread(print, chunk, flush=True)
             if chunk is END:
+                tool_coming = False
                 break
             if tool_coming:
                 current_tool_txt += chunk
-                if (
-                    len(current_tool_txt) >= 15
-                    and "<tool_call>" not in current_tool_txt
-                ):
-                    tool_coming = False
-                    response += current_tool_txt
+
+                is_tool_tag = (
+                    "<tool_call>".startswith(current_tool_txt)
+                    or "<tool_call>" in current_tool_txt
+                )
+
+                if not is_tool_tag and len(current_tool_txt) >= 15:
                     yield {
                         "finish_reason": None,
                         "id": completion_id,
@@ -461,35 +573,181 @@ class DeeperSeekerProvider(CustomLLM):
                             }
                         ],
                     }
-                    current_tool_txt = ""
-                elif "</tool_call>" in current_tool_txt:
-                    tools_txt.append(current_tool_txt)
+                    response += current_tool_txt
                     current_tool_txt = ""
                     tool_coming = False
-            elif "<" in chunk:
-                tool_coming = True
-                current_tool_txt += chunk
-            else:
-                response += chunk
-                yield {
-                    "finish_reason": None,
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": model,
-                    "is_finished": False,
-                    "usage": None,
-                    "text": chunk,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": chunk},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
+                    continue
 
-        tools_called = parse_tool_call(tools_txt)
+                if "</tool_call>" in current_tool_txt:
+                    raw, left_resp = current_tool_txt.split("</tool_call>", 1)
+                    tool_json = await asyncio.to_thread(
+                        parse_tool_call_streaming, "<tool_call>" + raw + "</tool_call>"
+                    )
+                    tool_id = tool_json["id"]
+                    name = tool_json["function"]["name"]
+                    args = tool_json["function"]["arguments"]
+                    args_str = json.dumps(args)
+                    arg_chunks = [
+                        args_str[k : k + 8] for k in range(0, len(args_str), 8)
+                    ]
+                    for chunk_id, arg_piece in enumerate(arg_chunks):
+                        if chunk_id == 0:
+                            delta_tool = ChatCompletionDeltaToolCall(
+                                index=tool_index,
+                                id=tool_id,
+                                type="function",
+                                function=FunctionDelta(name=name, arguments=arg_piece),
+                            )
+                        else:
+                            delta_tool = ChatCompletionDeltaToolCall(
+                                index=tool_index,
+                                function=FunctionDelta(arguments=arg_piece),
+                            )
+                        yield {
+                            "usage": None,
+                            "finish_reason": None,
+                            "is_finished": False,
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": model,
+                            "text": "",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "role": "assistant",
+                                        "tool_calls": [
+                                            delta_tool.model_dump()
+                                            if hasattr(delta_tool, "model_dump")
+                                            else delta_tool
+                                        ],
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    tool_index += 1
+                    tools_called = True
+
+                    if "<" in left_resp:
+                        current_tool_txt = left_resp
+                        tool_coming = True
+                    elif left_resp:
+                        yield {
+                            "finish_reason": None,
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": model,
+                            "is_finished": False,
+                            "usage": None,
+                            "text": left_resp,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "role": "assistant",
+                                        "content": left_resp,
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        response += left_resp
+                        current_tool_txt = ""
+                        tool_coming = False
+                    else:
+                        current_tool_txt = ""
+                        tool_coming = False
+
+            else:
+                if "<" not in chunk:
+                    yield {
+                        "finish_reason": None,
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "is_finished": False,
+                        "usage": None,
+                        "text": chunk,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": chunk},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    response += chunk
+                    continue
+
+                before_tool, tool_useful = chunk.split("<", 1)
+
+                if not tool_useful:
+                    yield {
+                        "finish_reason": None,
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "is_finished": False,
+                        "usage": None,
+                        "text": chunk,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": chunk},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    response += chunk
+                    continue
+
+                tool_coming = True
+                if before_tool:
+                    yield {
+                        "finish_reason": None,
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "is_finished": False,
+                        "usage": None,
+                        "text": before_tool,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": before_tool},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    response += before_tool
+                current_tool_txt = "<" + tool_useful
+
+        if tool_coming and current_tool_txt:
+            yield {
+                "finish_reason": None,
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "is_finished": False,
+                "usage": None,
+                "text": current_tool_txt,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": current_tool_txt},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            response += current_tool_txt
+
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             text=response,
@@ -498,50 +756,6 @@ class DeeperSeekerProvider(CustomLLM):
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             messages=messages,
         )
-
-        if tools_called:
-            for tool_index, j in enumerate(tools_called):
-                tool_id = j["id"]
-                name = j["function"]["name"]
-                args = j["function"]["arguments"]
-                arg_chunks = [args[k : k + 8] for k in range(0, len(args), 8)]
-                for chunk_id, arg_piece in enumerate(arg_chunks):
-                    if chunk_id == 0:
-                        delta_tool = ChatCompletionDeltaToolCall(
-                            index=tool_index,
-                            id=tool_id,
-                            type="function",
-                            function=FunctionDelta(name=name, arguments=arg_piece),
-                        )
-                    else:
-                        delta_tool = ChatCompletionDeltaToolCall(
-                            index=tool_index,
-                            function=FunctionDelta(arguments=arg_piece),
-                        )
-                    yield {
-                        "finish_reason": None,
-                        "is_finished": False,
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model,
-                        "usage": None,
-                        "text": "",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "role": "assistant",
-                                    "tool_calls": [
-                                        delta_tool.model_dump()
-                                        if hasattr(delta_tool, "model_dump")
-                                        else delta_tool
-                                    ],
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
         await asyncio.to_thread(
             self.put_api_key_metadata, api_key, session_id, parent_message_id + 2
         )
@@ -554,10 +768,10 @@ class DeeperSeekerProvider(CustomLLM):
             "finish_reason": "tool_calls" if tools_called else "stop",
             "is_finished": True,
             "id": completion_id,
-            "text": "",
             "object": "chat.completion.chunk",
             "created": created_time,
             "model": model,
+            "text": "",
             "choices": [
                 {
                     "index": 0,
