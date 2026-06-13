@@ -82,7 +82,7 @@ class DeeperSeekerProvider(CustomLLM):
             parent_message_id = 0
         else:
             session_id, parent_message_id = metadata
-        file_ids = extract_and_upload_files(messages, self.auth_token)
+        file_ids = extract_and_upload_files(Fix bugsmessages, self.auth_token)
         tools = kwargs.get("tools", [])
         prompt = build_prompt(messages, tools, parent_message_id == 0)
         generator_message = send_message(
