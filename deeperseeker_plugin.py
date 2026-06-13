@@ -82,7 +82,7 @@ class DeeperSeekerProvider(CustomLLM):
             parent_message_id = 0
         else:
             session_id, parent_message_id = metadata
-        file_ids = extract_and_upload_files(Fix bugsmessages, self.auth_token)
+        file_ids = extract_and_upload_files(messages, self.auth_token)
         tools = kwargs.get("tools", [])
         prompt = build_prompt(messages, tools, parent_message_id == 0)
         generator_message = send_message(
@@ -119,6 +119,12 @@ class DeeperSeekerProvider(CustomLLM):
             else:
                 response += i
         tools_called = parse_tool_call(tools_txt)
+
+        if tools_called:
+            for tool in tools_called:
+                tool["function"]["arguments"] = json.dumps(
+                    tool["function"]["arguments"]
+                )
 
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
@@ -207,6 +213,12 @@ class DeeperSeekerProvider(CustomLLM):
             else:
                 response += chunk
         tools_called = await asyncio.to_thread(parse_tool_call, tools_txt)
+
+        if tools_called:
+            for tool in tools_called:
+                tool["function"]["arguments"] = json.dumps(
+                    tool["function"]["arguments"]
+                )
 
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
@@ -480,53 +492,7 @@ class DeeperSeekerProvider(CustomLLM):
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             messages=messages,
         )
-<<<<<<< HEAD
-=======
 
-        if tools_called:
-            for tool_index, tool in enumerate(tools_called):
-                tool_id = tool["id"]
-                name = tool["function"]["name"]
-                args = tool["function"]["arguments"]
-
-                args_str = json.dumps(args) if isinstance(args, dict) else str(args)
-                arg_chunks = [args_str[k : k + 8] for k in range(0, len(args_str), 8)]
-
-                for chunk_id, arg_piece in enumerate(arg_chunks):
-                    if chunk_id == 0:
-                        delta_tool = {
-                            "index": tool_index,
-                            "id": tool_id,
-                            "type": "function",
-                            "function": {"name": name, "arguments": arg_piece},
-                        }
-                    else:
-                        delta_tool = {
-                            "index": tool_index,
-                            "function": {"arguments": arg_piece},
-                        }
-
-                    yield {
-                        "usage": None,
-                        "finish_reason": None,
-                        "is_finished": False,
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model,
-                        "text": "",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "role": "assistant",
-                                    "tool_calls": [delta_tool],
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
->>>>>>> refs/remotes/origin/main
         self.put_api_key_metadata(api_key, session_id, parent_message_id + 2)
         yield {
             "usage": {
@@ -803,54 +769,7 @@ class DeeperSeekerProvider(CustomLLM):
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             messages=messages,
         )
-<<<<<<< HEAD
-=======
 
-        if tools_called:
-            for tool_index, j in enumerate(tools_called):
-                tool_id = j["id"]
-                name = j["function"]["name"]
-                args = j["function"]["arguments"]
-                args_str = json.dumps(args)
-                arg_chunks = [args_str[k : k + 8] for k in range(0, len(args_str), 8)]
-                for chunk_id, arg_piece in enumerate(arg_chunks):
-                    if chunk_id == 0:
-                        delta_tool = ChatCompletionDeltaToolCall(
-                            index=tool_index,
-                            id=tool_id,
-                            type="function",
-                            function=FunctionDelta(name=name, arguments=arg_piece),
-                        )
-                    else:
-                        delta_tool = ChatCompletionDeltaToolCall(
-                            index=tool_index,
-                            function=FunctionDelta(arguments=arg_piece),
-                        )
-                    yield {
-                        "finish_reason": None,
-                        "is_finished": False,
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model,
-                        "usage": None,
-                        "text": "",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "role": "assistant",
-                                    "tool_calls": [
-                                        delta_tool.model_dump()
-                                        if hasattr(delta_tool, "model_dump")
-                                        else delta_tool
-                                    ],
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
->>>>>>> refs/remotes/origin/main
         await asyncio.to_thread(
             self.put_api_key_metadata, api_key, session_id, parent_message_id + 2
         )
