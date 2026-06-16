@@ -120,12 +120,6 @@ class DeeperSeekerProvider(CustomLLM):
                 response += i
         tools_called = parse_tool_call(tools_txt)
 
-        if tools_called:
-            for tool in tools_called:
-                tool["function"]["arguments"] = json.dumps(
-                    tool["function"]["arguments"]
-                )
-
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
             text=response,
@@ -213,12 +207,6 @@ class DeeperSeekerProvider(CustomLLM):
             else:
                 response += chunk
         tools_called = await asyncio.to_thread(parse_tool_call, tools_txt)
-
-        if tools_called:
-            for tool in tools_called:
-                tool["function"]["arguments"] = json.dumps(
-                    tool["function"]["arguments"]
-                )
 
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
@@ -324,45 +312,37 @@ class DeeperSeekerProvider(CustomLLM):
                     tool_json = parse_tool_call_streaming(raw + "</tool_call>")
                     tool_id = tool_json["id"]
                     name = tool_json["function"]["name"]
-                    args = tool_json["function"]["arguments"]
-                    args_str = json.dumps(args)
+                    args_str = tool_json["function"]["arguments"]
                     arg_chunks = [
                         args_str[k : k + 8] for k in range(0, len(args_str), 8)
                     ]
                     for chunk_id, arg_piece in enumerate(arg_chunks):
-                        delta_tool = (
-                            {
+                        if chunk_id == 0:
+                            delta_tool = {
                                 "index": tool_index,
                                 "id": tool_id,
                                 "type": "function",
                                 "function": {"name": name, "arguments": arg_piece},
                             }
-                            if chunk_id == 0
-                            else {
+
+                        else:
+                            delta_tool = {
                                 "index": tool_index,
                                 "function": {"arguments": arg_piece},
                             }
-                        )
-                        yield {
-                            "usage": None,
-                            "finish_reason": None,
-                            "is_finished": False,
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_time,
-                            "model": model,
-                            "text": "",
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "role": "assistant",
-                                        "tool_calls": [delta_tool],
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
+                            yield {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"tool_calls": [delta_tool]},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
                     tool_index += 1
 
                     if "<" in left_resp:
@@ -576,44 +556,39 @@ class DeeperSeekerProvider(CustomLLM):
                     )
                     tool_id = tool_json["id"]
                     name = tool_json["function"]["name"]
-                    args = tool_json["function"]["arguments"]
-                    args_str = json.dumps(args)
+                    args_str = tool_json["function"]["arguments"]
+
                     arg_chunks = [
                         args_str[k : k + 8] for k in range(0, len(args_str), 8)
                     ]
                     for chunk_id, arg_piece in enumerate(arg_chunks):
                         if chunk_id == 0:
-                            delta_tool = ChatCompletionDeltaToolCall(
-                                index=tool_index,
-                                id=tool_id,
-                                type="function",
-                                function=FunctionDelta(name=name, arguments=arg_piece),
-                            )
+                            delta_tool = {
+                                "index": tool_index,
+                                "id": tool_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arg_piece},
+                            }
+
                         else:
-                            delta_tool = ChatCompletionDeltaToolCall(
-                                index=tool_index,
-                                function=FunctionDelta(arguments=arg_piece),
-                            )
+                            delta_tool = {
+                                "index": tool_index,
+                                "function": {"arguments": arg_piece},
+                            }
+                        print(delta_tool)
                         yield {
-                            "usage": None,
-                            "finish_reason": None,
-                            "is_finished": False,
+                            "text": "",
+                            "is_finished": True,
                             "id": completion_id,
                             "object": "chat.completion.chunk",
                             "created": created_time,
                             "model": model,
-                            "text": "",
+                            "finish_reason": None,
+                            "usage": None,
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {
-                                        "role": "assistant",
-                                        "tool_calls": [
-                                            delta_tool.model_dump()
-                                            if hasattr(delta_tool, "model_dump")
-                                            else delta_tool
-                                        ],
-                                    },
+                                    "delta": {"tool_calls": [delta_tool]},
                                     "finish_reason": None,
                                 }
                             ],

@@ -179,6 +179,13 @@ def parse_tool_call(tools_list):
         call_id = "call_" + "".join(random.choices(characters, k=8))
         tool_name = tool_json["name"]
         tool_args = tool_json["arguments"]
+        if isinstance(tool_args, (dict, list)):
+            tool_args = json.dumps(tool_args)
+        elif isinstance(tool_args, str):
+            try:
+                json.loads(tool_args)
+            except (json.JSONDecodeError, TypeError):
+                tool_args = json.dumps(tool_args)
         if tool_name not in ["computer_use", "bash", "text_editor"]:
             tools_called.append(
                 {
@@ -207,6 +214,13 @@ def parse_tool_call_streaming(tool_txt):
     call_id = "call_" + "".join(random.choices(characters, k=8))
     tool_name = tool_json["name"]
     tool_args = tool_json["arguments"]
+    if isinstance(tool_args, (dict, list)):
+        tool_args = json.dumps(tool_args)
+    elif isinstance(tool_args, str):
+        try:
+            json.loads(tool_args)
+        except (json.JSONDecodeError, TypeError):
+            tool_args = json.dumps(tool_args)
     if tool_name not in ["computer_use", "bash", "text_editor"]:
         return {
             "id": call_id,
