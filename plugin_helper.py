@@ -60,9 +60,12 @@ def extract_tool_results(messages):
 def extract_and_upload_files(messages, auth_token):
     result_fileids = []
     for i in messages:
-        if isinstance(i["content"], str):
+        content = i.get("content")
+        if not content:
             continue
-        for j in i["content"]:
+        if isinstance(content, str):
+            continue
+        for j in content:
             if j["type"] == "text":
                 continue
             elif j["type"] == "image_url":
