@@ -53,7 +53,7 @@ def extract_tool_results(messages):
     tools_final = ""
     for i in messages:
         if i["role"] == "tool":
-            tools_final += f"""Tool result for {i["name"]}:\n{i["content"]}. Tool Call ID: {i["tool_call_id"]}\n"""
+            tools_final += f"""Tool result for {i.get("name", "tool")}:\n{i["content"]}. Tool Call ID: {i["tool_call_id"]}\n"""
     return tools_final if tools_final != "" else None
 
 
@@ -156,6 +156,7 @@ def build_prompt(messages, tools, is_first_message=False):
         final_prompt += f"""[TOOLS]\n{tools_extract}\n\n"""
     if is_first_message:
         system_prompt = extract_system(messages)
+        system_prompt += "\n If you need to call xml tags that are used for tool calls, then do not use markdown markers like code blocks around you."
         if system_prompt:
             final_prompt += f"[SYSTEM]\n{system_prompt}\n\n"
     tools_result_extract = extract_tool_results(messages)

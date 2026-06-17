@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -75,7 +76,13 @@ class DeeperSeekerProvider(CustomLLM):
             self.sqlite_con.commit()
 
     def completion(self, model, messages, **kwargs):
-        api_key = kwargs.get("litellm_params").get("metadata").get("user_api_key")
+        litellm_params = kwargs.get("litellm_params")
+        if litellm_params.get("metadata"):
+            api_key = litellm_params.get("metadata").get("user_api_key_auth").api_key
+        else:
+            api_key = (
+                litellm_params.get("litellm_metadata").get("user_api_key_auth").api_key
+            )
         metadata = self.get_api_key_metadata(api_key)
         if not metadata:
             session_id = create_new_chat(self.auth_token)
@@ -102,23 +109,46 @@ class DeeperSeekerProvider(CustomLLM):
         for i in generator_message:
             if tool_coming:
                 current_tool_txt += i
-                if (
-                    len(current_tool_txt) >= 15
-                    and "<tool_call>" not in current_tool_txt
-                ):
+                is_possible_tool = (
+                    "<tool_call>".startswith(current_tool_txt)
+                    or "<tool_call>" in current_tool_txt
+                )
+                if not is_possible_tool and len(current_tool_txt) >= 15:
                     tool_coming = False
                     response += current_tool_txt
                     current_tool_txt = ""
                 elif "</tool_call>" in current_tool_txt:
-                    tools_txt.append(current_tool_txt)
-                    current_tool_txt = ""
-                    tool_coming = False
+                    raw, left_resp = current_tool_txt.split("</tool_call>", 1)
+                    tools_txt.append(raw + "</tool_call>")
+                    if "<" in left_resp:
+                        before_angle, after_angle = left_resp.split("<", 1)
+                        if before_angle:
+                            response += before_angle
+                        current_tool_txt = "<" + after_angle
+                    elif left_resp:
+                        response += left_resp
+                        current_tool_txt = ""
+                        tool_coming = False
+                    else:
+                        current_tool_txt = ""
+                        tool_coming = False
+
             elif "<" in i:
+                before_start, after_start = i.split("<", 1)
+                if before_start:
+                    response += before_start
                 tool_coming = True
-                current_tool_txt += i
+                current_tool_txt += "<" + after_start
             else:
                 response += i
         tools_called = parse_tool_call(tools_txt)
+        for i in tools_called:
+            if isinstance(i["function"]["arguments"], str):
+                i["function"]["arguments"] = json.dumps(
+                    json.loads(i["function"]["arguments"])
+                )
+            else:
+                i["function"]["arguments"] = json.dumps(i["function"]["arguments"])
 
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
@@ -138,7 +168,7 @@ class DeeperSeekerProvider(CustomLLM):
                 {
                     "index": 0,
                     "message": {
-                        "tool_calls": tools_called,
+                        "tool_calls": tools_called if tools_called else None,
                         "role": "assistant",
                         "content": response,
                     },
@@ -154,7 +184,14 @@ class DeeperSeekerProvider(CustomLLM):
         return response
 
     async def acompletion(self, model, messages, **kwargs):
-        api_key = kwargs.get("litellm_params").get("metadata").get("user_api_key")
+
+        litellm_params = kwargs.get("litellm_params")
+        if litellm_params.get("metadata"):
+            api_key = litellm_params.get("metadata").get("user_api_key_auth").api_key
+        else:
+            api_key = (
+                litellm_params.get("litellm_metadata").get("user_api_key_auth").api_key
+            )
         metadata = await asyncio.to_thread(self.get_api_key_metadata, api_key)
         if not metadata:
             session_id = await asyncio.to_thread(create_new_chat, self.auth_token)
@@ -190,23 +227,46 @@ class DeeperSeekerProvider(CustomLLM):
                 break
             if tool_coming:
                 current_tool_txt += chunk
-                if (
-                    len(current_tool_txt) >= 15
-                    and "<tool_call>" not in current_tool_txt
-                ):
+                is_possible_tool = (
+                    "<tool_call>".startswith(current_tool_txt)
+                    or "<tool_call>" in current_tool_txt
+                )
+                if not is_possible_tool and len(current_tool_txt) >= 15:
                     tool_coming = False
                     response += current_tool_txt
                     current_tool_txt = ""
                 elif "</tool_call>" in current_tool_txt:
-                    tools_txt.append(current_tool_txt)
-                    current_tool_txt = ""
-                    tool_coming = False
+                    raw, left_resp = current_tool_txt.split("</tool_call>", 1)
+                    tools_txt.append(raw + "</tool_call>")
+                    if "<" in left_resp:
+                        before_angle, after_angle = left_resp.split("<", 1)
+                        if before_angle:
+                            response += before_angle
+                        current_tool_txt = "<" + after_angle
+                    elif left_resp:
+                        response += left_resp
+                        current_tool_txt = ""
+                        tool_coming = False
+                    else:
+                        current_tool_txt = ""
+                        tool_coming = False
+
             elif "<" in chunk:
+                before_start, after_start = chunk.split("<", 1)
+                if before_start:
+                    response += before_start
                 tool_coming = True
-                current_tool_txt += chunk
+                current_tool_txt += "<" + after_start
             else:
                 response += chunk
         tools_called = await asyncio.to_thread(parse_tool_call, tools_txt)
+        for i in tools_called:
+            if isinstance(i["function"]["arguments"], str):
+                i["function"]["arguments"] = json.dumps(
+                    json.loads(i["function"]["arguments"])
+                )
+            else:
+                i["function"]["arguments"] = json.dumps(i["function"]["arguments"])
 
         output_tokens = token_counter(
             model="deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash",
@@ -228,7 +288,7 @@ class DeeperSeekerProvider(CustomLLM):
                 {
                     "index": 0,
                     "message": {
-                        "tool_calls": tools_called,
+                        "tool_calls": tools_called if tools_called else None,
                         "role": "assistant",
                         "content": response,
                     },
@@ -244,7 +304,13 @@ class DeeperSeekerProvider(CustomLLM):
         return response
 
     def streaming(self, model, messages, **kwargs):
-        api_key = kwargs.get("litellm_params").get("metadata").get("user_api_key")
+        litellm_params = kwargs.get("litellm_params")
+        if litellm_params.get("metadata"):
+            api_key = litellm_params.get("metadata").get("user_api_key_auth").api_key
+        else:
+            api_key = (
+                litellm_params.get("litellm_metadata").get("user_api_key_auth").api_key
+            )
         metadata = self.get_api_key_metadata(api_key)
         if not metadata:
             session_id = create_new_chat(self.auth_token)
@@ -283,24 +349,12 @@ class DeeperSeekerProvider(CustomLLM):
 
                 if not is_tool_tag and len(current_tool_txt) >= 15:
                     yield {
-                        "finish_reason": None,
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model,
-                        "is_finished": False,
-                        "usage": None,
                         "text": current_tool_txt,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "role": "assistant",
-                                    "content": current_tool_txt,
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
+                        "tool_use": None,
+                        "is_finished": False,
+                        "finish_reason": None,
+                        "usage": None,
+                        "index": 0,
                     }
                     response += current_tool_txt
                     current_tool_txt = ""
@@ -309,65 +363,47 @@ class DeeperSeekerProvider(CustomLLM):
 
                 if "</tool_call>" in current_tool_txt:
                     raw, left_resp = current_tool_txt.split("</tool_call>", 1)
-                    tool_json = parse_tool_call_streaming(raw + "</tool_call>")
+                    tool_json = parse_tool_call_streaming(
+                        "<tool_call>" + raw + "</tool_call>"
+                    )
                     tool_id = tool_json["id"]
                     name = tool_json["function"]["name"]
                     args_str = tool_json["function"]["arguments"]
+                    if isinstance(args_str, str):
+                        args_str = json.dumps(json.loads(args_str))
+                    else:
+                        args_str = json.dumps(args_str)
                     arg_chunks = [
                         args_str[k : k + 8] for k in range(0, len(args_str), 8)
                     ]
-                    for chunk_id, arg_piece in enumerate(arg_chunks):
-                        if chunk_id == 0:
-                            delta_tool = {
-                                "index": tool_index,
+                    for arg_piece in arg_chunks:
+                        yield {
+                            "text": "",
+                            "tool_use": {
                                 "id": tool_id,
                                 "type": "function",
-                                "function": {"name": name, "arguments": arg_piece},
-                            }
-
-                        else:
-                            delta_tool = {
                                 "index": tool_index,
-                                "function": {"arguments": arg_piece},
-                            }
-                            yield {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created_time,
-                                "model": model,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"tool_calls": [delta_tool]},
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
+                                "function": {"name": name, "arguments": arg_piece},
+                            },
+                            "is_finished": False,
+                            "finish_reason": None,
+                            "usage": None,
+                            "index": 0,
+                        }
                     tool_index += 1
+                    tools_called = True
 
                     if "<" in left_resp:
                         current_tool_txt = left_resp
                         tool_coming = True
                     elif left_resp:
                         yield {
-                            "finish_reason": None,
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_time,
-                            "model": model,
-                            "is_finished": False,
-                            "usage": None,
                             "text": left_resp,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "role": "assistant",
-                                        "content": left_resp,
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
+                            "tool_use": None,
+                            "is_finished": False,
+                            "finish_reason": None,
+                            "usage": None,
+                            "index": 0,
                         }
                         response += left_resp
                         current_tool_txt = ""
@@ -379,66 +415,38 @@ class DeeperSeekerProvider(CustomLLM):
             else:
                 if "<" not in chunk:
                     yield {
-                        "finish_reason": None,
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model,
-                        "is_finished": False,
-                        "usage": None,
                         "text": chunk,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"role": "assistant", "content": chunk},
-                                "finish_reason": None,
-                            }
-                        ],
+                        "tool_use": None,
+                        "is_finished": False,
+                        "finish_reason": None,
+                        "usage": None,
+                        "index": 0,
                     }
                     response += chunk
                     continue
 
                 before_tool, tool_useful = chunk.split("<", 1)
-                tools_called = True
                 tool_coming = True
                 if before_tool:
                     yield {
-                        "finish_reason": None,
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model,
-                        "is_finished": False,
-                        "usage": None,
                         "text": before_tool,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"role": "assistant", "content": before_tool},
-                                "finish_reason": None,
-                            }
-                        ],
+                        "tool_use": None,
+                        "is_finished": False,
+                        "finish_reason": None,
+                        "usage": None,
+                        "index": 0,
                     }
                     response += before_tool
                 current_tool_txt = "<" + tool_useful
 
         if tool_coming and current_tool_txt:
             yield {
-                "finish_reason": None,
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model,
-                "is_finished": False,
-                "usage": None,
                 "text": current_tool_txt,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": current_tool_txt},
-                        "finish_reason": None,
-                    }
-                ],
+                "tool_use": None,
+                "is_finished": False,
+                "finish_reason": None,
+                "usage": None,
+                "index": 0,
             }
             response += current_tool_txt
 
@@ -453,29 +461,27 @@ class DeeperSeekerProvider(CustomLLM):
 
         self.put_api_key_metadata(api_key, session_id, parent_message_id + 2)
         yield {
+            "text": "",
+            "tool_use": None,
+            "is_finished": True,
+            "finish_reason": "tool_calls" if tools_called else "stop",
             "usage": {
                 "prompt_tokens": input_tokens,
                 "completion_tokens": output_tokens,
                 "total_tokens": input_tokens + output_tokens,
             },
-            "finish_reason": "tool_calls" if tools_called else "stop",
-            "is_finished": True,
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created_time,
-            "model": model,
-            "text": "",
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": None},
-                    "finish_reason": "tool_calls" if tools_called else "stop",
-                }
-            ],
+            "index": 0,
         }
 
     async def astreaming(self, model, messages, **kwargs):
-        api_key = kwargs.get("litellm_params").get("metadata").get("user_api_key")
+        litellm_params = kwargs.get("litellm_params")
+        if litellm_params.get("metadata"):
+            api_key = litellm_params.get("metadata").get("user_api_key_auth").api_key
+        else:
+            api_key = (
+                litellm_params.get("litellm_metadata").get("user_api_key_auth").api_key
+            )
+
         metadata = await asyncio.to_thread(self.get_api_key_metadata, api_key)
         if not metadata:
             session_id = await asyncio.to_thread(create_new_chat, self.auth_token)
@@ -525,24 +531,12 @@ class DeeperSeekerProvider(CustomLLM):
 
                 if not is_tool_tag and len(current_tool_txt) >= 15:
                     yield {
-                        "finish_reason": None,
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model,
-                        "is_finished": False,
-                        "usage": None,
                         "text": current_tool_txt,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "role": "assistant",
-                                    "content": current_tool_txt,
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
+                        "tool_use": None,
+                        "is_finished": False,
+                        "finish_reason": None,
+                        "usage": None,
+                        "index": 0,
                     }
                     response += current_tool_txt
                     current_tool_txt = ""
@@ -557,41 +551,26 @@ class DeeperSeekerProvider(CustomLLM):
                     tool_id = tool_json["id"]
                     name = tool_json["function"]["name"]
                     args_str = tool_json["function"]["arguments"]
-
+                    if isinstance(args_str, str):
+                        args_str = json.dumps(json.loads(args_str))
+                    else:
+                        args_str = json.dumps(args_str)
                     arg_chunks = [
                         args_str[k : k + 8] for k in range(0, len(args_str), 8)
                     ]
-                    for chunk_id, arg_piece in enumerate(arg_chunks):
-                        if chunk_id == 0:
-                            delta_tool = {
-                                "index": tool_index,
-                                "id": tool_id,
-                                "type": "function",
-                                "function": {"name": name, "arguments": arg_piece},
-                            }
-
-                        else:
-                            delta_tool = {
-                                "index": tool_index,
-                                "function": {"arguments": arg_piece},
-                            }
-                        print(delta_tool)
+                    for arg_piece in arg_chunks:
                         yield {
                             "text": "",
-                            "is_finished": True,
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_time,
-                            "model": model,
+                            "tool_use": {
+                                "id": tool_id,
+                                "type": "function",
+                                "index": tool_index,
+                                "function": {"name": name, "arguments": arg_piece},
+                            },
+                            "is_finished": False,
                             "finish_reason": None,
                             "usage": None,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"tool_calls": [delta_tool]},
-                                    "finish_reason": None,
-                                }
-                            ],
+                            "index": 0,
                         }
                     tool_index += 1
                     tools_called = True
@@ -601,24 +580,12 @@ class DeeperSeekerProvider(CustomLLM):
                         tool_coming = True
                     elif left_resp:
                         yield {
-                            "finish_reason": None,
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_time,
-                            "model": model,
-                            "is_finished": False,
-                            "usage": None,
                             "text": left_resp,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "role": "assistant",
-                                        "content": left_resp,
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
+                            "tool_use": None,
+                            "is_finished": False,
+                            "finish_reason": None,
+                            "usage": None,
+                            "index": 0,
                         }
                         response += left_resp
                         current_tool_txt = ""
@@ -630,21 +597,12 @@ class DeeperSeekerProvider(CustomLLM):
             else:
                 if "<" not in chunk:
                     yield {
-                        "finish_reason": None,
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model,
-                        "is_finished": False,
-                        "usage": None,
                         "text": chunk,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"role": "assistant", "content": chunk},
-                                "finish_reason": None,
-                            }
-                        ],
+                        "tool_use": None,
+                        "is_finished": False,
+                        "finish_reason": None,
+                        "usage": None,
+                        "index": 0,
                     }
                     response += chunk
                     continue
@@ -654,42 +612,24 @@ class DeeperSeekerProvider(CustomLLM):
                 tool_coming = True
                 if before_tool:
                     yield {
-                        "finish_reason": None,
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model,
-                        "is_finished": False,
-                        "usage": None,
                         "text": before_tool,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"role": "assistant", "content": before_tool},
-                                "finish_reason": None,
-                            }
-                        ],
+                        "tool_use": None,
+                        "is_finished": False,
+                        "finish_reason": None,
+                        "usage": None,
+                        "index": 0,
                     }
                     response += before_tool
                 current_tool_txt = "<" + tool_useful
 
         if tool_coming and current_tool_txt:
             yield {
-                "finish_reason": None,
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model,
-                "is_finished": False,
-                "usage": None,
                 "text": current_tool_txt,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": current_tool_txt},
-                        "finish_reason": None,
-                    }
-                ],
+                "tool_use": None,
+                "is_finished": False,
+                "finish_reason": None,
+                "usage": None,
+                "index": 0,
             }
             response += current_tool_txt
 
@@ -706,25 +646,16 @@ class DeeperSeekerProvider(CustomLLM):
             self.put_api_key_metadata, api_key, session_id, parent_message_id + 2
         )
         yield {
+            "text": "",
+            "tool_use": None,
+            "is_finished": True,
+            "finish_reason": "tool_calls" if tools_called else "stop",
             "usage": {
                 "prompt_tokens": input_tokens,
                 "completion_tokens": output_tokens,
                 "total_tokens": input_tokens + output_tokens,
             },
-            "finish_reason": "tool_calls" if tools_called else "stop",
-            "is_finished": True,
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created_time,
-            "model": model,
-            "text": "",
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": None},
-                    "finish_reason": "tool_calls" if tools_called else "stop",
-                }
-            ],
+            "index": 0,
         }
 
 
