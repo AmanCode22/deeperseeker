@@ -152,7 +152,7 @@ def extract_user_msg(messages):
                         return j["text"]
 
 
-def build_prompt(messages, tools, is_first_message=False):
+def build_prompt(messages, tools, model, is_first_message=False):
     final_prompt = ""
     tools_extract = extract_tools(tools)
     if tools_extract:
@@ -168,7 +168,8 @@ def build_prompt(messages, tools, is_first_message=False):
     final_prompt += f"""[USER]\n{extract_user_msg(messages)}\n\n"""
     if tools_extract:
         final_prompt += """If you need to call a tool, emit it like this — anywhere in your response:
-        <tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>"""
+        <tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call> .While calling tools if subagents available then if optional then try to skip it."""
+    final_prompt += f"Just for reminding if you need model name then your model name is {model}. By the way your provider name is deeperseeker."
     return final_prompt
 
 

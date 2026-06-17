@@ -99,7 +99,7 @@ class DeeperSeekerProvider(CustomLLM):
                 session_id, parent_message_id = metadata
             file_ids = extract_and_upload_files(messages, self.auth_token)
             tools = kwargs.get("optional_params").get("tools", [])
-            prompt = build_prompt(messages, tools, parent_message_id == 0)
+            prompt = build_prompt(messages, tools, model, parent_message_id == 0)
             generator_message = send_message(
                 session_id,
                 self.auth_token,
@@ -219,7 +219,7 @@ class DeeperSeekerProvider(CustomLLM):
             )
             tools = kwargs.get("optional_params").get("tools", [])
             prompt = await asyncio.to_thread(
-                build_prompt, messages, tools, parent_message_id == 0
+                build_prompt, messages, tools, model, parent_message_id == 0
             )
             generator_message = await asyncio.to_thread(
                 send_message,
@@ -345,7 +345,7 @@ class DeeperSeekerProvider(CustomLLM):
             file_ids = extract_and_upload_files(messages, self.auth_token)
 
             tools = kwargs.get("optional_params").get("tools", [])
-            prompt = build_prompt(messages, tools, parent_message_id == 0)
+            prompt = build_prompt(messages, tools, model, parent_message_id == 0)
             generator_message = send_message(
                 session_id,
                 self.auth_token,
@@ -522,7 +522,7 @@ class DeeperSeekerProvider(CustomLLM):
             )
             tools = kwargs.get("optional_params").get("tools", [])
             prompt = await asyncio.to_thread(
-                build_prompt, messages, tools, parent_message_id == 0
+                build_prompt, messages, tools, model, parent_message_id == 0
             )
             generator_message = await asyncio.to_thread(
                 send_message,
@@ -572,7 +572,8 @@ class DeeperSeekerProvider(CustomLLM):
                     if "</tool_call>" in current_tool_txt:
                         raw, left_resp = current_tool_txt.split("</tool_call>", 1)
                         tool_json = await asyncio.to_thread(
-                            parse_tool_call_streaming, "<tool_call>" + raw + "</tool_call>"
+                            parse_tool_call_streaming,
+                            "<tool_call>" + raw + "</tool_call>",
                         )
                         tool_id = tool_json["id"]
                         name = tool_json["function"]["name"]
