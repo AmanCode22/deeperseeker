@@ -45,6 +45,14 @@ Now you can run litellm server using
 python3 run.py
 ```
 
+You can use http://localhost:4000 or your public ip with port 4000 as base url in both anthropic and openai clients.
+File upload support works fine and is both anthropic and openai compatible.
+Model names are: instant,vision and expert.
+As per deepseek website :
+- Instant supports file,search and thinking.
+- Vision supports thinking and files(vision image forking is done when vision is detected so instead of ocr original vision is used similar to deepseek website)
+- Expert just supports thinking so files are dropped.
+
 Deeperseeker uses wasm file from my repo in which I recreated deepseek POW solver: [deepseek_pow_solver](https://github.com/AmanCode22/deepseek_pow_solver)
 
 # Few Important Notes
