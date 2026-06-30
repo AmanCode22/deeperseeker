@@ -7,11 +7,8 @@ It uses litellm to expose anthropic and openai compatible endpoints
 Firstly you need python to run deeperseeker and git to clone repo.
 It is recommended to use venv to install dependencies to prevent breaking system packages.
 
-Firstly clone the repo
-
-```bash
-git clone https://github.com/amancode22/deeeperseeker
-```
+Firstly download the zip from releases as  the git clone can download unstable code from repo.
+Then unzip it.
 Nextly, create and activate venv(optional, but recommended)
 ```bash
 python3 -m venv deeperseeker_env
@@ -49,5 +46,13 @@ python3 run.py
 ```
 
 Deeperseeker uses wasm file from my repo in which I recreated deepseek POW solver: [deepseek_pow_solver](https://github.com/AmanCode22/deepseek_pow_solver)
+
+# Few Important Notes
+ - LiteLLM's UI is opened at http://localhost:4000 or your public ip.
+ - Litellm UI's default admin password is admin@1234, can be changed in .env file.
+ - Currently, every api key represents a chat id, api key can be generated in litellm admin ui.
+ - You must not logout from deepseek on the browser from which auth token is extracted or else it will also trigger logout. Clear cookies instead of deepseek website.
+
+
 # Disclamer
 This project is just for educational purpose it is not affilated with deepseek anyway.
