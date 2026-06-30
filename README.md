@@ -53,6 +53,16 @@ Deeperseeker uses wasm file from my repo in which I recreated deepseek POW solve
  - Currently, every api key represents a chat id, api key can be generated in litellm admin ui.
  - You must not logout from deepseek on the browser from which auth token is extracted or else it will also trigger logout. Clear cookies instead of deepseek website.
 
+ # Currently being built or in future be built
+ - MCP support
+ - litellm alternative seeking
+ - multi account pooling
+ - system prompt and message signature based chat session detection or create new chat on chat not detected with history.
+ - add login support with password and email instead of relying on auth token and keep auth token as not recommended but supported login method.
+ - better tool call management
+ - add better rate limit handling
+
+ If you find any other thing useful open a issue.
 
 # Disclamer
 This project is just for educational purpose it is not affilated with deepseek anyway.
