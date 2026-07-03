@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import mimetypes
@@ -7,18 +8,18 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import requests
-from functions import upload_file
+import aiohttp
+from functions import get_session, upload_file
 
 
-def extract_system(messages):
+async def extract_system(messages):
     for i in messages:
         if i["role"] == "system":
             return i["content"]
     return None
 
 
-def extract_tools(tools):
+async def extract_tools(tools):
     final_tools = ""
     for i in tools:
         if i["type"] == "function":
@@ -49,7 +50,7 @@ def extract_tools(tools):
     return final_tools if final_tools != "" else None
 
 
-def extract_tool_results(messages):
+async def extract_tool_results(messages):
     tools_final = ""
     for i in messages:
         if i["role"] == "tool":
@@ -57,7 +58,7 @@ def extract_tool_results(messages):
     return tools_final if tools_final != "" else None
 
 
-def extract_and_upload_files(messages, auth_token):
+async def extract_and_upload_files(messages, auth_token):
     result_fileids = []
     for i in messages:
         content = i.get("content")
@@ -73,9 +74,11 @@ def extract_and_upload_files(messages, auth_token):
                     url_path = urlsplit(j["image_url"]["url"]).path
                     filename = Path(url_path).name
                     mime_type, _ = mimetypes.guess_type(filename)
-                    file_bytes = requests.get(j["image_url"]["url"]).content
+                    session = await get_session()
+                    async with session.get(j["image_url"]["url"]) as resp:
+                        file_bytes = await resp.read()
 
-                    for k in upload_file(file_bytes, filename, mime_type, auth_token):
+                    async for k in upload_file(file_bytes, filename, mime_type, auth_token):
                         if k[0] == "uploaded":
                             continue
                         elif k[0] == "success":
@@ -94,7 +97,7 @@ def extract_and_upload_files(messages, auth_token):
                     data_bytes = base64.b64decode(
                         base64_data.split("data:")[1].encode()
                     )
-                    for k in upload_file(data_bytes, filename, mime_type, auth_token):
+                    async for k in upload_file(data_bytes, filename, mime_type, auth_token):
                         if k[0] == "uploaded":
                             continue
                         elif k[0] == "success":
@@ -112,7 +115,7 @@ def extract_and_upload_files(messages, auth_token):
                     data_bytes = base64.b64decode(
                         base64_data.split("data:")[1].encode()
                     )
-                    for k in upload_file(data_bytes, filename, mime_type, auth_token):
+                    async for k in upload_file(data_bytes, filename, mime_type, auth_token):
                         if k[0] == "uploaded":
                             continue
                         elif k[0] == "success":
@@ -129,7 +132,7 @@ def extract_and_upload_files(messages, auth_token):
                         + mimetypes.guess_extension(mime_type)
                     )
                     data_bytes = base64.b64decode(base64_data.encode())
-                    for k in upload_file(data_bytes, filename, mime_type, auth_token):
+                    async for k in upload_file(data_bytes, filename, mime_type, auth_token):
                         if k[0] == "uploaded":
                             continue
                         elif k[0] == "success":
@@ -141,7 +144,7 @@ def extract_and_upload_files(messages, auth_token):
     return result_fileids
 
 
-def extract_user_msg(messages):
+async def extract_user_msg(messages):
     for i in messages[::-1]:
         if i["role"] == "user":
             if isinstance(i["content"], str):
@@ -152,20 +155,20 @@ def extract_user_msg(messages):
                         return j["text"]
 
 
-def build_prompt(messages, tools, model, is_first_message=False):
+async def build_prompt(messages, tools, model, is_first_message=False):
     final_prompt = ""
-    tools_extract = extract_tools(tools)
+    tools_extract = await extract_tools(tools)
     if tools_extract:
         final_prompt += f"""[TOOLS]\n{tools_extract}\n\n"""
     if is_first_message:
-        system_prompt = extract_system(messages)
-        system_prompt += "\n If you need to call xml tags that are used for tool calls, then do not use markdown markers like code blocks around you."
+        system_prompt = await extract_system(messages)
         if system_prompt:
+            system_prompt += "\n If you need to call xml tags that are used for tool calls, then do not use markdown markers like code blocks around you."
             final_prompt += f"[SYSTEM]\n{system_prompt}\n\n"
-    tools_result_extract = extract_tool_results(messages)
+    tools_result_extract = await extract_tool_results(messages)
     if tools_result_extract:
         final_prompt += f"""[TOOL RESULTS]\n{tools_result_extract}\n\n"""
-    final_prompt += f"""[USER]\n{extract_user_msg(messages)}\n\n"""
+    final_prompt += f"""[USER]\n{await extract_user_msg(messages)}\n\n"""
     if tools_extract:
         final_prompt += """If you need to call a tool, emit it like this — anywhere in your response:
         <tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call> .While calling tools if subagents available then if optional then try to skip it."""
@@ -173,7 +176,7 @@ def build_prompt(messages, tools, model, is_first_message=False):
     return final_prompt
 
 
-def parse_tool_call(tools_list):
+async def parse_tool_call(tools_list):
     tools_called = []
     for i in tools_list:
         i = i.strip()
@@ -210,7 +213,7 @@ def parse_tool_call(tools_list):
     return tools_called
 
 
-def parse_tool_call_streaming(tool_txt):
+async def parse_tool_call_streaming(tool_txt):
     tool_txt = tool_txt.strip()
     tool_json = json.loads(
         tool_txt.replace("<tool_call>", "").replace("</tool_call>", "").strip()

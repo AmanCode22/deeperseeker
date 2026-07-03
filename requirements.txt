@@ -1,7 +1,7 @@
 wasmtime
 numpy
 playwright
-requests
+aiohttp
 litellm[proxy]
 prisma
 pgserver
