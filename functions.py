@@ -3,6 +3,7 @@ import base64
 import json
 import mimetypes
 import os
+import sqlite3
 import time
 from datetime import datetime, timezone
 
@@ -79,6 +80,169 @@ async def _generate_cookies():
         await browser.close()
     with open("aws_cookies_deepseek.json", "w") as f:
         f.write(json.dumps({"cookie": final_cookies, "expiry": expiry}))
+
+
+async def login_account(email=None, mobile=None, area_code="", password=""):
+    cookie = await get_cookies()
+    session = await get_session()
+    url = "https://chat.deepseek.com/api/v0/users/login"
+    headers = get_headers(None)
+    json_data = {
+        "email": email,
+        "mobile": mobile,
+        "password": password,
+        "area_code": area_code,
+        "device_id": "",
+        "os": "web",
+    }
+    async with session.post(
+        url, cookies=cookie, headers=headers, json=json_data
+    ) as response:
+        if response.status != 200:
+            return None
+        data = await response.json()
+    try:
+        if data["data"]["biz_data"]["biz_code"] != 0:
+            return None
+        return data["data"]["biz_data"]["user"]["token"]
+    except (KeyError, TypeError):
+        return None
+
+
+def init_db():
+    conn = sqlite3.connect("deeperseeker.db")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT,
+            mobile TEXT,
+            area_code TEXT,
+            password TEXT,
+            token TEXT,
+            status TEXT
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS sessions (
+            signature TEXT PRIMARY KEY,
+            account_id INTEGER,
+            deepseek_session_id TEXT,
+            parent_message_id INTEGER
+        )"""
+    )
+    conn.commit()
+    conn.close()
+
+
+def add_account(email=None, mobile=None, area_code="", password=""):
+    conn = sqlite3.connect("deeperseeker.db")
+    cur = conn.execute(
+        """INSERT INTO accounts (email, mobile, area_code, password, token, status)
+           VALUES (?, ?, ?, ?, NULL, ?)""",
+        (email, mobile, area_code, password, "NOT_LOGGED_IN"),
+    )
+    account_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return account_id
+
+
+async def get_account_token(account_id):
+    conn = sqlite3.connect("deeperseeker.db")
+    row = conn.execute(
+        "SELECT email, mobile, area_code, password, token, status FROM accounts WHERE id = ?",
+        (account_id,),
+    ).fetchone()
+    if row is None:
+        conn.close()
+        return None
+    email, mobile, area_code, password, token, status = row
+    if status == "RUNNING" and token:
+        conn.close()
+        return token
+    token = await login_account(
+        email=email, mobile=mobile, area_code=area_code, password=password
+    )
+    if token is None:
+        conn.execute(
+            "UPDATE accounts SET status = ? WHERE id = ?",
+            ("NOT_LOGGED_IN", account_id),
+        )
+        conn.commit()
+        conn.close()
+        return None
+    conn.execute(
+        "UPDATE accounts SET token = ?, status = ? WHERE id = ?",
+        (token, "RUNNING", account_id),
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+
+async def get_account_rate_limit(signature):
+    conn = sqlite3.connect("deeperseeker.db")
+    row = conn.execute(
+        "SELECT account_id FROM sessions WHERE signature = ?",
+        (signature,),
+    ).fetchone()
+    if row is not None:
+        account_id = row[0]
+        status = conn.execute(
+            "SELECT status FROM accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+        if status is not None and status[0] == "RUNNING":
+            conn.close()
+            return account_id
+    account = conn.execute(
+        "SELECT id FROM accounts WHERE status = ? ORDER BY id LIMIT 1",
+        ("RUNNING",),
+    ).fetchone()
+    if account is None:
+        account = conn.execute(
+            "SELECT id FROM accounts ORDER BY id LIMIT 1",
+        ).fetchone()
+    account_id = account[0] if account is not None else None
+    conn.close()
+    return account_id
+
+
+async def send_history_new_account(
+    signature, account_id, messages, model, thinking=False, search=False
+):
+    from plugin_helper import build_prompt, generate_signature
+
+    token = await get_account_token(account_id)
+    if token is None:
+        return
+    session_id = await create_new_chat(token)
+    parent_message_id = 0
+    tools = []
+    prompt = await build_prompt(
+        messages, tools, model, is_first_message=True
+    )
+    sig = await generate_signature(messages)
+    conn = sqlite3.connect("deeperseeker.db")
+    conn.execute(
+        """INSERT OR REPLACE INTO sessions
+           (signature, account_id, deepseek_session_id, parent_message_id)
+           VALUES (?, ?, ?, ?)""",
+        (sig, account_id, session_id, parent_message_id),
+    )
+    conn.commit()
+    conn.close()
+    generator = send_message(
+        session_id,
+        token,
+        prompt,
+        parent_message_id,
+        thinking=thinking,
+        search=search,
+        model_type=None if model == "instant" else model,
+    )
+    async for chunk in generator:
+        yield chunk
 
 
 def _find_pow_answer_blocking(challange_data):

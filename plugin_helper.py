@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import mimetypes
 import random
@@ -153,6 +154,34 @@ async def extract_user_msg(messages):
                 for j in i["content"]:
                     if j["type"] == "text":
                         return j["text"]
+
+
+async def generate_signature(messages):
+    system_prompt = await extract_system(messages)
+    first_user = ""
+    for i in messages:
+        if i["role"] == "user":
+            if isinstance(i["content"], str):
+                first_user = i["content"]
+            else:
+                for j in i["content"]:
+                    if j["type"] == "text":
+                        first_user = j["text"]
+            break
+    first_assistant = ""
+    for i in messages:
+        if i["role"] == "assistant":
+            if isinstance(i["content"], str):
+                first_assistant = i["content"]
+            else:
+                for j in i["content"]:
+                    if j["type"] == "text":
+                        first_assistant = j["text"]
+            break
+    joined = (
+        f"{system_prompt}\n---\n{first_user}\n---\n{first_assistant}"
+    )
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
 async def build_prompt(messages, tools, model, is_first_message=False):
