@@ -8,4 +8,3 @@ pgserver
 uvicorn
 dotenv
 psycopg2-binary
-sqlite3
