@@ -16,7 +16,7 @@ python3 app.py
 
 ### Docker / Podman (Podman recommended for rootless execution)
 
-*Idea suggested in issue #3.*
+Suggested in issue #3.
 
 ```bash
 cp .env.example .env
