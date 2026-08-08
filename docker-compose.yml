@@ -7,10 +7,5 @@ services:
     env_file:
       - .env
     volumes:
-      - deeperseeker_db:/app/deeperseeker.db
-      - deeperseeker_cookies:/app/aws_cookies_deepseek.json
+      - ./data:/app/data
     restart: unless-stopped
-
-volumes:
-  deeperseeker_db:
-  deeperseeker_cookies:

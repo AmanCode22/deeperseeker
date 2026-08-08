@@ -30,7 +30,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium --with-deps || playwright install chromium
 
 COPY . .
-RUN touch deeperseeker.db && echo '{}' > aws_cookies_deepseek.json
+
+# Create persistent data dir and symlink root files to it
+RUN mkdir -p /app/data && \
+    ln -sf /app/data/deeperseeker.db /app/deeperseeker.db && \
+    ln -sf /app/data/aws_cookies_deepseek.json /app/aws_cookies_deepseek.json
+
 EXPOSE 4000
 
 CMD ["python3", "app.py"]
