@@ -1,0 +1,12 @@
+services:
+  deeperseeker:
+    build: .
+    container_name: deeperseeker
+    ports:
+      - "4000:4000"
+    env_file:
+      - .env
+    volumes:
+      - ./deeperseeker.db:/app/deeperseeker.db
+      - ./aws_cookies_deepseek.json:/app/aws_cookies_deepseek.json
+    restart: unless-stopped

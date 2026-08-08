@@ -4,6 +4,7 @@ DeepSeek website reverse-proxy server with FastAPI, supporting OpenAI & Anthropi
 
 ## Quickstart
 
+### Local Python
 ```bash
 python3 -m venv deeperseeker_env
 source deeperseeker_env/bin/activate
@@ -11,6 +12,26 @@ pip install -r requirements.txt
 playwright install chromium
 cp .env.example .env
 python3 app.py
+```
+
+### Docker / Podman (Podman recommended for rootless execution)
+
+*Idea suggested in issue #3.*
+
+```bash
+cp .env.example .env
+
+# Using Podman (Recommended - Rootless)
+podman build -t deeperseeker .
+podman run -d --name deeperseeker -p 4000:4000 --env-file .env deeperseeker
+
+# Using Docker
+docker build -t deeperseeker .
+docker run -d --name deeperseeker -p 4000:4000 --env-file .env deeperseeker
+
+# Or using Podman Compose / Docker Compose
+podman-compose up -d
+# docker compose up -d
 ```
 
 Dashboard: `http://localhost:4000/`
