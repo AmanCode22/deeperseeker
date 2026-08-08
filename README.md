@@ -63,3 +63,7 @@ cp .env.example .env
 |-------|------------------|-----------------|--------|
 | `deepseek-v4-flash` (`instant`/`vision`) | $0.14 | $0.0028 | $0.28 |
 | `deepseek-v4-pro` (`expert`) | $0.435 | $0.003625 | $0.87 |
+
+## Disclaimer
+
+Educational purpose only. This project is not affiliated with, endorsed by, or sponsored by DeepSeek. Use responsibly and in accordance with DeepSeek's terms of service.
