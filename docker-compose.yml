@@ -7,5 +7,8 @@ services:
     env_file:
       - .env
     volumes:
-      - ./data:/app/data
+      - deeperseeker_data:/app/data
     restart: unless-stopped
+
+volumes:
+  deeperseeker_data:
