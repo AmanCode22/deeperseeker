@@ -7,14 +7,10 @@ services:
     env_file:
       - .env
     volumes:
-      - type: bind
-        source: ./deeperseeker.db
-        target: /app/deeperseeker.db
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./aws_cookies_deepseek.json
-        target: /app/aws_cookies_deepseek.json
-        bind:
-          create_host_path: false
+      - deeperseeker_db:/app/deeperseeker.db
+      - deeperseeker_cookies:/app/aws_cookies_deepseek.json
     restart: unless-stopped
+
+volumes:
+  deeperseeker_db:
+  deeperseeker_cookies:
