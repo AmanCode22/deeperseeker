@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Login - DeeperSeeker{% endblock %}
+{% block content %}
+<h1>Login</h1>
+{% if error %}
+<p style="color:red;">{{ error }}</p>
+{% endif %}
+<form method="post" action="/login">
+    <div style="margin-bottom:10px;">
+        <input type="text" name="username" placeholder="Username" required style="width:300px;">
+    </div>
+    <div style="margin-bottom:10px;">
+        <input type="password" name="password" placeholder="Password" required style="width:300px;">
+    </div>
+    <button type="submit">Login</button>
+</form>
+{% endblock %}

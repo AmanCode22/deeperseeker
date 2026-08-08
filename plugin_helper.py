@@ -194,6 +194,20 @@ async def build_prompt(messages, tools, model, is_first_message=False):
         if system_prompt:
             system_prompt += "\n If you need to call xml tags that are used for tool calls, then do not use markdown markers like code blocks around you."
             final_prompt += f"[SYSTEM]\n{system_prompt}\n\n"
+        if len(messages) > 1:
+            history_parts = []
+            for msg in messages[:-1]:
+                role = msg.get("role", "unknown")
+                if role == "system":
+                    continue
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
+                if content:
+                    history_parts.append(f"{role.upper()}: {content}")
+            if history_parts:
+                history_text = "\n".join(history_parts)
+                final_prompt += f"[PREVIOUS CONVERSATION HISTORY]\n{history_text}\n\n"
     tools_result_extract = await extract_tool_results(messages)
     if tools_result_extract:
         final_prompt += f"""[TOOL RESULTS]\n{tools_result_extract}\n\n"""

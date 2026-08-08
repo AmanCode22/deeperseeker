@@ -2,9 +2,9 @@ wasmtime
 numpy
 playwright
 aiohttp
-litellm[proxy]
-prisma
-pgserver
 uvicorn
-dotenv
-psycopg2-binary
+fastapi
+python-multipart
+jinja2
+deepseek-tokenizer
+python-dotenv

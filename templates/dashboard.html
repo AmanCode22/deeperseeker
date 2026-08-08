@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - DeeperSeeker{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+
+<section>
+    <h2>Add Auth Token</h2>
+    <div class="steps">
+        <p><strong>Steps:</strong></p>
+        <ol>
+            <li>Open <strong>incognito/private</strong> window</li>
+            <li>Go to <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a> and login</li>
+            <li>Open DevTools (F12) → Console → paste:</li>
+        </ol>
+        <code>JSON.parse(localStorage.getItem("userToken")).value</code>
+        <ol start="4">
+            <li>Copy the token and paste below</li>
+            <li><strong>Remove any surrounding quotes</strong> — paste only the raw token string</li>
+            <li><strong>Close the incognito window</strong> to preserve the login</li>
+        </ol>
+    </div>
+    <div class="warning">
+        If you logout from DeepSeek in browser, this token stops working.
+    </div>
+    <form method="post" action="/tokens/add">
+        <input type="text" name="alias" placeholder="Alias (optional, e.g. personal, work)" style="width:200px">
+        <input type="text" name="auth_token" placeholder="Paste auth token here (no quotes)" style="width:400px">
+        <button type="submit">Add Token</button>
+    </form>
+</section>
+
+<section>
+    <h2>Tokens ({{ tokens|length }})</h2>
+    {% if tokens %}
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Alias</th>
+                <th>Token</th>
+                <th>Status</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for tok in tokens %}
+            <tr>
+                <td>{{ tok['id'] }}</td>
+                <td>{{ tok['alias'] or '—' }}</td>
+                <td><code>{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
+                <td>
+                    <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] == 'RATE_LIMITED' %}warn{% else %}err{% endif %}">
+                        {{ tok['status'] }}
+                    </span>
+                </td>
+                <td>
+                    <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
+                          onsubmit="return confirm('Delete?')">
+                        <button type="submit" class="btn-sm btn-danger">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No tokens yet.</p>
+    {% endif %}
+</section>
+
+<section>
+    <h2>API</h2>
+    <p>OpenAI: <code>http://localhost:4000/v1</code></p>
+    <p>Anthropic: <code>http://localhost:4000</code></p>
+    <p>Models: <code>instant</code>, <code>vision</code>, <code>expert</code></p>
+</section>
+{% endblock %}

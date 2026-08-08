@@ -1,6 +1,5 @@
-litellm_db/
-auth_token.txt
 aws_cookies_deepseek.json
 __pycache__/
-api_key_metadata.sqlite
+deeperseeker.db
+.venv/
 .env
