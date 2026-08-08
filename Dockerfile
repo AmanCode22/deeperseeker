@@ -2,7 +2,6 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies required for Playwright Chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     libglib2.0-0 \
@@ -19,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxdamage1 \
     libxext6 \
     libxfixes3 \
-    librandr2 \
+    libxrandr2 \
     libgbm1 \
     libpango-1.0-0 \
     libcairo2 \
