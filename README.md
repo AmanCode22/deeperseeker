@@ -15,6 +15,20 @@ python3 app.py
 
 Dashboard: `http://localhost:4000/`
 
+## Configuration (`.env`)
+
+Copy `.env.example` to `.env` and edit your secret values:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Description | Default |
+|---|---|---|
+| `DEEPSEEKER_API_KEY` | Bearer API key required to access endpoints | `dseeker` |
+| `DEEPSEEKER_ADMIN_USER` | Dashboard login username | `admin` |
+| `DEEPSEEKER_ADMIN_PASSWORD` | Dashboard login password | `admin` |
+
 ## Auth Token Setup
 
 1. Open incognito window -> `chat.deepseek.com` -> Login
