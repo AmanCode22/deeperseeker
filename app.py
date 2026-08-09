@@ -37,7 +37,6 @@ from functions import (
     mark_active,
     parse_tools,
     pick_token,
-    save_auth_token,
     save_session,
     save_session_map,
     send_message,
@@ -442,7 +441,6 @@ async def tokens_add(request: Request):
     auth_token = form.get("auth_token", "").strip().strip("'\"")
     alias = form.get("alias", "").strip() or None
     if auth_token:
-        save_auth_token(auth_token)
         add_token(auth_token, alias)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 

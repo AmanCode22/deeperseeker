@@ -106,7 +106,6 @@ async def _generate_cookies():
         page = await context.new_page()
         await page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded")
         await page.wait_for_selector("body")
-        # Wait for user to solve CAPTCHA — page will navigate to sign_in
         try:
             await page.wait_for_url("**/sign_in*", timeout=120000)
         except Exception:
@@ -126,16 +125,9 @@ async def _generate_cookies():
         f.write(json.dumps({"cookie": final_cookies, "expiry": expiry}))
 
 
-def save_auth_token(auth_token):
-    conn = get_db()
-    conn.execute("INSERT OR REPLACE INTO tokens (id, token, status) VALUES (1, ?, 'ACTIVE')", (auth_token,))
-    conn.commit()
-    conn.close()
-
-
 def get_auth_token():
     conn = get_db()
-    row = conn.execute("SELECT token FROM tokens WHERE id = 1").fetchone()
+    row = conn.execute("SELECT token FROM tokens LIMIT 1").fetchone()
     conn.close()
     if row:
         return row[0]
@@ -144,7 +136,17 @@ def get_auth_token():
 
 def add_token(token, alias=None):
     conn = get_db()
-    conn.execute("INSERT INTO tokens (alias, token, status) VALUES (?, ?, 'ACTIVE')", (alias, token))
+    if not conn.execute("SELECT 1 FROM tokens WHERE id = 1").fetchone():
+        next_id = 1
+    else:
+        row = conn.execute("""
+            SELECT min(t1.id + 1)
+            FROM tokens t1
+            LEFT JOIN tokens t2 ON t1.id + 1 = t2.id
+            WHERE t2.id IS NULL
+        """).fetchone()
+        next_id = row[0] if row and row[0] else 1
+    conn.execute("INSERT INTO tokens (id, alias, token, status) VALUES (?, ?, ?, 'ACTIVE')", (next_id, alias, token))
     conn.commit()
     conn.close()
 
