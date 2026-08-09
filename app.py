@@ -87,65 +87,92 @@ def check_key(request: Request):
     return key == API_KEY
 
 
-async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None):
+async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None):
+    print("[STEP] Starting handle_chat", flush=True)
     auth_token = get_auth_token()
     if not auth_token:
+        print("[STEP] No auth token available", flush=True)
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
 
+    print("[STEP] Generating signature", flush=True)
     sig = await generate_signature(messages)
+    print(f"[STEP] Signature generated: {sig}", flush=True)
     sess = find_session(sig)
 
     if sess:
+        print(f"[STEP] Found existing session: {sess['session_id']}", flush=True)
         token_id = sess["token_id"]
         session_id = sess["session_id"]
         parent_message_id = sess["parent_message_id"]
         tok = get_token(token_id)
         if tok and tok["status"] == "RATE_LIMITED":
+            print(f"[STEP] Token {token_id} is RATE_LIMITED, attempting fallback", flush=True)
             summary = summarize_messages(messages)
             new_token_id = pick_token()
             if new_token_id and new_token_id != token_id:
                 new_tok = get_token(new_token_id)
                 if new_tok:
+                    print(f"[STEP] Creating new session with fallback token {new_token_id}", flush=True)
                     new_session_id = await create_new_chat(new_tok["token"])
                     save_session_map(session_id, new_session_id, new_token_id)
+                    print("[STEP] Building prompt for fallback session", flush=True)
                     prompt = await build_prompt(messages, tools or [], model, is_first_message=True)
+                    print("[STEP] Sending message to fallback session", flush=True)
                     gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, None if model == "instant" else model)
                     if stream:
-                        return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools), media_type="text/event-stream")
+                        print("[STEP] Returning streaming response (fallback)", flush=True)
+                        if is_anthropic:
+                            return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, parent_message_id), media_type="text/event-stream")
+                        return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, parent_message_id), media_type="text/event-stream")
                     else:
+                        print("[STEP] Awaiting full response (fallback)", flush=True)
                         resp_text = await collect_response(gen)
                         save_session(sig, new_token_id, new_session_id, 2)
                         return format_response(resp_text, model, messages, tools)
     else:
+        print("[STEP] No existing session found, creating new session", flush=True)
         token_id = pick_token()
         if not token_id:
+            print("[STEP] No tokens available", flush=True)
             return JSONResponse({"error": "No tokens available"}, status_code=503)
         tok = get_token(token_id)
         if not tok:
+            print("[STEP] Picked token not found", flush=True)
             return JSONResponse({"error": "Token not found"}, status_code=503)
         session_id = await create_new_chat(tok["token"])
+        print(f"[STEP] New session created: {session_id} using token {token_id}", flush=True)
         parent_message_id = 0
 
     tok = get_token(token_id)
     if not tok:
+        print(f"[STEP] Token {token_id} expired or missing", flush=True)
         return JSONResponse({"error": "Token expired"}, status_code=503)
 
+    print("[STEP] Extracting and uploading files", flush=True)
     file_ids = await extract_and_upload_files(messages, tok["token"])
     is_first = parent_message_id == 0
+    print("[STEP] Building prompt", flush=True)
     prompt = await build_prompt(messages, tools or [], model, is_first)
 
     try:
+        print("[STEP] Sending message", flush=True)
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, None if model == "instant" else model, file_ids)
         if stream:
-            return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools), media_type="text/event-stream")
+            print("[STEP] Returning streaming response", flush=True)
+            if is_anthropic:
+                return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id), media_type="text/event-stream")
+            return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id), media_type="text/event-stream")
         else:
+            print("[STEP] Awaiting full response", flush=True)
             resp_text = await collect_response(gen)
             save_session(sig, token_id, session_id, parent_message_id + 2)
             return format_response(resp_text, model, messages, tools)
     except Exception as e:
+        print(f"[STEP] Exception encountered: {e}", flush=True)
         if "429" in str(e) or "rate" in str(e).lower():
+            print(f"[STEP] Rate limit hit, marking token {token_id} as limited", flush=True)
             mark_limited(token_id)
-            return await handle_chat(messages, model, thinking, search, stream, tools)
+            return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model)
         raise
 
 
@@ -156,9 +183,9 @@ async def extract_user_msg_text(messages):
             if isinstance(content, str):
                 return content
             if isinstance(content, list):
-                for c in content:
-                    if c.get("type") == "text":
-                        return c["text"]
+                parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+                if parts:
+                    return "\n".join(parts)
     return ""
 
 
@@ -169,7 +196,7 @@ async def collect_response(gen):
     return text
 
 
-async def stream_response(gen, model, messages, token_id, session_id, sig, tools):
+async def stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id=0):
     parser = StreamToolParser()
     full_text = ""
     try:
@@ -192,9 +219,98 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         yield f"data: {json.dumps({'choices': [{'finish_reason': 'stop'}]})}\n\n"
     yield "data: [DONE]\n\n"
 
+    save_session(sig, token_id, session_id, parent_message_id + 2)
+
+
+async def stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model=None, parent_message_id=0):
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     in_tokens = count_tok(json.dumps(messages))
+    model_name = req_model if req_model else model
+    start_evt = f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model_name, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': in_tokens, 'output_tokens': 1}}})}\n\n"
+    print("[ANTHROPIC OUT]", start_evt.strip(), flush=True)
+    yield start_evt
+
+    parser = StreamToolParser()
+    full_text = ""
+    text_block_started = False
+    block_index = 0
+
+    try:
+        async for chunk in gen:
+            if not chunk:
+                continue
+            full_text += chunk
+            results = parser.feed(chunk)
+            for r in results:
+                if "text" in r:
+                    if not text_block_started:
+                        start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                        print("[ANTHROPIC OUT]", start_block.strip(), flush=True)
+                        yield start_block
+                        text_block_started = True
+                    delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': r['text']}})}\n\n"
+                    print("[ANTHROPIC OUT]", delta_evt.strip(), flush=True)
+                    yield delta_evt
+    except Exception:
+        pass
+
+    for r in parser.flush():
+        if "text" in r:
+            if not text_block_started:
+                start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                print("[ANTHROPIC OUT]", start_block.strip(), flush=True)
+                yield start_block
+                text_block_started = True
+            delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': r['text']}})}\n\n"
+            print("[ANTHROPIC OUT]", delta_evt.strip(), flush=True)
+            yield delta_evt
+
+    parsed_tools, clean_text = parse_tools(full_text)
     out_tokens = count_tok(full_text)
-    save_session(sig, token_id, session_id, 0)
+
+    if not text_block_started and not parsed_tools and clean_text.strip():
+        start_evt = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        print("[ANTHROPIC OUT]", start_evt.strip(), flush=True)
+        yield start_evt
+        delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': clean_text}})}\n\n"
+        print("[ANTHROPIC OUT]", delta_evt.strip(), flush=True)
+        yield delta_evt
+        stop_evt = f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+        print("[ANTHROPIC OUT]", stop_evt.strip(), flush=True)
+        yield stop_evt
+        block_index += 1
+    elif text_block_started:
+        stop_evt = f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+        print("[ANTHROPIC OUT]", stop_evt.strip(), flush=True)
+        yield stop_evt
+        block_index += 1
+
+    if parsed_tools:
+        for tc in parsed_tools:
+            tool_input = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"]
+            json_str = json.dumps(tool_input)
+            start_tc = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'tool_use', 'id': tc['id'], 'name': tc['function']['name'], 'input': {}}})}\n\n"
+            print("[ANTHROPIC OUT]", start_tc.strip(), flush=True)
+            yield start_tc
+            delta_tc = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'input_json_delta', 'partial_json': json_str}})}\n\n"
+            print("[ANTHROPIC OUT]", delta_tc.strip(), flush=True)
+            yield delta_tc
+            stop_tc = f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+            print("[ANTHROPIC OUT]", stop_tc.strip(), flush=True)
+            yield stop_tc
+            block_index += 1
+        msg_delta = f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use', 'stop_sequence': None}, 'usage': {'output_tokens': out_tokens}})}\n\n"
+        print("[ANTHROPIC OUT]", msg_delta.strip(), flush=True)
+        yield msg_delta
+    else:
+        msg_delta = f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': out_tokens}})}\n\n"
+        print("[ANTHROPIC OUT]", msg_delta.strip(), flush=True)
+        yield msg_delta
+
+    stop_evt = f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+    print("[ANTHROPIC OUT]", stop_evt.strip(), flush=True)
+    yield stop_evt
+    save_session(sig, token_id, session_id, parent_message_id + 2)
 
 
 def format_response(text, model, messages, tools=None):
@@ -237,23 +353,32 @@ def format_anthropic_response(result, model):
     ant_content = []
     if msg.get("content"):
         ant_content.append({"type": "text", "text": msg["content"]})
-    ant_tools = []
     if msg.get("tool_calls"):
         for tc in msg["tool_calls"]:
-            ant_tools.append({
+            args = tc["function"]["arguments"]
+            tool_input = json.loads(args) if isinstance(args, str) else args
+            ant_content.append({
                 "type": "tool_use",
                 "id": tc["id"],
                 "name": tc["function"]["name"],
-                "input": json.loads(tc["function"]["arguments"]),
+                "input": tool_input,
             })
+    usage = result.get("usage", {})
+    msg_id = result["id"]
+    if not msg_id.startswith("msg_"):
+        msg_id = f"msg_{msg_id.replace('chatcmpl-', '')}"
     return {
-        "id": result["id"],
+        "id": msg_id,
         "type": "message",
         "role": "assistant",
-        "content": ant_content + ant_tools,
+        "content": ant_content,
         "model": model,
-        "stop_reason": "tool_use" if ant_tools else "end_turn",
-        "usage": result["usage"],
+        "stop_reason": "tool_use" if msg.get("tool_calls") else "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        },
     }
 
 
@@ -281,7 +406,7 @@ async def files_upload(request: Request):
             break
     if not file_info:
         return JSONResponse({"error": "Upload failed"}, status_code=500)
-    
+
     if request.url.path.startswith("/v1/files/upload"):
         return {
             "id": file_info["file_id"],
@@ -324,7 +449,11 @@ async def chat_completions(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
     model = body.get("model", "instant")
-    thinking = body.get("thinking", False)
+    thinking_raw = body.get("thinking", False)
+    if isinstance(thinking_raw, dict):
+        thinking = thinking_raw.get("type") == "enabled"
+    else:
+        thinking = bool(thinking_raw)
     search = body.get("search", False)
     stream = body.get("stream", False)
     tools = body.get("tools", None)
@@ -338,19 +467,53 @@ async def anthropic_messages(request: Request):
     body = await request.json()
     system = body.get("system", "")
     messages = body.get("messages", [])
-    model = body.get("model", "instant")
-    thinking = body.get("thinking", False)
+    model_raw = body.get("model", "").lower()
+    if "instant" in model_raw:
+        model = "instant"
+    elif "vision" in model_raw:
+        model = "vision"
+    else:
+        model = "expert"
+
+    thinking_raw = body.get("thinking", False)
+    if isinstance(thinking_raw, dict):
+        thinking = thinking_raw.get("type") == "enabled"
+    else:
+        thinking = bool(thinking_raw)
     stream = body.get("stream", False)
     tools = body.get("tools", [])
 
     openai_msgs = []
     if system:
-        openai_msgs.append({"role": "system", "content": system})
+        if isinstance(system, list):
+            system_str = " ".join(c.get("text", "") for c in system if isinstance(c, dict) and c.get("type") == "text")
+        else:
+            system_str = str(system)
+        if system_str:
+            openai_msgs.append({"role": "system", "content": system_str})
+
     for m in messages:
         content = m.get("content", "")
         if isinstance(content, list):
-            text_parts = [c.get("text", "") for c in content if c.get("type") == "text"]
-            content = " ".join(text_parts)
+            parts = []
+            for c in content:
+                if isinstance(c, dict):
+                    if c.get("type") == "text":
+                        parts.append(c.get("text", ""))
+                    elif c.get("type") == "tool_use":
+                        parts.append(f"<tool_call>{json.dumps({'name': c.get('name'), 'arguments': c.get('input', {})})}</tool_call>")
+                    elif c.get("type") == "tool_result":
+                        res_content = c.get("content", "")
+                        if isinstance(res_content, list):
+                            res_content = " ".join(item.get("text", "") for item in res_content if isinstance(item, dict) and item.get("type") == "text")
+                        parts.append(f"[Tool Result for {c.get('tool_use_id', 'tool')}]: {res_content}")
+            content = "\n".join(parts)
+        if m.get("role") == "system":
+            if content:
+                openai_msgs.append({"role": "system", "content": content})
+            continue
+        if m["role"] == "assistant" and (not content or content.strip() == "(no content)"):
+            continue
         openai_msgs.append({"role": m["role"], "content": content})
 
     openai_tools = []
@@ -364,12 +527,28 @@ async def anthropic_messages(request: Request):
                     "parameters": t.get("input_schema", {}),
                 },
             })
+        elif "name" in t:
+            openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "parameters": t.get("input_schema", t.get("parameters", {})),
+                },
+            })
 
-    result = await handle_chat(openai_msgs, model, thinking, False, stream, openai_tools or None)
-    if isinstance(result, StreamingResponse):
-        return result
+    output_config = body.get("output_config")
+    if isinstance(output_config, dict) and output_config.get("format", {}).get("type") == "json_schema":
+        json_schema = output_config["format"].get("schema")
+        if json_schema:
+            openai_msgs.insert(0, {"role": "system", "content": f"You MUST return valid JSON adhering strictly to this JSON Schema:\n{json.dumps(json_schema)}"})
 
-    return format_anthropic_response(result, model)
+    req_model = body.get("model")
+    if stream:
+        return await handle_chat(openai_msgs, model, thinking, False, True, openai_tools or None, is_anthropic=True, req_model=req_model)
+
+    result = await handle_chat(openai_msgs, model, thinking, False, False, openai_tools or None, is_anthropic=True, req_model=req_model)
+    return format_anthropic_response(result, req_model)
 
 
 @app.get("/v1/models")
@@ -377,17 +556,31 @@ async def anthropic_messages(request: Request):
 async def list_models(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
-    models = ["instant", "vision", "expert"]
+    
+    # We dynamically return the requested models or a generic list
+    anthropic_models = [
+        {"id": "instant", "name": "instant", "type": "model", "created_at": 1700000000},
+        {"id": "expert", "name": "expert", "type": "model", "created_at": 1700000000},
+    ]
+
+    if "anthropic-version" in request.headers or request.url.path == "/v1/models":
+        return {
+            "data": anthropic_models,
+            "has_more": False,
+            "first_id": "instant",
+            "last_id": "expert"
+        }
+
     return {
         "object": "list",
         "data": [
             {
-                "id": m,
+                "id": m["id"],
                 "object": "model",
                 "created": 1700000000,
                 "owned_by": "deeperseeker",
             }
-            for m in models
+            for m in anthropic_models
         ],
     }
 

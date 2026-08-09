@@ -261,9 +261,9 @@ def parse_tools(text):
     tools = []
     while "<tool_call>" in text and "</tool_call>" in text:
         start = text.index("<tool_call>")
-        end = text.index("</tool_call>") + len("<tool_call>")
+        end = text.index("</tool_call>") + len("</tool_call>")
         chunk = text[start:end]
-        text = text[end:]
+        text = text[:start] + text[end:]
         try:
             json_str = chunk.replace("<tool_call>", "").replace("</tool_call>", "").strip()
             tool = json.loads(json_str)
@@ -481,6 +481,11 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
     }
 
     async with session.post(url, cookies=cookie, headers=headers, json=json_data) as r:
+        if r.status != 200:
+            error_text = await r.text()
+            print(f"[ERROR] send_message failed with status {r.status}: {error_text}", flush=True)
+            raise Exception(f"HTTP {r.status}: {error_text}")
+        
         async for line in r.content:
             if not line:
                 continue

@@ -150,10 +150,14 @@ async def extract_user_msg(messages):
         if i["role"] == "user":
             if isinstance(i["content"], str):
                 return i["content"]
-            else:
+            elif isinstance(i["content"], list):
+                parts = []
                 for j in i["content"]:
-                    if j["type"] == "text":
-                        return j["text"]
+                    if isinstance(j, dict) and j.get("type") == "text":
+                        parts.append(j.get("text", ""))
+                if parts:
+                    return "\n".join(parts)
+    return ""
 
 
 async def generate_signature(messages):
@@ -213,9 +217,8 @@ async def build_prompt(messages, tools, model, is_first_message=False):
         final_prompt += f"""[TOOL RESULTS]\n{tools_result_extract}\n\n"""
     final_prompt += f"""[USER]\n{await extract_user_msg(messages)}\n\n"""
     if tools_extract:
-        final_prompt += """If you need to call a tool, emit it like this — anywhere in your response:
-        <tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call> .While calling tools if subagents available then if optional then try to skip it."""
-    final_prompt += f"Just for reminding if you need model name then your model name is {model}. By the way your provider name is deeperseeker."
+        final_prompt += """IMPORTANT FOR TOOL CALLS: If you decide to call a tool, output ONLY the tool call XML block tag without any extra conversational text or markdown codeblock markers:
+<tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>\n"""
     return final_prompt
 
 
