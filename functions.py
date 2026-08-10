@@ -88,12 +88,10 @@ def get_headers(auth_token, pow=None):
 
 async def get_cookies():
     if not os.path.exists("aws_cookies_deepseek.json"):
-        print("Cookie not found, regenerating...")
         await _generate_cookies()
     else:
         cookies = json.load(open("aws_cookies_deepseek.json"))
         if cookies.get("expiry") is None or cookies["expiry"] <= time.time():
-            print("Cookie expired, regenerating...")
             await _generate_cookies()
     cookies = json.load(open("aws_cookies_deepseek.json"))
     return cookies["cookie"]
@@ -109,7 +107,7 @@ async def _generate_cookies():
         try:
             await page.wait_for_url("**/sign_in*", timeout=120000)
         except Exception:
-            print("CAPTCHA not solved within 2 minutes, proceeding anyway...")
+            pass
         cookies = await context.cookies()
         final_cookies = {}
         expiry = None
@@ -119,7 +117,7 @@ async def _generate_cookies():
             final_cookies[i["name"]] = i["value"]
         final_cookies["ds_cookie_preference"] = "%257B%2522level%2522%253A%2522all%2522%257D"
         if not expiry:
-            print("No aws-waf-token cookie. Check internet or region blocking.")
+            pass
         await browser.close()
     with open("aws_cookies_deepseek.json", "w") as f:
         f.write(json.dumps({"cookie": final_cookies, "expiry": expiry}))
@@ -483,7 +481,6 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
     async with session.post(url, cookies=cookie, headers=headers, json=json_data) as r:
         if r.status != 200:
             error_text = await r.text()
-            print(f"[ERROR] send_message failed with status {r.status}: {error_text}", flush=True)
             raise Exception(f"HTTP {r.status}: {error_text}")
         
         async for line in r.content:

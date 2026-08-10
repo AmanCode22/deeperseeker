@@ -28,7 +28,7 @@ async def extract_tools(tools):
                 "Tool Type: function. Tool name: "
                 + i["function"]["name"]
                 + ", description: "
-                + i["function"].get("description")
+                + i["function"].get("description","NO DESCRIPTION")
                 + ". Params needed: "
                 + json.dumps(i["function"].get("parameters"))
                 + "\n"
@@ -61,13 +61,13 @@ async def extract_tool_results(messages):
 
 async def extract_and_upload_files(messages, auth_token):
     result_fileids = []
-    for i in messages:
+    for idx, i in enumerate(messages):
         content = i.get("content")
         if not content:
             continue
         if isinstance(content, str):
             continue
-        for j in content:
+        for j_idx, j in enumerate(content):
             if j["type"] == "text":
                 continue
             elif j["type"] == "image_url":
@@ -83,9 +83,9 @@ async def extract_and_upload_files(messages, auth_token):
                         if k[0] == "uploaded":
                             continue
                         elif k[0] == "success":
+                            result_fileids.append(k[1]["file_id"])
+                        elif k[0] == "error":
                             result_fileids.append(k[1])
-                        else:
-                            print("Error while uploading file.")
 
                 else:
                     mimetype_base, base64_data = j["image_url"]["url"].split(",")
@@ -96,15 +96,15 @@ async def extract_and_upload_files(messages, auth_token):
                         + mimetypes.guess_extension(mime_type)
                     )
                     data_bytes = base64.b64decode(
-                        base64_data.split("data:")[1].encode()
+                        (base64_data.split("data:")[1] if "data:" in base64_data else base64_data).encode()
                     )
                     async for k in upload_file(data_bytes, filename, mime_type, auth_token):
                         if k[0] == "uploaded":
                             continue
                         elif k[0] == "success":
+                            result_fileids.append(k[1]["file_id"])
+                        elif k[0] == "error":
                             result_fileids.append(k[1])
-                        else:
-                            print("Error while uploading file.")
             elif j["type"] == "file":
                 if "file_id" in j["file"]:
                     result_fileids.append(j["file_id"])
@@ -114,18 +114,18 @@ async def extract_and_upload_files(messages, auth_token):
 
                     mime_type = mimetype_base.split(":")[1].split(";")[0]
                     data_bytes = base64.b64decode(
-                        base64_data.split("data:")[1].encode()
+                        (base64_data.split("data:")[1] if "data:" in base64_data else base64_data).encode()
                     )
                     async for k in upload_file(data_bytes, filename, mime_type, auth_token):
                         if k[0] == "uploaded":
                             continue
                         elif k[0] == "success":
+                            result_fileids.append(k[1]["file_id"])
+                        elif k[0] == "error":
                             result_fileids.append(k[1])
-                        else:
-                            print("Error while uploading file.")
             elif j["type"] == "document" or j["type"] == "image":
                 if j["source"]["type"] == "base64":
-                    base64_data = j["source"]["data"].split(",")[1]
+                    base64_data = j["source"]["data"].split(",")[1] if "," in j["source"]["data"] else j["source"]["data"]
                     mime_type = j["source"]["media_type"]
                     filename = (
                         "inline_uploaded_"
@@ -137,9 +137,9 @@ async def extract_and_upload_files(messages, auth_token):
                         if k[0] == "uploaded":
                             continue
                         elif k[0] == "success":
+                            result_fileids.append(k[1]["file_id"])
+                        elif k[0] == "error":
                             result_fileids.append(k[1])
-                        else:
-                            print("Error while uploading file.")
                 elif j["source"]["type"] == "file":
                     result_fileids.append(j["source"]["file_id"])
     return result_fileids
@@ -160,32 +160,20 @@ async def extract_user_msg(messages):
     return ""
 
 
-async def generate_signature(messages):
-    system_prompt = await extract_system(messages)
-    first_user = ""
-    for i in messages:
-        if i["role"] == "user":
-            if isinstance(i["content"], str):
-                first_user = i["content"]
-            else:
-                for j in i["content"]:
-                    if j["type"] == "text":
-                        first_user = j["text"]
+async def generate_signature(messages, model):
+    last_ast_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "assistant":
+            last_ast_idx = i
             break
-    first_assistant = ""
-    for i in messages:
-        if i["role"] == "assistant":
-            if isinstance(i["content"], str):
-                first_assistant = i["content"]
-            else:
-                for j in i["content"]:
-                    if j["type"] == "text":
-                        first_assistant = j["text"]
-            break
-    joined = (
-        f"{system_prompt}\n---\n{first_user}\n---\n{first_assistant}"
-    )
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+    if last_ast_idx == -1:
+        history = messages
+    else:
+        history = messages[:last_ast_idx + 1]
+
+    dump = json.dumps(history, sort_keys=True)
+    return hashlib.sha256(f"{model}_{dump}".encode("utf-8")).hexdigest()
 
 
 async def build_prompt(messages, tools, model, is_first_message=False):
