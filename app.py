@@ -199,8 +199,27 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
     parser = StreamToolParser()
     full_text = ""
     try:
+        is_thinking = False
         async for chunk in gen:
             full_text += chunk
+            
+            if "<think>\n" in chunk:
+                is_thinking = True
+                chunk = chunk.replace("<think>\n", "")
+                
+            end_thinking = False
+            if "\n</think>\n\n" in chunk:
+                is_thinking = False
+                end_thinking = True
+                chunk = chunk.replace("\n</think>\n\n", "")
+                
+            if is_thinking and chunk:
+                yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': chunk}}]})}\n\n"
+                continue
+                
+            if end_thinking and not chunk:
+                continue
+
             results = parser.feed(chunk)
             for r in results:
                 if "text" in r:
@@ -243,10 +262,36 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
     block_index = 0
 
     try:
+        is_thinking = False
         async for chunk in gen:
             if not chunk:
                 continue
             full_text += chunk
+            
+            if "<think>\n" in chunk:
+                is_thinking = True
+                chunk = chunk.replace("<think>\n", "")
+                start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'thinking'}})}\n\n"
+                yield start_block
+                
+            end_thinking = False
+            if "\n</think>\n\n" in chunk:
+                is_thinking = False
+                end_thinking = True
+                chunk = chunk.replace("\n</think>\n\n", "")
+                
+            if is_thinking and chunk:
+                delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': chunk}})}\n\n"
+                yield delta_evt
+                continue
+                
+            if end_thinking:
+                stop_evt = f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                yield stop_evt
+                block_index += 1
+                if not chunk:
+                    continue
+
             results = parser.feed(chunk)
             for r in results:
                 if "text" in r:
@@ -320,11 +365,28 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
 def format_response(text, model, messages, tools=None):
     from functions import DEEPSEEK_TARIFFS
     parsed_tools, clean_text = parse_tools(text)
+    
+    import re
+    reasoning = None
+    match = re.search(r"<think>\s*(.*?)\s*</think>\s*", clean_text, flags=re.DOTALL)
+    if match:
+        reasoning = match.group(1).strip()
+        clean_text = clean_text.replace(match.group(0), "").strip()
+        
     in_tokens = count_tok(json.dumps(messages))
     out_tokens = count_tok(text)
     tariff_key = "deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash"
     tariff = DEEPSEEK_TARIFFS[tariff_key]
     cost = (in_tokens / 1_000_000 * tariff["cache_miss_input"]) + (out_tokens / 1_000_000 * tariff["output_generation"])
+    
+    msg_dict = {
+        "role": "assistant",
+        "content": clean_text if not parsed_tools else None,
+        "tool_calls": parsed_tools if parsed_tools else None,
+    }
+    if reasoning:
+        msg_dict["reasoning_content"] = reasoning
+
     return {
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion",
@@ -332,11 +394,7 @@ def format_response(text, model, messages, tools=None):
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": clean_text if not parsed_tools else None,
-                "tool_calls": parsed_tools if parsed_tools else None,
-            },
+            "message": msg_dict,
             "finish_reason": "tool_calls" if parsed_tools else "stop",
         }],
         "usage": {
@@ -355,8 +413,13 @@ def format_anthropic_response(result, model):
     choice = result["choices"][0]
     msg = choice["message"]
     ant_content = []
+    
+    if msg.get("reasoning_content"):
+        ant_content.append({"type": "thinking", "thinking": msg["reasoning_content"]})
+        
     if msg.get("content"):
         ant_content.append({"type": "text", "text": msg["content"]})
+        
     if msg.get("tool_calls"):
         for tc in msg["tool_calls"]:
             args = tc["function"]["arguments"]
@@ -520,17 +583,19 @@ async def openai_responses(request: Request):
             # Depending on spec, it might be just included in content or in tool_calls
             out_content.extend([{"type": "tool_call", "id": tc["id"], "name": tc["function"]["name"], "arguments": tc["function"]["arguments"]} for tc in message["tool_calls"]])
 
+        msg_output = {
+            "type": "message",
+            "role": "assistant",
+            "content": out_content
+        }
+        if message.get("reasoning_content"):
+            msg_output["reasoning_content"] = message["reasoning_content"]
+
         return {
             "id": result["id"],
             "object": "response",
             "model": result["model"],
-            "output": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": out_content
-                }
-            ],
+            "output": [msg_output],
             "usage": result.get("usage", {})
         }
     return result

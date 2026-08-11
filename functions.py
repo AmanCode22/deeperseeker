@@ -494,15 +494,35 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 if "FINISHED" in json_str or "BATCH" in json_str:
                     return
                 data = json.loads(json_str)
+                if "v" in data and isinstance(data["v"], dict) and "response" in data["v"]:
+                    fragments = data["v"]["response"].get("fragments")
+                    if fragments:
+                        fragment = fragments[0]
+                        if fragment.get("type") == "THINK":
+                            yield "<think>\n" + fragment.get("content", "")
+                        elif fragment.get("type") == "RESPONSE":
+                            yield fragment.get("content", "")
+                        else:
+                            yield fragment.get("content", "")
+                    continue
+                
+                if data.get("p") == "response/fragments" and data.get("o") == "APPEND":
+                    fragments = data.get("v")
+                    if isinstance(fragments, list) and len(fragments) > 0:
+                        fragment = fragments[0]
+                        if fragment.get("type") == "RESPONSE":
+                            yield "\n</think>\n\n" + fragment.get("content", "")
+                        elif fragment.get("type") == "THINK":
+                            yield "\n<think>\n" + fragment.get("content", "")
+                        else:
+                            yield fragment.get("content", "")
+                    continue
+
                 if "v" in data:
-                    if isinstance(data["v"], dict) and "response" in data["v"]:
-                        fragments = data["v"]["response"].get("fragments")
-                        if fragments:
-                            yield fragments[0]["content"]
-                    elif isinstance(data["v"], str):
+                    if isinstance(data["v"], str):
                         yield data["v"]
-                elif data.get("o") == "APPEND":
-                    yield data.get("v", "")
+                elif data.get("o") == "APPEND" and isinstance(data.get("v"), str):
+                    yield data["v"]
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):
