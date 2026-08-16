@@ -311,27 +311,33 @@ def parse_tools(text):
     clean_text = text
     seen_sigs = set()
 
-    block_pattern = re.compile(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:invoke|tool_call|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22]\s*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:invoke|tool_call|function_call)>|$)", re.DOTALL | re.IGNORECASE)
-    param_pattern = re.compile(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?parameter\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?parameter>|$)", re.DOTALL | re.IGNORECASE)
+    param_names = {"command", "description", "file_path", "content", "path", "prompt", "query", "subject", "old_string", "new_string", "url", "input"}
+    tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_call|invoke|function_call)\s+(?:name|tool)=[\x27\x22]([A-Za-z0-9_]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
+    real_tool_matches = [m for m in tool_matches if m.group(1).lower() not in param_names]
 
-    for m in block_pattern.finditer(text):
-        name = m.group(1).strip()
-        body = m.group(2)
-        if "parameter" in body:
+    if real_tool_matches:
+        for i, tm in enumerate(real_tool_matches):
+            candidate_name = tm.group(1).strip()
+            start_idx = tm.end()
+            end_idx = real_tool_matches[i+1].start() if i + 1 < len(real_tool_matches) else len(text)
+            body = text[start_idx:end_idx]
             args = {}
-            for p in param_pattern.finditer(body):
-                p_name = p.group(1).strip()
-                p_val = p.group(2).strip()
+            p_matches = re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([A-Za-z0-9_]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:parameter|tool_call|param|invoke)\s+name=)|$)", body, flags=re.DOTALL | re.IGNORECASE)
+            for pm in p_matches:
+                p_name = pm.group(1).strip()
+                p_val = pm.group(2).strip()
+                p_val = re.sub(r"</?[A-Za-z0-9_]+[^>]*>", "", p_val).strip()
                 try:
                     args[p_name] = json.loads(p_val)
                 except Exception:
                     args[p_name] = p_val
-            norm = normalize_tool_call(name, args)
-            if norm:
-                sig = (norm["function"]["name"], norm["function"]["arguments"])
-                if sig not in seen_sigs:
-                    seen_sigs.add(sig)
-                    tools.append(norm)
+            if candidate_name and args:
+                norm = normalize_tool_call(candidate_name, args)
+                if norm:
+                    sig = (norm["function"]["name"], norm["function"]["arguments"])
+                    if sig not in seen_sigs:
+                        seen_sigs.add(sig)
+                        tools.append(norm)
 
     if tools:
         clean_text = re.sub(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_calls?|tool_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_calls?|tool_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
@@ -409,25 +415,37 @@ def parse_tools(text):
                 after_tag = text[m.end():]
                 brace_pos = after_tag.find("{")
                 if brace_pos != -1:
+                    json_substr = after_tag[brace_pos:]
+                    data = None
                     try:
-                        data, end_idx = decoder.raw_decode(after_tag[brace_pos:])
-                        if isinstance(data, dict):
-                            name = tag_name or data.get("name") or data.get("tool") or data.get("tool_name") or data.get("function") or data.get("action")
-                            args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or data.get("params") or data.get("tool_input") or data.get("action_input")
-                            if args is None:
-                                if tag_name:
-                                    args = {k: v for k, v in data.items() if k not in ["name", "tool", "function"]}
-                                else:
-                                    args = {}
-                            if name:
-                                norm = normalize_tool_call(name, args)
-                                if norm:
-                                    sig = (norm["function"]["name"], norm["function"]["arguments"])
-                                    if sig not in seen_sigs:
-                                        seen_sigs.add(sig)
-                                        tools.append(norm)
+                        data, _ = decoder.raw_decode(json_substr)
                     except Exception:
                         pass
+                    if not data:
+                        cleaned_json = re.sub(r"</?(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*", "", json_substr, flags=re.DOTALL).strip()
+                        open_b = cleaned_json.count("{")
+                        close_b = cleaned_json.count("}")
+                        if open_b > close_b:
+                            cleaned_json += "}" * (open_b - close_b)
+                        try:
+                            data = json.loads(cleaned_json)
+                        except Exception:
+                            pass
+                    if isinstance(data, dict):
+                        name = tag_name or data.get("name") or data.get("tool") or data.get("tool_name") or data.get("function") or data.get("action")
+                        args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or data.get("params") or data.get("tool_input") or data.get("action_input")
+                        if args is None:
+                            if tag_name:
+                                args = {k: v for k, v in data.items() if k not in ["name", "tool", "function"]}
+                            else:
+                                args = {}
+                        if name:
+                            norm = normalize_tool_call(name, args)
+                            if norm:
+                                sig = (norm["function"]["name"], norm["function"]["arguments"])
+                                if sig not in seen_sigs:
+                                    seen_sigs.add(sig)
+                                    tools.append(norm)
             clean_text = re.sub(r"<(?:tool_call|function_call)[^>]*>.*?(?:</(?:tool_call|function_call)>|$)", "", text, flags=re.DOTALL).strip()
 
     if not tools:
@@ -469,7 +487,10 @@ def parse_tools(text):
                             tools.append(norm)
             except Exception:
                 pass
-    clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+    if tools:
+        clean_text = ""
+    else:
+        clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
     return tools, clean_text
 
 
