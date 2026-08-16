@@ -311,31 +311,75 @@ def parse_tools(text):
     clean_text = text
     seen_sigs = set()
 
-    block_pattern = re.compile(r"<(?:invoke|tool_call|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22]\s*>(.*?)(?:</(?:invoke|tool_call|function_call)>|$)", re.DOTALL | re.IGNORECASE)
-    param_pattern = re.compile(r"<parameter\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</parameter>|$)", re.DOTALL | re.IGNORECASE)
-
-    for m in block_pattern.finditer(text):
-        name = m.group(1).strip()
-        body = m.group(2)
-        if "<parameter" in body:
+    if "DSML" in text:
+        dsml_block_pattern = re.compile(r"<[｜\|]{2}DSML[｜\|]{2}([A-Za-z0-9_]+)>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}\1>|$)", re.DOTALL | re.IGNORECASE)
+        param_pattern = re.compile(r"<[｜\|]{2}DSML[｜\|]{2}B([A-Za-z0-9_]+)[^>]*>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}B.*?>|$)", re.DOTALL | re.IGNORECASE)
+        for m in dsml_block_pattern.finditer(text):
+            tool_name = m.group(1).strip()
+            body = m.group(2)
             args = {}
-            for p in param_pattern.finditer(body):
-                p_name = p.group(1).strip()
-                p_val = p.group(2).strip()
+            for pm in param_pattern.finditer(body):
+                p_name = pm.group(1).lower().strip()
+                p_val = pm.group(2).strip()
                 try:
                     args[p_name] = json.loads(p_val)
                 except Exception:
                     args[p_name] = p_val
-            norm = normalize_tool_call(name, args)
+            norm = normalize_tool_call(tool_name, args)
             if norm:
                 sig = (norm["function"]["name"], norm["function"]["arguments"])
                 if sig not in seen_sigs:
                     seen_sigs.add(sig)
                     tools.append(norm)
+        if not tools:
+            tool_match = re.search(r"[｜\|]{2}DSML[｜\|]{2}([A-Za-z0-9_]+)", text, re.IGNORECASE)
+            if tool_match:
+                tool_name = tool_match.group(1).strip()
+                args = {}
+                cmd_match = re.search(r"[｜\|]{2}B[\x22\x27]?command[\x22\x27]?[^>]*>(.*?)(?:</[｜\|]{2}B|$)", text, re.DOTALL | re.IGNORECASE)
+                desc_match = re.search(r"[｜\|]{2}B[\x22\x27]?description[\x22\x27]?[^>]*>(.*?)(?:</[｜\|]{2}B|$)", text, re.DOTALL | re.IGNORECASE)
+                if cmd_match:
+                    clean_cmd = re.sub(r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", cmd_match.group(1)).strip("\x22\x27() ")
+                    args["command"] = clean_cmd
+                if desc_match:
+                    clean_desc = re.sub(r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", desc_match.group(1)).strip("\x22\x27() ")
+                    args["description"] = clean_desc
+                norm = normalize_tool_call(tool_name, args)
+                if norm:
+                    sig = (norm["function"]["name"], norm["function"]["arguments"])
+                    if sig not in seen_sigs:
+                        seen_sigs.add(sig)
+                        tools.append(norm)
+        if tools:
+            clean_text = re.sub(r"<[｜\|]{2}DSML[｜\|]{2}[^>]*>.*?(?:</[｜\|]{2}DSML[｜\|]{2}[^>]*>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+            clean_text = re.sub(r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
 
-    if tools:
-        clean_text = re.sub(r"<(?:tool_calls?|tool_call)[^>]*>.*?(?:</(?:tool_calls?|tool_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
-        clean_text = re.sub(r"<(?:invoke|function_call)[^>]*>.*?(?:</(?:invoke|function_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+    if not tools:
+        block_pattern = re.compile(r"<(?:invoke|tool_call|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22]\s*>(.*?)(?:</(?:invoke|tool_call|function_call)>|$)", re.DOTALL | re.IGNORECASE)
+        param_pattern = re.compile(r"<parameter\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</parameter>|$)", re.DOTALL | re.IGNORECASE)
+
+        for m in block_pattern.finditer(text):
+            name = m.group(1).strip()
+            body = m.group(2)
+            if "<parameter" in body:
+                args = {}
+                for p in param_pattern.finditer(body):
+                    p_name = p.group(1).strip()
+                    p_val = p.group(2).strip()
+                    try:
+                        args[p_name] = json.loads(p_val)
+                    except Exception:
+                        args[p_name] = p_val
+                norm = normalize_tool_call(name, args)
+                if norm:
+                    sig = (norm["function"]["name"], norm["function"]["arguments"])
+                    if sig not in seen_sigs:
+                        seen_sigs.add(sig)
+                        tools.append(norm)
+
+        if tools:
+            clean_text = re.sub(r"<(?:tool_calls?|tool_call)[^>]*>.*?(?:</(?:tool_calls?|tool_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+            clean_text = re.sub(r"<(?:invoke|function_call)[^>]*>.*?(?:</(?:invoke|function_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     if not tools:
         fn_call_pattern = re.compile(r"<function_call>\s*<name>([^<]+)</name>\s*<arguments>(.*?)</arguments>\s*</function_call>", re.DOTALL | re.IGNORECASE)
@@ -440,7 +484,7 @@ class StreamToolParser:
         results = []
         while True:
             if self.in_tool:
-                end_tags = ["</tool_call>", "</function_call>", "</invoke>", "</tool_calls>"]
+                end_tags = ["</tool_call>", "</function_call>", "</invoke>", "</tool_calls>", "</｜｜DSML｜｜", "</||DSML||"]
                 end_pos = -1
                 end_tag_len = 0
                 for tag in end_tags:
@@ -475,7 +519,7 @@ class StreamToolParser:
                     else:
                         break
             else:
-                start_tags = ["<tool_call", "<function_call", "<invoke", "<tool_calls"]
+                start_tags = ["<tool_call", "<function_call", "<invoke", "<tool_calls", "<｜｜DSML｜｜", "<||DSML||", "DSML"]
                 start_pos = -1
                 for tag in start_tags:
                     if tag in self.buffer:
@@ -488,7 +532,7 @@ class StreamToolParser:
                     self.in_tool = True
                     self.has_tool = True
                 else:
-                    if len(self.buffer) > 30 and not any(self.buffer.endswith(tag[:i]) for tag in ["<tool_call", "<function_call", "<invoke", "<tool_calls"] for i in range(1, len(tag))):
+                    if len(self.buffer) > 30 and not any(self.buffer.endswith(tag[:i]) for tag in ["<tool_call", "<function_call", "<invoke", "<tool_calls", "<｜｜DSML｜｜", "<||DSML||", "DSML"] for i in range(1, len(tag))):
                         if not self.has_tool:
                             results.append({"text": self.buffer})
                         self.buffer = ""
