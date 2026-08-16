@@ -282,17 +282,22 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                 continue
             full_text += chunk
             
-            if "<think>\n" in chunk:
+            if "<think>" in chunk:
                 is_thinking = True
-                chunk = chunk.replace("<think>\n", "")
+                chunk = chunk.replace("<think>", "").lstrip("\n")
                 start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'thinking'}})}\n\n"
                 yield start_block
                 
             end_thinking = False
-            if "\n</think>\n\n" in chunk:
+            if "</think>" in chunk:
                 is_thinking = False
                 end_thinking = True
-                chunk = chunk.replace("\n</think>\n\n", "")
+                parts = chunk.split("</think>")
+                think_part = parts[0]
+                chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
+                if think_part:
+                    delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': think_part}})}\n\n"
+                    yield delta_evt
                 
             if is_thinking and chunk:
                 delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': chunk}})}\n\n"

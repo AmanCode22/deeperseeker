@@ -331,6 +331,16 @@ def parse_tools(text):
                     args[p_name] = json.loads(p_val)
                 except Exception:
                     args[p_name] = p_val
+            tag_param_matches = re.finditer(r"<([A-Za-z0-9_]+)>(.*?)(?:</\1>|$)", body, flags=re.DOTALL | re.IGNORECASE)
+            for pm in tag_param_matches:
+                t_name = pm.group(1).strip().lower()
+                if t_name in param_names:
+                    t_val = pm.group(2).strip()
+                    t_val = re.sub(r"</?[A-Za-z0-9_]+[^>]*>", "", t_val).strip()
+                    try:
+                        args[t_name] = json.loads(t_val)
+                    except Exception:
+                        args[t_name] = t_val
             if candidate_name and args:
                 norm = normalize_tool_call(candidate_name, args)
                 if norm:
