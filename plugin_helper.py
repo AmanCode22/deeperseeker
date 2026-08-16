@@ -186,7 +186,7 @@ def canonicalize_messages(messages):
                         args = json.loads(args)
                     except Exception:
                         pass
-                tc_json = json.dumps({"name": name, "arguments": args}, sort_keys=True)
+                tc_json = json.dumps({"arguments": args, "name": name}, sort_keys=True)
                 tc_parts.append("<tool_call>" + tc_json + "</tool_call>")
             content = "\n".join(tc_parts)
         elif isinstance(content, list):
@@ -197,7 +197,7 @@ def canonicalize_messages(messages):
                         parts.append(c.get("text", ""))
                     elif c.get("type") == "tool_use":
                         args = c.get("input", {})
-                        tc_json = json.dumps({"name": c.get("name"), "arguments": args}, sort_keys=True)
+                        tc_json = json.dumps({"arguments": args, "name": c.get("name")}, sort_keys=True)
                         parts.append("<tool_call>" + tc_json + "</tool_call>")
                     elif c.get("type") == "tool_result":
                         res_content = c.get("content", "")
@@ -206,8 +206,20 @@ def canonicalize_messages(messages):
                         tool_id = c.get("tool_use_id", "tool")
                         parts.append("[Tool Result for " + str(tool_id) + "]: " + str(res_content))
             content = "\n".join(parts)
+        elif isinstance(content, str):
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            def repl_tc(match):
+                raw_json = match.group(1).strip()
+                try:
+                    d = json.loads(raw_json)
+                    d_name = d.get("name")
+                    d_args = d.get("arguments", {})
+                    return "<tool_call>" + json.dumps({"arguments": d_args, "name": d_name}, sort_keys=True) + "</tool_call>"
+                except Exception:
+                    return match.group(0)
+            content = re.sub(r"<tool_call>(.*?)</tool_call>", repl_tc, content, flags=re.DOTALL)
             
-        canon.append({"role": role, "content": content})
+        canon.append({"role": role, "content": str(content).strip()})
     return canon
 
 
