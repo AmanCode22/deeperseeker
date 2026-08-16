@@ -442,12 +442,20 @@ def parse_tools(text):
                         except Exception:
                             pass
                     if isinstance(data, dict):
-                        name = tag_name or data.get("name") or data.get("tool") or data.get("tool_name") or data.get("function") or data.get("action")
-                        args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or data.get("params") or data.get("tool_input") or data.get("action_input")
-                        if args is None:
-                            if tag_name:
-                                args = {k: v for k, v in data.items() if k not in ["name", "tool", "function"]}
+                        if tag_name:
+                            name = tag_name
+                            if "arguments" in data and isinstance(data["arguments"], dict):
+                                args = data["arguments"]
+                            elif "parameters" in data and isinstance(data["parameters"], dict):
+                                args = data["parameters"]
+                            elif "input" in data and isinstance(data["input"], dict):
+                                args = data["input"]
                             else:
+                                args = {k: v for k, v in data.items() if k not in ["name", "tool", "function"]}
+                        else:
+                            name = data.get("name") or data.get("tool") or data.get("tool_name") or data.get("function") or data.get("action")
+                            args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or data.get("params") or data.get("tool_input") or data.get("action_input")
+                            if args is None:
                                 args = {}
                         if name:
                             norm = normalize_tool_call(name, args)
