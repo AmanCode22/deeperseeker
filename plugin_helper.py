@@ -4,6 +4,7 @@ import hashlib
 import json
 import mimetypes
 import random
+import re
 import string
 import uuid
 from pathlib import Path
@@ -15,48 +16,54 @@ from functions import get_session, upload_file
 
 async def extract_system(messages):
     for i in messages:
-        if i["role"] == "system":
-            return i["content"]
+        if i.get("role") == "system":
+            return i.get("content")
     return None
 
 
 async def extract_tools(tools):
-    final_tools = ""
+    if not tools:
+        return None
+    final_tools = []
     for i in tools:
-        if i["type"] == "function":
-            final_tools += (
-                "Tool Type: function. Tool name: "
-                + i["function"]["name"]
-                + ", description: "
-                + i["function"].get("description","NO DESCRIPTION")
-                + ". Params needed: "
-                + json.dumps(i["function"].get("parameters"))
-                + "\n"
-            )
-
-        elif i["type"] == "computer_use":
-            final_tools += (
-                "Tool name: computer_use. Description: Use this to interact with the screen, mouse, and keyboard. Other whole info: "
-                + json.dumps(i)
-                + "\n"
-            )
-        elif i["type"] == "text_editor":
-            final_tools += "Tool name: text_editor. Description: Use this to view and edit text files\n"
-        elif i["type"] == "bash":
-            final_tools += (
-                "Tool name: bash. Description: Use this to run bash commands\n"
-            )
+        if i.get("type") == "function":
+            fn = i.get("function", {})
+            name = fn.get("name", "")
+            desc = fn.get("description", "")
+            params = fn.get("parameters", {})
+            final_tools.append(f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}")
+        elif "name" in i:
+            name = i.get("name", "")
+            desc = i.get("description", "")
+            params = i.get("input_schema", i.get("parameters", {}))
+            final_tools.append(f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}")
+        elif i.get("type") in ["computer_use", "text_editor", "bash"]:
+            final_tools.append(f"Tool: {i['type']}\nDescription: {json.dumps(i)}")
         else:
-            final_tools += "Tool: " + json.dumps(i)
-    return final_tools if final_tools != "" else None
+            final_tools.append(f"Tool: {json.dumps(i)}")
+    return "\n\n".join(final_tools) if final_tools else None
 
 
-async def extract_tool_results(messages):
-    tools_final = ""
-    for i in messages:
-        if i["role"] == "tool":
-            tools_final += f"""Tool result for {i.get("name", "tool")}:\n{i["content"]}. Tool Call ID: {i["tool_call_id"]}\n"""
-    return tools_final if tools_final != "" else None
+async def extract_tool_results(messages, latest_only=False):
+    target_messages = messages
+    if latest_only:
+        last_ast_idx = -1
+        for idx in range(len(messages) - 1, -1, -1):
+            if messages[idx].get("role") == "assistant":
+                last_ast_idx = idx
+                break
+        if last_ast_idx != -1:
+            target_messages = messages[last_ast_idx + 1:]
+    tools_final = []
+    for i in target_messages:
+        if i.get("role") == "tool":
+            name = i.get("name", "tool")
+            call_id = i.get("tool_call_id", "")
+            content = i.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+            tools_final.append(f"Tool: {name} (Call ID: {call_id})\nResult: {content}")
+    return "\n\n".join(tools_final) if tools_final else None
 
 
 async def extract_and_upload_files(messages, auth_token):
@@ -147,17 +154,61 @@ async def extract_and_upload_files(messages, auth_token):
 
 async def extract_user_msg(messages):
     for i in messages[::-1]:
-        if i["role"] == "user":
-            if isinstance(i["content"], str):
-                return i["content"]
-            elif isinstance(i["content"], list):
+        if i.get("role") == "user":
+            content = i.get("content")
+            if isinstance(content, str):
+                return content
+            elif isinstance(content, list):
                 parts = []
-                for j in i["content"]:
+                for j in content:
                     if isinstance(j, dict) and j.get("type") == "text":
                         parts.append(j.get("text", ""))
                 if parts:
                     return "\n".join(parts)
     return ""
+
+
+def canonicalize_messages(messages):
+    canon = []
+    for m in messages:
+        role = m.get("role", "")
+        content = m.get("content", "")
+        tool_calls = m.get("tool_calls")
+        
+        if tool_calls and isinstance(tool_calls, list):
+            tc_parts = []
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                name = fn.get("name") or tc.get("name")
+                args = fn.get("arguments") or tc.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        pass
+                tc_json = json.dumps({"name": name, "arguments": args}, sort_keys=True)
+                tc_parts.append("<tool_call>" + tc_json + "</tool_call>")
+            content = "\n".join(tc_parts)
+        elif isinstance(content, list):
+            parts = []
+            for c in content:
+                if isinstance(c, dict):
+                    if c.get("type") == "text":
+                        parts.append(c.get("text", ""))
+                    elif c.get("type") == "tool_use":
+                        args = c.get("input", {})
+                        tc_json = json.dumps({"name": c.get("name"), "arguments": args}, sort_keys=True)
+                        parts.append("<tool_call>" + tc_json + "</tool_call>")
+                    elif c.get("type") == "tool_result":
+                        res_content = c.get("content", "")
+                        if isinstance(res_content, list):
+                            res_content = " ".join(item.get("text", "") for item in res_content if isinstance(item, dict) and item.get("type") == "text")
+                        tool_id = c.get("tool_use_id", "tool")
+                        parts.append("[Tool Result for " + str(tool_id) + "]: " + str(res_content))
+            content = "\n".join(parts)
+            
+        canon.append({"role": role, "content": content})
+    return canon
 
 
 async def generate_signature(messages, model):
@@ -172,20 +223,33 @@ async def generate_signature(messages, model):
     else:
         history = messages[:last_ast_idx + 1]
 
-    dump = json.dumps(history, sort_keys=True)
+    canon_history = canonicalize_messages(history)
+    dump = json.dumps(canon_history, sort_keys=True)
     return hashlib.sha256(f"{model}_{dump}".encode("utf-8")).hexdigest()
 
 
 async def build_prompt(messages, tools, model, is_first_message=False):
     final_prompt = ""
     tools_extract = await extract_tools(tools)
-    if tools_extract:
-        final_prompt += f"""[TOOLS]\n{tools_extract}\n\n"""
+    tool_instructions = (
+        "IMPORTANT EXECUTION DIRECTIVE:\n"
+        "You are an AI agent with tools. When an actionable request is given (such as listing/reading/editing files, executing commands, searching, or computing), you MUST execute the appropriate tool call immediately or even when you feel user wants you or you think you should call tools then don't delay just call them, think which tool to use then use below format to call it simply.\n"
+"You have complete right to call tools anytime you feel you should or user is asking you to. Don't wait for user to explicitly say you to tool call use your own thinking to understand where to and where not to call it."
+        "DO NOT say ambigious messages or provide conversational text/promises. Output ONLY the tool call XML block in this exact schema with no surrounding text or markdown code blocks:\n"
+        "<tool_call>{\"name\": \"exact_tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n"
+        "Never use keys like 'parameters', 'tool_name', 'action', or 'function'. Output strictly 'name' and 'arguments'."
+    )
     if is_first_message:
+        if tools_extract:
+            final_prompt += f"[TOOLS]\n{tools_extract}\n\n"
         system_prompt = await extract_system(messages)
         if system_prompt:
-            system_prompt += "\n If you need to call xml tags that are used for tool calls, then do not use markdown markers like code blocks around you."
+            if tools_extract:
+                system_prompt += "\n\n" + tool_instructions
             final_prompt += f"[SYSTEM]\n{system_prompt}\n\n"
+        elif tools_extract:
+            final_prompt += f"[SYSTEM]\n{tool_instructions}\n\n"
+
         if len(messages) > 1:
             history_parts = []
             for msg in messages[:-1]:
@@ -200,13 +264,46 @@ async def build_prompt(messages, tools, model, is_first_message=False):
             if history_parts:
                 history_text = "\n".join(history_parts)
                 final_prompt += f"[PREVIOUS CONVERSATION HISTORY]\n{history_text}\n\n"
-    tools_result_extract = await extract_tool_results(messages)
-    if tools_result_extract:
-        final_prompt += f"""[TOOL RESULTS]\n{tools_result_extract}\n\n"""
-    final_prompt += f"""[USER]\n{await extract_user_msg(messages)}\n\n"""
-    if tools_extract:
-        final_prompt += """IMPORTANT FOR TOOL CALLS: If you decide to call a tool, output ONLY the tool call XML block tag without any extra conversational text or markdown codeblock markers:
-<tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>\n"""
+
+        tools_result_extract = await extract_tool_results(messages, latest_only=False)
+        if tools_result_extract:
+            final_prompt += f"[TOOL RESULTS]\n{tools_result_extract}\n\n"
+
+        user_msg = await extract_user_msg(messages)
+        if user_msg:
+            final_prompt += f"[USER]\n{user_msg}\n\n"
+        if tools_extract:
+            final_prompt += tool_instructions + "\n"
+    else:
+        last_ast_idx = -1
+        for idx in range(len(messages) - 1, -1, -1):
+            if messages[idx].get("role") == "assistant":
+                last_ast_idx = idx
+                break
+
+        trailing_messages = messages[last_ast_idx + 1:] if last_ast_idx != -1 else [messages[-1]]
+        tools_result_extract = await extract_tool_results(messages, latest_only=True)
+        if tools_result_extract:
+            final_prompt += f"[TOOL RESULTS]\n{tools_result_extract}\n\n"
+
+        trailing_user_parts = []
+        for m in trailing_messages:
+            if m.get("role") == "user":
+                c = m.get("content", "")
+                if isinstance(c, str) and c:
+                    trailing_user_parts.append(c)
+                elif isinstance(c, list):
+                    txt = " ".join(part.get("text", "") for part in c if isinstance(part, dict) and part.get("type") == "text")
+                    if txt:
+                        trailing_user_parts.append(txt)
+
+        if trailing_user_parts:
+            final_prompt += f"[USER]\n{chr(10).join(trailing_user_parts)}\n\n"
+        elif not tools_result_extract:
+            user_msg = await extract_user_msg(messages)
+            if user_msg:
+                final_prompt += f"[USER]\n{user_msg}\n\n"
+
     return final_prompt
 
 
@@ -214,13 +311,22 @@ async def parse_tool_call(tools_list):
     tools_called = []
     for i in tools_list:
         i = i.strip()
-        tool_json = json.loads(
-            i.replace("<tool_call>", "").replace("</tool_call>", "").strip()
-        )
+        cleaned = i.replace("<tool_call>", "").replace("</tool_call>", "").replace("<function_call>", "").replace("</function_call>", "").strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        tool_json = json.loads(cleaned.strip())
         characters = string.ascii_letters + string.digits
         call_id = "call_" + "".join(random.choices(characters, k=8))
-        tool_name = tool_json["name"]
-        tool_args = tool_json["arguments"]
+        if "function" in tool_json and isinstance(tool_json["function"], dict):
+            tool_name = tool_json["function"].get("name") or tool_json.get("name")
+            tool_args = tool_json["function"].get("arguments") or tool_json["function"].get("parameters") or tool_json.get("arguments") or {}
+        else:
+            tool_name = tool_json.get("name") or tool_json.get("tool") or tool_json.get("tool_name") or tool_json.get("function") or tool_json.get("action")
+            tool_args = tool_json.get("arguments") or tool_json.get("parameters") or tool_json.get("input") or tool_json.get("args") or tool_json.get("params") or tool_json.get("tool_input") or tool_json.get("action_input") or {}
         if isinstance(tool_args, (dict, list)):
             tool_args = json.dumps(tool_args)
         elif isinstance(tool_args, str):
@@ -249,13 +355,22 @@ async def parse_tool_call(tools_list):
 
 async def parse_tool_call_streaming(tool_txt):
     tool_txt = tool_txt.strip()
-    tool_json = json.loads(
-        tool_txt.replace("<tool_call>", "").replace("</tool_call>", "").strip()
-    )
+    cleaned = tool_txt.replace("<tool_call>", "").replace("</tool_call>", "").replace("<function_call>", "").replace("</function_call>", "").strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    tool_json = json.loads(cleaned.strip())
     characters = string.ascii_letters + string.digits
     call_id = "call_" + "".join(random.choices(characters, k=8))
-    tool_name = tool_json["name"]
-    tool_args = tool_json["arguments"]
+    if "function" in tool_json and isinstance(tool_json["function"], dict):
+        tool_name = tool_json["function"].get("name") or tool_json.get("name")
+        tool_args = tool_json["function"].get("arguments") or tool_json["function"].get("parameters") or tool_json.get("arguments") or {}
+    else:
+        tool_name = tool_json.get("name") or tool_json.get("tool") or tool_json.get("tool_name") or tool_json.get("function") or tool_json.get("action")
+        tool_args = tool_json.get("arguments") or tool_json.get("parameters") or tool_json.get("input") or tool_json.get("args") or tool_json.get("params") or tool_json.get("tool_input") or tool_json.get("action_input") or {}
     if isinstance(tool_args, (dict, list)):
         tool_args = json.dumps(tool_args)
     elif isinstance(tool_args, str):

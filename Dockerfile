@@ -4,6 +4,8 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    xvfb \
+    xauth \
     libglib2.0-0 \
     libnss3 \
     libnspr4 \
@@ -37,4 +39,4 @@ RUN mkdir -p /app/data && \
 
 EXPOSE 4000
 
-CMD ["python3", "app.py"]
+CMD ["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1280x720x24", "python3", "app.py"]

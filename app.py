@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -116,6 +117,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         resp_text = await collect_response(gen)
 
                         parsed_tools, clean_text = parse_tools(resp_text)
+                        clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
                         next_messages = messages.copy()
                         ast_msg = {"role": "assistant"}
                         if parsed_tools:
@@ -156,6 +158,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             resp_text = await collect_response(gen)
 
             parsed_tools, clean_text = parse_tools(resp_text)
+            clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
             next_messages = messages.copy()
             ast_msg = {"role": "assistant"}
             if parsed_tools:
@@ -223,14 +226,17 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
             results = parser.feed(chunk)
             for r in results:
                 if "text" in r:
-                    yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
+                    if not parser.has_tool:
+                        yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
     except Exception:
         pass
-    for r in parser.flush():
-        if "text" in r:
-            yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
 
     parsed_tools, clean_text = parse_tools(full_text)
+    if not parsed_tools:
+        for r in parser.flush():
+            if "text" in r:
+                yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
+
     if parsed_tools:
         yield f"data: {json.dumps({'choices': [{'delta': {'tool_calls': parsed_tools}, 'finish_reason': 'tool_calls'}]})}\n\n"
     else:
@@ -238,6 +244,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
     yield "data: [DONE]\n\n"
 
     next_messages = messages.copy()
+    clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
     ast_msg = {"role": "assistant"}
     if parsed_tools:
         ast_msg["tool_calls"] = parsed_tools
@@ -294,7 +301,7 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
 
             results = parser.feed(chunk)
             for r in results:
-                if "text" in r:
+                if "text" in r and not parser.has_tool:
                     if not text_block_started:
                         start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
                         yield start_block
@@ -304,17 +311,18 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
     except Exception:
         pass
 
-    for r in parser.flush():
-        if "text" in r:
-            if not text_block_started:
-                start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                yield start_block
-                text_block_started = True
-            delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': r['text']}})}\n\n"
-            yield delta_evt
-
     parsed_tools, clean_text = parse_tools(full_text)
     out_tokens = count_tok(full_text)
+
+    if not parsed_tools:
+        for r in parser.flush():
+            if "text" in r:
+                if not text_block_started:
+                    start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                    yield start_block
+                    text_block_started = True
+                delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': r['text']}})}\n\n"
+                yield delta_evt
 
     if not text_block_started and not parsed_tools and clean_text.strip():
         start_evt = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
@@ -350,6 +358,7 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
     yield stop_evt
 
     next_messages = messages.copy()
+    clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
     ast_msg = {"role": "assistant"}
     if parsed_tools:
         ast_msg["tool_calls"] = parsed_tools
@@ -509,6 +518,71 @@ async def files_content(file_id: str, request: Request):
     return StreamingResponse(stream_chunks(), media_type=mime or "application/octet-stream")
 
 
+def is_thinking_enabled(body, request=None):
+    effort = body.get("effort")
+    if effort is not None:
+        e_str = str(effort).strip().lower()
+        if e_str in ["medium", "high", "max", "ultra", "extreme", "enabled", "adaptive", "on"]:
+            return True
+        if e_str in ["low", "none", "off", "disable", "disabled", "false"]:
+            return False
+
+    out_cfg = body.get("output_config")
+    if isinstance(out_cfg, dict):
+        out_effort = out_cfg.get("effort") or out_cfg.get("reasoning_effort")
+        if out_effort is not None:
+            e_str = str(out_effort).strip().lower()
+            if e_str in ["medium", "high", "max", "ultra", "extreme", "enabled", "adaptive", "on"]:
+                return True
+            if e_str in ["low", "none", "off", "disable", "disabled", "false"]:
+                return False
+
+    thinking_val = body.get("thinking")
+    if isinstance(thinking_val, dict):
+        t_type = str(thinking_val.get("type", "")).strip().lower()
+        if t_type in ["enabled", "adaptive", "true"]:
+            return True
+        if t_type == "disabled":
+            return False
+        budget = thinking_val.get("budget_tokens", 0)
+        if isinstance(budget, (int, float)) and budget > 0:
+            return True
+        t_effort = thinking_val.get("effort") or thinking_val.get("reasoning_effort") or thinking_val.get("level")
+        if t_effort is not None:
+            e_str = str(t_effort).strip().lower()
+            if e_str in ["medium", "high", "max", "ultra", "extreme", "enabled", "adaptive", "on"]:
+                return True
+            if e_str in ["low", "none", "off", "disable", "disabled", "false"]:
+                return False
+    elif isinstance(thinking_val, str):
+        t_str = thinking_val.strip().lower()
+        if t_str in ["medium", "high", "max", "ultra", "extreme", "true", "enabled", "adaptive", "on"]:
+            return True
+        if t_str in ["low", "none", "off", "disable", "disabled", "false"]:
+            return False
+    elif isinstance(thinking_val, bool):
+        return thinking_val
+
+    reasoning_effort = body.get("reasoning_effort")
+    if reasoning_effort is not None:
+        effort_str = str(reasoning_effort).strip().lower()
+        if effort_str in ["medium", "high", "max", "ultra", "extreme"]:
+            return True
+        if effort_str in ["low", "none", "off", "disable", "disabled"]:
+            return False
+
+    if request:
+        req_effort = request.headers.get("anthropic-thinking") or request.headers.get("x-anthropic-thinking") or request.headers.get("effort") or request.headers.get("x-effort")
+        if req_effort:
+            e_str = str(req_effort).strip().lower()
+            if e_str in ["medium", "high", "max", "ultra", "extreme", "enabled", "adaptive", "on"]:
+                return True
+            if e_str in ["low", "none", "off", "disable", "disabled", "false"]:
+                return False
+
+    return False
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     if not check_key(request):
@@ -516,11 +590,7 @@ async def chat_completions(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
     model = body.get("model", "instant")
-    thinking_raw = body.get("thinking", False)
-    if isinstance(thinking_raw, dict):
-        thinking = thinking_raw.get("type") == "enabled"
-    else:
-        thinking = bool(thinking_raw)
+    thinking = is_thinking_enabled(body, request)
     search = body.get("search", False)
     stream = body.get("stream", False)
     tools = body.get("tools", None)
@@ -580,7 +650,6 @@ async def openai_responses(request: Request):
         if message.get("content"):
             out_content.append({"type": "text", "text": message["content"]})
         if message.get("tool_calls"):
-            # Depending on spec, it might be just included in content or in tool_calls
             out_content.extend([{"type": "tool_call", "id": tc["id"], "name": tc["function"]["name"], "arguments": tc["function"]["arguments"]} for tc in message["tool_calls"]])
 
         msg_output = {
@@ -617,11 +686,7 @@ async def anthropic_messages(request: Request):
     else:
         model = "expert"
 
-    thinking_raw = body.get("thinking", False)
-    if isinstance(thinking_raw, dict):
-        thinking = thinking_raw.get("type") == "enabled"
-    else:
-        thinking = bool(thinking_raw)
+    thinking = is_thinking_enabled(body, request)
     stream = body.get("stream", False)
     tools = body.get("tools", [])
 
@@ -699,7 +764,6 @@ async def list_models(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
 
-    # We dynamically return the requested models or a generic list
     anthropic_models = [
         {"id": "instant", "name": "instant", "type": "model", "created_at": 1700000000},
         {"id": "expert", "name": "expert", "type": "model", "created_at": 1700000000},

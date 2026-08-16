@@ -4,6 +4,7 @@ import json
 import mimetypes
 import os
 import random
+import re
 import sqlite3
 import string
 import time
@@ -255,83 +256,252 @@ def count_tokens(text, model="deepseek-v4-flash"):
     return len(deepseek_tokenizer.ds_token.encode(text))
 
 
+def normalize_tool_call(tool_data_or_name, args_if_name=None):
+    if isinstance(tool_data_or_name, str):
+        name = tool_data_or_name
+        args = args_if_name if args_if_name is not None else {}
+    elif isinstance(tool_data_or_name, dict):
+        tool_data = tool_data_or_name
+        if "function" in tool_data and isinstance(tool_data["function"], dict):
+            fn = tool_data["function"]
+            name = fn.get("name") or tool_data.get("name")
+            args = fn.get("arguments") or fn.get("parameters") or fn.get("input") or fn.get("args") or fn.get("params") or {}
+        else:
+            name = tool_data.get("name") or tool_data.get("tool") or tool_data.get("tool_name") or tool_data.get("function") or tool_data.get("action")
+            args = tool_data.get("arguments") or tool_data.get("parameters") or tool_data.get("input") or tool_data.get("args") or tool_data.get("params") or tool_data.get("tool_input") or tool_data.get("action_input") or {}
+    else:
+        return None
+
+    if not name or not isinstance(name, str):
+        return None
+    if isinstance(args, (dict, list)):
+        args_str = json.dumps(args)
+    elif isinstance(args, str):
+        args_str = args
+        try:
+            json.loads(args_str)
+        except Exception:
+            args_str = json.dumps(args_str)
+    else:
+        args_str = json.dumps({})
+    call_id = "call_" + "".join(random.choices(string.ascii_letters + string.digits, k=8))
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name.strip(),
+            "arguments": args_str,
+        },
+    }
+
+
+def clean_json_str(s):
+    s = s.strip()
+    if s.startswith("```json"):
+        s = s[7:]
+    elif s.startswith("```"):
+        s = s[3:]
+    if s.endswith("```"):
+        s = s[:-3]
+    return s.strip()
+
+
 def parse_tools(text):
     tools = []
-    while "<tool_call>" in text and "</tool_call>" in text:
-        start = text.index("<tool_call>")
-        end = text.index("</tool_call>") + len("</tool_call>")
-        chunk = text[start:end]
-        text = text[:start] + text[end:]
-        try:
-            json_str = chunk.replace("<tool_call>", "").replace("</tool_call>", "").strip()
-            tool = json.loads(json_str)
-            call_id = "call_" + "".join(random.choices(string.ascii_letters + string.digits, k=8))
-            tools.append({
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": tool["name"],
-                    "arguments": json.dumps(tool["arguments"]) if isinstance(tool["arguments"], dict) else tool["arguments"],
-                },
-            })
-        except (json.JSONDecodeError, KeyError):
-            continue
-    return tools, text
+    clean_text = text
+    seen_sigs = set()
+
+    invoke_pattern = re.compile(r"<invoke\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22]\s*>(.*?)(?:</invoke>|$)", re.DOTALL | re.IGNORECASE)
+    param_pattern = re.compile(r"<parameter\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</parameter>|$)", re.DOTALL | re.IGNORECASE)
+
+    for m in invoke_pattern.finditer(text):
+        name = m.group(1).strip()
+        body = m.group(2)
+        args = {}
+        for p in param_pattern.finditer(body):
+            p_name = p.group(1).strip()
+            p_val = p.group(2).strip()
+            try:
+                args[p_name] = json.loads(p_val)
+            except Exception:
+                args[p_name] = p_val
+        norm = normalize_tool_call(name, args)
+        if norm:
+            sig = (norm["function"]["name"], norm["function"]["arguments"])
+            if sig not in seen_sigs:
+                seen_sigs.add(sig)
+                tools.append(norm)
+    if tools:
+        clean_text = re.sub(r"<(?:tool_calls?|tool_call)[^>]*>.*?(?:</(?:tool_calls?|tool_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        clean_text = re.sub(r"<invoke[^>]*>.*?(?:</invoke>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    if not tools:
+        fn_call_pattern = re.compile(r"<function_call>\s*<name>([^<]+)</name>\s*<arguments>(.*?)</arguments>\s*</function_call>", re.DOTALL | re.IGNORECASE)
+        for m in fn_call_pattern.finditer(text):
+            name = m.group(1).strip()
+            args_raw = m.group(2).strip()
+            try:
+                args = json.loads(args_raw)
+            except Exception:
+                args = args_raw
+            norm = normalize_tool_call(name, args)
+            if norm:
+                sig = (norm["function"]["name"], norm["function"]["arguments"])
+                if sig not in seen_sigs:
+                    seen_sigs.add(sig)
+                    tools.append(norm)
+        if tools:
+            clean_text = re.sub(r"<function_call>.*?</function_call>", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    if not tools:
+        tag_regex = re.compile(r"<(?:tool_call|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>", re.IGNORECASE)
+        decoder = json.JSONDecoder()
+        matches = list(tag_regex.finditer(text))
+        if matches:
+            for m in matches:
+                tag_name = m.group(1)
+                after_tag = text[m.end():]
+                brace_pos = after_tag.find("{")
+                if brace_pos != -1:
+                    try:
+                        data, end_idx = decoder.raw_decode(after_tag[brace_pos:])
+                        if isinstance(data, dict):
+                            name = tag_name or data.get("name") or data.get("tool") or data.get("tool_name") or data.get("function") or data.get("action")
+                            args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or data.get("params") or data.get("tool_input") or data.get("action_input")
+                            if args is None:
+                                if tag_name:
+                                    args = {k: v for k, v in data.items() if k not in ["name", "tool", "function"]}
+                                else:
+                                    args = {}
+                            if name:
+                                norm = normalize_tool_call(name, args)
+                                if norm:
+                                    sig = (norm["function"]["name"], norm["function"]["arguments"])
+                                    if sig not in seen_sigs:
+                                        seen_sigs.add(sig)
+                                        tools.append(norm)
+                    except Exception:
+                        pass
+            clean_text = re.sub(r"<(?:tool_call|function_call)[^>]*>.*?(?:</(?:tool_call|function_call)>|$)", "", text, flags=re.DOTALL).strip()
+
+    if not tools:
+        codeblock_pattern = r"```(?:tool_call|function_call)\s*(.*?)\s*```"
+        cb_matches = list(re.finditer(codeblock_pattern, clean_text, flags=re.DOTALL))
+        for m in cb_matches:
+            cleaned = clean_json_str(m.group(1))
+            try:
+                data = json.loads(cleaned)
+                if isinstance(data, dict):
+                    name = data.get("name") or data.get("tool") or data.get("function") or data.get("action")
+                    args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or {}
+                    norm = normalize_tool_call(name, args)
+                    if norm:
+                        sig = (norm["function"]["name"], norm["function"]["arguments"])
+                        if sig not in seen_sigs:
+                            seen_sigs.add(sig)
+                            tools.append(norm)
+            except Exception:
+                pass
+        if tools:
+            clean_text = re.sub(codeblock_pattern, "", clean_text, flags=re.DOTALL).strip()
+
+    if not tools:
+        json_pattern = r"```json\s*(\{.*?\})\s*```"
+        json_matches = list(re.finditer(json_pattern, clean_text, flags=re.DOTALL))
+        for m in json_matches:
+            cleaned = clean_json_str(m.group(1))
+            try:
+                data = json.loads(cleaned)
+                if isinstance(data, dict) and ("name" in data or "tool" in data or "function" in data):
+                    name = data.get("name") or data.get("tool") or data.get("function") or data.get("action")
+                    args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or {}
+                    norm = normalize_tool_call(name, args)
+                    if norm:
+                        sig = (norm["function"]["name"], norm["function"]["arguments"])
+                        if sig not in seen_sigs:
+                            seen_sigs.add(sig)
+                            tools.append(norm)
+            except Exception:
+                pass
+        if tools:
+            clean_text = re.sub(json_pattern, "", clean_text, flags=re.DOTALL).strip()
+
+    return tools, clean_text
 
 
 class StreamToolParser:
     def __init__(self):
         self.buffer = ""
         self.in_tool = False
-        self.tools = []
+        self.has_tool = False
 
     def feed(self, chunk):
         self.buffer += chunk
         results = []
         while True:
             if self.in_tool:
-                if "</tool_call>" in self.buffer:
-                    idx = self.buffer.index("</tool_call>") + len("</tool_call>")
+                end_tags = ["</tool_call>", "</function_call>", "</invoke>", "</tool_calls>"]
+                end_pos = -1
+                end_tag_len = 0
+                for tag in end_tags:
+                    if tag in self.buffer:
+                        idx = self.buffer.index(tag)
+                        if end_pos == -1 or idx < end_pos:
+                            end_pos = idx
+                            end_tag_len = len(tag)
+                if end_pos != -1:
+                    idx = end_pos + end_tag_len
                     tool_xml = self.buffer[:idx]
                     self.buffer = self.buffer[idx:]
                     self.in_tool = False
-                    try:
-                        json_str = tool_xml.replace("<tool_call>", "").replace("</tool_call>", "").strip()
-                        tool = json.loads(json_str)
-                        call_id = "call_" + "".join(random.choices(string.ascii_letters + string.digits, k=8))
-                        results.append({
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": tool["name"],
-                                "arguments": json.dumps(tool["arguments"]) if isinstance(tool["arguments"], dict) else tool["arguments"],
-                            },
-                        })
-                    except (json.JSONDecodeError, KeyError):
-                        pass
+                    self.has_tool = True
+                    parsed, _ = parse_tools(tool_xml)
+                    for item in parsed:
+                        results.append({"tool": item})
                 else:
-                    break
+                    brace_idx = self.buffer.find("{")
+                    if brace_idx != -1:
+                        decoder = json.JSONDecoder()
+                        try:
+                            data, end_pos = decoder.raw_decode(self.buffer[brace_idx:])
+                            norm = normalize_tool_call(data)
+                            if norm:
+                                results.append({"tool": norm})
+                                self.buffer = self.buffer[brace_idx + end_pos:]
+                                self.in_tool = False
+                                self.has_tool = True
+                        except Exception:
+                            break
+                    else:
+                        break
             else:
-                if "<tool_call>" in self.buffer:
-                    idx = self.buffer.index("<tool_call>")
-                    before = self.buffer[:idx]
-                    self.buffer = self.buffer[idx:]
+                start_tags = ["<tool_call", "<function_call", "<invoke", "<tool_calls"]
+                start_pos = -1
+                for tag in start_tags:
+                    if tag in self.buffer:
+                        idx = self.buffer.index(tag)
+                        if start_pos == -1 or idx < start_pos:
+                            start_pos = idx
+                if start_pos != -1:
+                    before = self.buffer[:start_pos]
+                    self.buffer = self.buffer[start_pos:]
                     self.in_tool = True
-                    if before:
-                        results.append({"text": before})
+                    self.has_tool = True
                 else:
-                    if len(self.buffer) > 15 and "<tool_call>" not in self.buffer:
-                        results.append({"text": self.buffer})
+                    if len(self.buffer) > 30 and not any(self.buffer.endswith(tag[:i]) for tag in ["<tool_call", "<function_call", "<invoke", "<tool_calls"] for i in range(1, len(tag))):
+                        if not self.has_tool:
+                            results.append({"text": self.buffer})
                         self.buffer = ""
                     else:
                         break
         return results
 
     def flush(self):
-        if self.buffer:
+        if self.buffer and not self.has_tool and not self.in_tool:
             result = [{"text": self.buffer}]
             self.buffer = ""
             return result
+        self.buffer = ""
         return []
 
 
