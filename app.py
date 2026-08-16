@@ -204,17 +204,23 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
     try:
         is_thinking = False
         async for chunk in gen:
+            if not chunk:
+                continue
             full_text += chunk
             
-            if "<think>\n" in chunk:
+            if "<think>" in chunk:
                 is_thinking = True
-                chunk = chunk.replace("<think>\n", "")
+                chunk = chunk.replace("<think>", "").lstrip("\n")
                 
             end_thinking = False
-            if "\n</think>\n\n" in chunk:
+            if "</think>" in chunk:
                 is_thinking = False
                 end_thinking = True
-                chunk = chunk.replace("\n</think>\n\n", "")
+                parts = chunk.split("</think>")
+                think_part = parts[0]
+                chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
+                if think_part:
+                    yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': think_part}}]})}\n\n"
                 
             if is_thinking and chunk:
                 yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': chunk}}]})}\n\n"
@@ -225,13 +231,15 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
 
             results = parser.feed(chunk)
             for r in results:
-                if "text" in r:
-                    if not parser.has_tool:
-                        yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
+                if "text" in r and not parser.has_tool:
+                    yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
     except Exception:
         pass
 
     parsed_tools, clean_text = parse_tools(full_text)
+    clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
+    clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+
     if not parsed_tools:
         for r in parser.flush():
             if "text" in r:
@@ -244,7 +252,6 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
     yield "data: [DONE]\n\n"
 
     next_messages = messages.copy()
-    clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
     ast_msg = {"role": "assistant"}
     if parsed_tools:
         ast_msg["tool_calls"] = parsed_tools
@@ -324,7 +331,10 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                 delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': r['text']}})}\n\n"
                 yield delta_evt
 
-    if not text_block_started and not parsed_tools and clean_text.strip():
+    clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
+    clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+
+    if not text_block_started and not parsed_tools and clean_text:
         start_evt = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
         yield start_evt
         delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': clean_text}})}\n\n"
@@ -375,12 +385,12 @@ def format_response(text, model, messages, tools=None):
     from functions import DEEPSEEK_TARIFFS
     parsed_tools, clean_text = parse_tools(text)
     
-    import re
     reasoning = None
-    match = re.search(r"<think>\s*(.*?)\s*</think>\s*", clean_text, flags=re.DOTALL)
+    match = re.search(r"<think>\s*(.*?)\s*</think>\s*", text, flags=re.DOTALL)
     if match:
         reasoning = match.group(1).strip()
-        clean_text = clean_text.replace(match.group(0), "").strip()
+    clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
+    clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
         
     in_tokens = count_tok(json.dumps(messages))
     out_tokens = count_tok(text)
@@ -630,11 +640,7 @@ async def openai_responses(request: Request):
                     msg_content.append(c)
         messages.append({"role": role, "content": msg_content})
 
-    thinking_raw = body.get("thinking", False)
-    if isinstance(thinking_raw, dict):
-        thinking = thinking_raw.get("type") == "enabled"
-    else:
-        thinking = bool(thinking_raw)
+    thinking = is_thinking_enabled(body, request)
     search = body.get("search", False)
     stream = body.get("stream", False)
     tools = body.get("tools", None)

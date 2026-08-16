@@ -311,29 +311,31 @@ def parse_tools(text):
     clean_text = text
     seen_sigs = set()
 
-    invoke_pattern = re.compile(r"<invoke\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22]\s*>(.*?)(?:</invoke>|$)", re.DOTALL | re.IGNORECASE)
+    block_pattern = re.compile(r"<(?:invoke|tool_call|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22]\s*>(.*?)(?:</(?:invoke|tool_call|function_call)>|$)", re.DOTALL | re.IGNORECASE)
     param_pattern = re.compile(r"<parameter\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</parameter>|$)", re.DOTALL | re.IGNORECASE)
 
-    for m in invoke_pattern.finditer(text):
+    for m in block_pattern.finditer(text):
         name = m.group(1).strip()
         body = m.group(2)
-        args = {}
-        for p in param_pattern.finditer(body):
-            p_name = p.group(1).strip()
-            p_val = p.group(2).strip()
-            try:
-                args[p_name] = json.loads(p_val)
-            except Exception:
-                args[p_name] = p_val
-        norm = normalize_tool_call(name, args)
-        if norm:
-            sig = (norm["function"]["name"], norm["function"]["arguments"])
-            if sig not in seen_sigs:
-                seen_sigs.add(sig)
-                tools.append(norm)
+        if "<parameter" in body:
+            args = {}
+            for p in param_pattern.finditer(body):
+                p_name = p.group(1).strip()
+                p_val = p.group(2).strip()
+                try:
+                    args[p_name] = json.loads(p_val)
+                except Exception:
+                    args[p_name] = p_val
+            norm = normalize_tool_call(name, args)
+            if norm:
+                sig = (norm["function"]["name"], norm["function"]["arguments"])
+                if sig not in seen_sigs:
+                    seen_sigs.add(sig)
+                    tools.append(norm)
+
     if tools:
         clean_text = re.sub(r"<(?:tool_calls?|tool_call)[^>]*>.*?(?:</(?:tool_calls?|tool_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
-        clean_text = re.sub(r"<invoke[^>]*>.*?(?:</invoke>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        clean_text = re.sub(r"<(?:invoke|function_call)[^>]*>.*?(?:</(?:invoke|function_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     if not tools:
         fn_call_pattern = re.compile(r"<function_call>\s*<name>([^<]+)</name>\s*<arguments>(.*?)</arguments>\s*</function_call>", re.DOTALL | re.IGNORECASE)
@@ -423,9 +425,7 @@ def parse_tools(text):
                             tools.append(norm)
             except Exception:
                 pass
-        if tools:
-            clean_text = re.sub(json_pattern, "", clean_text, flags=re.DOTALL).strip()
-
+    clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
     return tools, clean_text
 
 
