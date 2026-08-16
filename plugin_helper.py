@@ -246,8 +246,8 @@ async def build_prompt(messages, tools, model, is_first_message=False):
     tool_instructions = (
         "IMPORTANT EXECUTION DIRECTIVE:\n"
         "You are an AI agent with tools. When an actionable request is given (such as listing/reading/editing files, executing commands, searching, or computing), you MUST execute the appropriate tool call immediately or even when you feel user wants you or you think you should call tools then don't delay just call them, think which tool to use then use below format to call it simply.\n"
-"You have complete right to call tools anytime you feel you should or user is asking you to. Don't wait for user to explicitly say you to tool call use your own thinking to understand where to and where not to call it."
-        "DO NOT say ambigious messages or provide conversational text/promises. Output ONLY the tool call XML block in this exact schema with no surrounding text or markdown code blocks:\n"
+        "You have complete right to call tools anytime you feel you should or user is asking you to. Don't wait for user to explicitly say you to tool call use your own thinking to understand where to and where not to call it.\n"
+        "DO NOT spam, repeat past history, or provide conversational fluff/promises. Output ONLY the tool call XML block in this exact schema with no surrounding text or markdown code blocks:\n"
         "<tool_call>{\"name\": \"exact_tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n"
         "Never use keys like 'parameters', 'tool_name', 'action', or 'function'. Output strictly 'name' and 'arguments'."
     )

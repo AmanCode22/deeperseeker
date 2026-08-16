@@ -311,14 +311,40 @@ def parse_tools(text):
     clean_text = text
     seen_sigs = set()
 
-    if "DSML" in text:
+    block_pattern = re.compile(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:invoke|tool_call|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22]\s*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:invoke|tool_call|function_call)>|$)", re.DOTALL | re.IGNORECASE)
+    param_pattern = re.compile(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?parameter\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?parameter>|$)", re.DOTALL | re.IGNORECASE)
+
+    for m in block_pattern.finditer(text):
+        name = m.group(1).strip()
+        body = m.group(2)
+        if "parameter" in body:
+            args = {}
+            for p in param_pattern.finditer(body):
+                p_name = p.group(1).strip()
+                p_val = p.group(2).strip()
+                try:
+                    args[p_name] = json.loads(p_val)
+                except Exception:
+                    args[p_name] = p_val
+            norm = normalize_tool_call(name, args)
+            if norm:
+                sig = (norm["function"]["name"], norm["function"]["arguments"])
+                if sig not in seen_sigs:
+                    seen_sigs.add(sig)
+                    tools.append(norm)
+
+    if tools:
+        clean_text = re.sub(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_calls?|tool_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_calls?|tool_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        clean_text = re.sub(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:invoke|function_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:invoke|function_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    if not tools and "DSML" in text:
         dsml_block_pattern = re.compile(r"<[｜\|]{2}DSML[｜\|]{2}([A-Za-z0-9_]+)>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}\1>|$)", re.DOTALL | re.IGNORECASE)
-        param_pattern = re.compile(r"<[｜\|]{2}DSML[｜\|]{2}B([A-Za-z0-9_]+)[^>]*>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}B.*?>|$)", re.DOTALL | re.IGNORECASE)
+        param_pattern_b = re.compile(r"<[｜\|]{2}DSML[｜\|]{2}B([A-Za-z0-9_]+)[^>]*>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}B.*?>|$)", re.DOTALL | re.IGNORECASE)
         for m in dsml_block_pattern.finditer(text):
             tool_name = m.group(1).strip()
             body = m.group(2)
             args = {}
-            for pm in param_pattern.finditer(body):
+            for pm in param_pattern_b.finditer(body):
                 p_name = pm.group(1).lower().strip()
                 p_val = pm.group(2).strip()
                 try:
@@ -332,9 +358,10 @@ def parse_tools(text):
                     seen_sigs.add(sig)
                     tools.append(norm)
         if not tools:
-            tool_match = re.search(r"[｜\|]{2}DSML[｜\|]{2}([A-Za-z0-9_]+)", text, re.IGNORECASE)
+            tool_match = re.search(r"[｜\|]{2}DSML[｜\|]{2}(Bash|Read|Write|Edit|Agent|TaskList|TaskCreate|WebSearch|[A-Za-z0-9_]+)", text, re.IGNORECASE)
             if tool_match:
-                tool_name = tool_match.group(1).strip()
+                candidate = tool_match.group(1).strip()
+                tool_name = "Bash" if candidate.lower().startswith("b") and candidate.lower() not in ["bdescription", "bparam"] else candidate
                 args = {}
                 cmd_match = re.search(r"[｜\|]{2}B[\x22\x27]?command[\x22\x27]?[^>]*>(.*?)(?:</[｜\|]{2}B|$)", text, re.DOTALL | re.IGNORECASE)
                 desc_match = re.search(r"[｜\|]{2}B[\x22\x27]?description[\x22\x27]?[^>]*>(.*?)(?:</[｜\|]{2}B|$)", text, re.DOTALL | re.IGNORECASE)
@@ -353,33 +380,6 @@ def parse_tools(text):
         if tools:
             clean_text = re.sub(r"<[｜\|]{2}DSML[｜\|]{2}[^>]*>.*?(?:</[｜\|]{2}DSML[｜\|]{2}[^>]*>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
             clean_text = re.sub(r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
-
-    if not tools:
-        block_pattern = re.compile(r"<(?:invoke|tool_call|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22]\s*>(.*?)(?:</(?:invoke|tool_call|function_call)>|$)", re.DOTALL | re.IGNORECASE)
-        param_pattern = re.compile(r"<parameter\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</parameter>|$)", re.DOTALL | re.IGNORECASE)
-
-        for m in block_pattern.finditer(text):
-            name = m.group(1).strip()
-            body = m.group(2)
-            if "<parameter" in body:
-                args = {}
-                for p in param_pattern.finditer(body):
-                    p_name = p.group(1).strip()
-                    p_val = p.group(2).strip()
-                    try:
-                        args[p_name] = json.loads(p_val)
-                    except Exception:
-                        args[p_name] = p_val
-                norm = normalize_tool_call(name, args)
-                if norm:
-                    sig = (norm["function"]["name"], norm["function"]["arguments"])
-                    if sig not in seen_sigs:
-                        seen_sigs.add(sig)
-                        tools.append(norm)
-
-        if tools:
-            clean_text = re.sub(r"<(?:tool_calls?|tool_call)[^>]*>.*?(?:</(?:tool_calls?|tool_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
-            clean_text = re.sub(r"<(?:invoke|function_call)[^>]*>.*?(?:</(?:invoke|function_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     if not tools:
         fn_call_pattern = re.compile(r"<function_call>\s*<name>([^<]+)</name>\s*<arguments>(.*?)</arguments>\s*</function_call>", re.DOTALL | re.IGNORECASE)
