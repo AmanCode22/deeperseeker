@@ -312,7 +312,7 @@ def parse_tools(text):
     seen_sigs = set()
 
     param_names = {"command", "description", "file_path", "content", "path", "prompt", "query", "subject", "old_string", "new_string", "url", "input"}
-    tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_call|invoke|function_call)\s+(?:name|tool)=[\x27\x22]([A-Za-z0-9_]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
+    tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_call|invoke|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
     real_tool_matches = [m for m in tool_matches if m.group(1).lower() not in param_names]
 
     if real_tool_matches:
@@ -322,26 +322,26 @@ def parse_tools(text):
             end_idx = real_tool_matches[i+1].start() if i + 1 < len(real_tool_matches) else len(text)
             body = text[start_idx:end_idx]
             args = {}
-            p_matches = re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([A-Za-z0-9_]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:parameter|tool_call|param|invoke)\s+name=)|$)", body, flags=re.DOTALL | re.IGNORECASE)
+            p_matches = re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:parameter|tool_call|param|invoke)\s+name=)|$)", body, flags=re.DOTALL | re.IGNORECASE)
             for pm in p_matches:
                 p_name = pm.group(1).strip()
                 p_val = pm.group(2).strip()
-                p_val = re.sub(r"</?[A-Za-z0-9_]+[^>]*>", "", p_val).strip()
+                p_val = re.sub(r"</?[A-Za-z0-9_\-]+[^>]*>", "", p_val).strip()
                 try:
                     args[p_name] = json.loads(p_val)
                 except Exception:
                     args[p_name] = p_val
-            tag_param_matches = re.finditer(r"<([A-Za-z0-9_]+)>(.*?)(?:</\1>|$)", body, flags=re.DOTALL | re.IGNORECASE)
+            tag_param_matches = re.finditer(r"<([A-Za-z0-9_\-]+)>(.*?)(?:</\1>|$)", body, flags=re.DOTALL | re.IGNORECASE)
             for pm in tag_param_matches:
                 t_name = pm.group(1).strip().lower()
                 if t_name in param_names:
                     t_val = pm.group(2).strip()
-                    t_val = re.sub(r"</?[A-Za-z0-9_]+[^>]*>", "", t_val).strip()
+                    t_val = re.sub(r"</?[A-Za-z0-9_\-]+[^>]*>", "", t_val).strip()
                     try:
                         args[t_name] = json.loads(t_val)
                     except Exception:
                         args[t_name] = t_val
-            if candidate_name and args:
+            if candidate_name:
                 norm = normalize_tool_call(candidate_name, args)
                 if norm:
                     sig = (norm["function"]["name"], norm["function"]["arguments"])
