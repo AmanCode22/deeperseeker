@@ -778,6 +778,7 @@ async def list_models(request: Request):
     anthropic_models = [
         {"id": "instant", "name": "instant", "type": "model", "created_at": 1700000000},
         {"id": "expert", "name": "expert", "type": "model", "created_at": 1700000000},
+        {"id": "vision", "name": "vision", "type": "model", "created_at": 1700000000},
     ]
 
     if "anthropic-version" in request.headers or request.url.path == "/v1/models":
@@ -785,7 +786,7 @@ async def list_models(request: Request):
             "data": anthropic_models,
             "has_more": False,
             "first_id": "instant",
-            "last_id": "expert"
+            "last_id": "vision"
         }
 
     return {
