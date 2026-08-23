@@ -775,31 +775,109 @@ async def list_models(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
 
-    anthropic_models = [
-        {"id": "instant", "name": "instant", "type": "model", "created_at": 1700000000},
-        {"id": "expert", "name": "expert", "type": "model", "created_at": 1700000000},
-        {"id": "vision", "name": "vision", "type": "model", "created_at": 1700000000},
-    ]
-
-    if "anthropic-version" in request.headers or request.url.path == "/v1/models":
-        return {
-            "data": anthropic_models,
-            "has_more": False,
-            "first_id": "instant",
-            "last_id": "vision"
-        }
-
     return {
         "object": "list",
         "data": [
             {
-                "id": m["id"],
+                "id": "instant",
                 "object": "model",
-                "created": 1700000000,
+                "type": "model",
+                "name": "instant",
+                "display_name": "Instant",
+                "created": 1785456000,
+                "created_at": "2026-07-31T00:00:00Z",
                 "owned_by": "deeperseeker",
+                "capabilities": {
+                    "batch": {"supported": True},
+                    "structured_outputs": {"supported": True},
+                    "thinking": {
+                        "supported": True,
+                        "types": {
+                            "enabled": {"supported": True},
+                            "adaptive": {"supported": True}
+                        }
+                    },
+                    "effort": {
+                        "supported": True,
+                        "low": {"supported": True},
+                        "medium": {"supported": True}
+                    },
+                    "context_management": {
+                        "clear_thinking_20251015": {"supported": True},
+                        "compact_20260112": {"supported": True},
+                        "supported": True
+                    }
+                }
+            },
+            {
+                "id": "expert",
+                "object": "model",
+                "type": "model",
+                "name": "expert",
+                "display_name": "Expert",
+                "created": 1788134400,
+                "created_at": "2026-08-31T00:00:00Z",
+                "owned_by": "deeperseeker",
+                "capabilities": {
+                    "batch": {"supported": True},
+                    "code_execution": {"supported": True},
+                    "structured_outputs": {"supported": True},
+                    "thinking": {
+                        "supported": True,
+                        "types": {
+                            "enabled": {"supported": True},
+                            "adaptive": {"supported": True}
+                        }
+                    },
+                    "effort": {
+                        "supported": True,
+                        "low": {"supported": True},
+                        "medium": {"supported": True}
+                    },
+                    "context_management": {
+                        "clear_thinking_20251015": {"supported": True},
+                        "compact_20260112": {"supported": True},
+                        "supported": True
+                    }
+                }
+            },
+            {
+                "id": "vision",
+                "object": "model",
+                "type": "model",
+                "name": "vision",
+                "display_name": "Vision",
+                "created": 1785456000,
+                "created_at": "2026-07-31T00:00:00Z",
+                "owned_by": "deeperseeker",
+                "capabilities": {
+                    "batch": {"supported": True},
+                    "image_input": {"supported": True},
+                    "pdf_input": {"supported": True},
+                    "structured_outputs": {"supported": True},
+                    "thinking": {
+                        "supported": True,
+                        "types": {
+                            "enabled": {"supported": True},
+                            "adaptive": {"supported": True}
+                        }
+                    },
+                    "effort": {
+                        "supported": True,
+                        "low": {"supported": True},
+                        "medium": {"supported": True}
+                    },
+                    "context_management": {
+                        "clear_thinking_20251015": {"supported": True},
+                        "compact_20260112": {"supported": True},
+                        "supported": True
+                    }
+                }
             }
-            for m in anthropic_models
         ],
+        "has_more": False,
+        "first_id": "instant",
+        "last_id": "vision"
     }
 
 
