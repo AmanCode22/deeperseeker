@@ -592,10 +592,18 @@ def is_thinking_enabled(body, request=None):
             e_str = str(req_effort).strip().lower()
             if e_str in ["medium", "high", "max", "ultra", "extreme", "enabled", "adaptive", "on"]:
                 return True
-            if e_str in ["low", "none", "off", "disable", "disabled", "false"]:
-                return False
-
     return False
+
+
+def resolve_model(model_raw):
+    if not model_raw or not isinstance(model_raw, str):
+        return "expert"
+    m = model_raw.lower()
+    if "instant" in m or "haiku" in m or "flash" in m:
+        return "instant"
+    elif "vision" in m:
+        return "vision"
+    return "expert"
 
 
 @app.post("/v1/chat/completions")
@@ -604,7 +612,7 @@ async def chat_completions(request: Request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
     body = await request.json()
     messages = body.get("messages", [])
-    model = body.get("model", "instant")
+    model = resolve_model(body.get("model", "expert"))
     thinking = is_thinking_enabled(body, request)
     search = body.get("search", False)
     stream = body.get("stream", False)
@@ -617,7 +625,7 @@ async def openai_responses(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
     body = await request.json()
-    model = body.get("model", "instant")
+    model = resolve_model(body.get("model", "expert"))
     inputs = body.get("input", [])
     if isinstance(inputs, str):
         inputs = [inputs]
@@ -689,13 +697,7 @@ async def anthropic_messages(request: Request):
     body = await request.json()
     system = body.get("system", "")
     messages = body.get("messages", [])
-    model_raw = body.get("model", "").lower()
-    if "instant" in model_raw:
-        model = "instant"
-    elif "vision" in model_raw:
-        model = "vision"
-    else:
-        model = "expert"
+    model = resolve_model(body.get("model", "expert"))
 
     thinking = is_thinking_enabled(body, request)
     stream = body.get("stream", False)
@@ -775,109 +777,121 @@ async def list_models(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
 
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": "instant",
-                "object": "model",
-                "type": "model",
-                "name": "instant",
-                "display_name": "Instant",
-                "created": 1785456000,
-                "created_at": "2026-07-31T00:00:00Z",
-                "owned_by": "deeperseeker",
-                "capabilities": {
-                    "batch": {"supported": True},
-                    "structured_outputs": {"supported": True},
-                    "thinking": {
-                        "supported": True,
-                        "types": {
-                            "enabled": {"supported": True},
-                            "adaptive": {"supported": True}
-                        }
-                    },
-                    "effort": {
-                        "supported": True,
-                        "low": {"supported": True},
-                        "medium": {"supported": True}
-                    },
-                    "context_management": {
-                        "clear_thinking_20251015": {"supported": True},
-                        "compact_20260112": {"supported": True},
-                        "supported": True
+    base_models = [
+        {
+            "id": "instant",
+            "object": "model",
+            "type": "model",
+            "name": "instant",
+            "display_name": "Instant",
+            "created": 1785456000,
+            "created_at": "2026-07-31T00:00:00Z",
+            "owned_by": "deeperseeker",
+            "capabilities": {
+                "batch": {"supported": True},
+                "structured_outputs": {"supported": True},
+                "thinking": {
+                    "supported": True,
+                    "types": {
+                        "enabled": {"supported": True},
+                        "adaptive": {"supported": True}
                     }
-                }
-            },
-            {
-                "id": "expert",
-                "object": "model",
-                "type": "model",
-                "name": "expert",
-                "display_name": "Expert",
-                "created": 1788134400,
-                "created_at": "2026-08-31T00:00:00Z",
-                "owned_by": "deeperseeker",
-                "capabilities": {
-                    "batch": {"supported": True},
-                    "code_execution": {"supported": True},
-                    "structured_outputs": {"supported": True},
-                    "thinking": {
-                        "supported": True,
-                        "types": {
-                            "enabled": {"supported": True},
-                            "adaptive": {"supported": True}
-                        }
-                    },
-                    "effort": {
-                        "supported": True,
-                        "low": {"supported": True},
-                        "medium": {"supported": True}
-                    },
-                    "context_management": {
-                        "clear_thinking_20251015": {"supported": True},
-                        "compact_20260112": {"supported": True},
-                        "supported": True
-                    }
-                }
-            },
-            {
-                "id": "vision",
-                "object": "model",
-                "type": "model",
-                "name": "vision",
-                "display_name": "Vision",
-                "created": 1785456000,
-                "created_at": "2026-07-31T00:00:00Z",
-                "owned_by": "deeperseeker",
-                "capabilities": {
-                    "batch": {"supported": True},
-                    "image_input": {"supported": True},
-                    "pdf_input": {"supported": True},
-                    "structured_outputs": {"supported": True},
-                    "thinking": {
-                        "supported": True,
-                        "types": {
-                            "enabled": {"supported": True},
-                            "adaptive": {"supported": True}
-                        }
-                    },
-                    "effort": {
-                        "supported": True,
-                        "low": {"supported": True},
-                        "medium": {"supported": True}
-                    },
-                    "context_management": {
-                        "clear_thinking_20251015": {"supported": True},
-                        "compact_20260112": {"supported": True},
-                        "supported": True
-                    }
+                },
+                "effort": {
+                    "supported": True,
+                    "low": {"supported": True},
+                    "medium": {"supported": True}
+                },
+                "context_management": {
+                    "clear_thinking_20251015": {"supported": True},
+                    "compact_20260112": {"supported": True},
+                    "supported": True
                 }
             }
-        ],
+        },
+        {
+            "id": "expert",
+            "object": "model",
+            "type": "model",
+            "name": "expert",
+            "display_name": "Expert",
+            "created": 1788134400,
+            "created_at": "2026-08-31T00:00:00Z",
+            "owned_by": "deeperseeker",
+            "capabilities": {
+                "batch": {"supported": True},
+                "code_execution": {"supported": True},
+                "structured_outputs": {"supported": True},
+                "thinking": {
+                    "supported": True,
+                    "types": {
+                        "enabled": {"supported": True},
+                        "adaptive": {"supported": True}
+                    }
+                },
+                "effort": {
+                    "supported": True,
+                    "low": {"supported": True},
+                    "medium": {"supported": True}
+                },
+                "context_management": {
+                    "clear_thinking_20251015": {"supported": True},
+                    "compact_20260112": {"supported": True},
+                    "supported": True
+                }
+            }
+        },
+        {
+            "id": "vision",
+            "object": "model",
+            "type": "model",
+            "name": "vision",
+            "display_name": "Vision",
+            "created": 1785456000,
+            "created_at": "2026-07-31T00:00:00Z",
+            "owned_by": "deeperseeker",
+            "capabilities": {
+                "batch": {"supported": True},
+                "image_input": {"supported": True},
+                "pdf_input": {"supported": True},
+                "structured_outputs": {"supported": True},
+                "thinking": {
+                    "supported": True,
+                    "types": {
+                        "enabled": {"supported": True},
+                        "adaptive": {"supported": True}
+                    }
+                },
+                "effort": {
+                    "supported": True,
+                    "low": {"supported": True},
+                    "medium": {"supported": True}
+                },
+                "context_management": {
+                    "clear_thinking_20251015": {"supported": True},
+                    "compact_20260112": {"supported": True},
+                    "supported": True
+                }
+            }
+        }
+    ]
+
+    claude_aliases = []
+    for m in base_models:
+        alias = dict(m)
+        alias["id"] = f"anthropic/claude-{m['id']}"
+        alias["name"] = f"anthropic/claude-{m['name']}"
+        alias["display_name"] = f"Claude {m['display_name']}"
+        claude_aliases.append(alias)
+
+    all_models = base_models + claude_aliases
+
+    return {
+        "object": "list",
+        "data": all_models,
         "has_more": False,
-        "first_id": "instant",
-        "last_id": "vision"
+        "first_id": all_models[0]["id"],
+        "last_id": all_models[-1]["id"]
     }
 
 
