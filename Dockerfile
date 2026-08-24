@@ -39,4 +39,4 @@ RUN mkdir -p /app/data && \
 
 EXPOSE 4000
 
-CMD ["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1280x720x24", "python3", "app.py"]
+CMD ["sh", "-c", "xvfb-run -a -s '-screen 0 1280x720x24' python3 app.py"]
