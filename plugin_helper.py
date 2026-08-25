@@ -114,7 +114,7 @@ async def extract_and_upload_files(messages, auth_token):
                             result_fileids.append(k[1])
             elif j["type"] == "file":
                 if "file_id" in j["file"]:
-                    result_fileids.append(j["file_id"])
+                    result_fileids.append(j["file"]["file_id"])
                 if "file_data" in j["file"]:
                     filename = j["file"]["filename"]
                     mimetype_base, base64_data = j["file_data"].split(",")
@@ -223,21 +223,21 @@ def canonicalize_messages(messages):
     return canon
 
 
-async def generate_signature(messages, model):
+def generate_signature_sync(messages, model):
     last_ast_idx = -1
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "assistant":
             last_ast_idx = i
             break
 
-    if last_ast_idx == -1:
-        history = messages
-    else:
-        history = messages[:last_ast_idx + 1]
-
+    history = messages if last_ast_idx == -1 else messages[:last_ast_idx + 1]
     canon_history = canonicalize_messages(history)
     dump = json.dumps(canon_history, sort_keys=True)
     return hashlib.sha256(f"{model}_{dump}".encode("utf-8")).hexdigest()
+
+
+async def generate_signature(messages, model):
+    return generate_signature_sync(messages, model)
 
 
 async def build_prompt(messages, tools, model, is_first_message=False):

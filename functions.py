@@ -55,7 +55,7 @@ def init_db():
 async def get_session():
     global _session
     if _session is None:
-        _session = aiohttp.ClientSession()
+        _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15, sock_read=600))
     return _session
 
 
@@ -87,20 +87,27 @@ def get_headers(auth_token, pow=None):
     return headers
 
 
+_cookie_lock = asyncio.Lock()
+
+
 async def get_cookies():
-    if not os.path.exists("aws_cookies_deepseek.json"):
-        await _generate_cookies()
-    else:
-        cookies = json.load(open("aws_cookies_deepseek.json"))
-        if cookies.get("expiry") is None or cookies["expiry"] <= time.time():
+    async with _cookie_lock:
+        if not os.path.exists("aws_cookies_deepseek.json"):
             await _generate_cookies()
-    cookies = json.load(open("aws_cookies_deepseek.json"))
-    return cookies["cookie"]
+        else:
+            cookies = json.load(open("aws_cookies_deepseek.json"))
+            if cookies.get("expiry") is None or cookies["expiry"] <= time.time():
+                await _generate_cookies()
+        cookies = json.load(open("aws_cookies_deepseek.json"))
+        return cookies["cookie"]
 
 
 async def _generate_cookies():
+    launch_kwargs = {"headless": os.getenv("DS_HEADLESS", "1") != "0"}
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        launch_kwargs["args"] = ["--no-sandbox"]
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        browser = await p.chromium.launch(**launch_kwargs)
         context = await browser.new_context()
         page = await context.new_page()
         await page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded")
@@ -313,7 +320,7 @@ def parse_tools(text):
 
     param_names = {"command", "description", "file_path", "content", "path", "prompt", "query", "subject", "old_string", "new_string", "url", "input"}
     tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_call|invoke|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
-    real_tool_matches = [m for m in tool_matches if m.group(1).lower() not in param_names]
+    real_tool_matches = tool_matches
 
     if real_tool_matches:
         for i, tm in enumerate(real_tool_matches):
@@ -517,75 +524,86 @@ class StreamToolParser:
         self.buffer = ""
         self.in_tool = False
         self.has_tool = False
+        self.json_done = False
 
     def feed(self, chunk):
         self.buffer += chunk
         results = []
         while True:
             if self.in_tool:
-                end_tags = ["</tool_call>", "</function_call>", "</invoke>", "</tool_calls>", "</｜｜DSML｜｜", "</||DSML||"]
+                end_tags = ["</tool_call>", "</function_call>", "</invoke>", "</tool_calls>"]
                 end_pos = -1
                 end_tag_len = 0
                 for tag in end_tags:
-                    if tag in self.buffer:
-                        idx = self.buffer.index(tag)
-                        if end_pos == -1 or idx < end_pos:
-                            end_pos = idx
-                            end_tag_len = len(tag)
+                    idx = self.buffer.find(tag)
+                    if idx != -1 and (end_pos == -1 or idx < end_pos):
+                        end_pos = idx
+                        end_tag_len = len(tag)
                 if end_pos != -1:
-                    idx = end_pos + end_tag_len
-                    tool_xml = self.buffer[:idx]
-                    self.buffer = self.buffer[idx:]
+                    if not self.json_done:
+                        tool_xml = self.buffer[:end_pos + end_tag_len]
+                        parsed, _ = parse_tools(tool_xml)
+                        for item in parsed:
+                            results.append({"tool": item})
+                    self.buffer = self.buffer[end_pos + end_tag_len:]
                     self.in_tool = False
-                    self.has_tool = True
-                    parsed, _ = parse_tools(tool_xml)
-                    for item in parsed:
-                        results.append({"tool": item})
-                else:
-                    brace_idx = self.buffer.find("{")
-                    if brace_idx != -1:
-                        decoder = json.JSONDecoder()
-                        try:
-                            data, end_pos = decoder.raw_decode(self.buffer[brace_idx:])
-                            norm = normalize_tool_call(data)
-                            if norm:
-                                results.append({"tool": norm})
-                                self.buffer = self.buffer[brace_idx + end_pos:]
-                                self.in_tool = False
-                                self.has_tool = True
-                        except Exception:
-                            break
-                    else:
-                        break
+                    self.json_done = False
+                    continue
+                brace_idx = self.buffer.find("{")
+                if brace_idx != -1 and not self.json_done:
+                    decoder = json.JSONDecoder()
+                    try:
+                        data, consumed = decoder.raw_decode(self.buffer[brace_idx:])
+                        norm = normalize_tool_call(data)
+                        if norm:
+                            results.append({"tool": norm})
+                            self.json_done = True
+                            self.buffer = self.buffer[brace_idx + consumed:]
+                            continue
+                    except Exception:
+                        pass
+                break
             else:
-                start_tags = ["<tool_call", "<function_call", "<invoke", "<tool_calls", "<｜｜DSML｜｜", "<||DSML||", "DSML"]
+                start_tags = ["<tool_call", "<function_call", "<invoke", "<tool_calls"]
                 start_pos = -1
                 for tag in start_tags:
-                    if tag in self.buffer:
-                        idx = self.buffer.index(tag)
-                        if start_pos == -1 or idx < start_pos:
-                            start_pos = idx
+                    idx = self.buffer.find(tag)
+                    if idx != -1 and (start_pos == -1 or idx < start_pos):
+                        start_pos = idx
                 if start_pos != -1:
-                    before = self.buffer[:start_pos]
+                    if start_pos > 0:
+                        results.append({"text": self.buffer[:start_pos]})
                     self.buffer = self.buffer[start_pos:]
                     self.in_tool = True
                     self.has_tool = True
+                    continue
+                hold = 0
+                for tag in start_tags:
+                    for i in range(1, len(tag)):
+                        if self.buffer.endswith(tag[:i]):
+                            hold = max(hold, i)
+                if hold:
+                    text_part = self.buffer[:-hold]
+                    if text_part:
+                        results.append({"text": text_part})
+                    self.buffer = self.buffer[-hold:]
                 else:
-                    if len(self.buffer) > 30 and not any(self.buffer.endswith(tag[:i]) for tag in ["<tool_call", "<function_call", "<invoke", "<tool_calls", "<｜｜DSML｜｜", "<||DSML||", "DSML"] for i in range(1, len(tag))):
-                        if not self.has_tool:
-                            results.append({"text": self.buffer})
-                        self.buffer = ""
-                    else:
-                        break
+                    if self.buffer:
+                        results.append({"text": self.buffer})
+                    self.buffer = ""
+                break
         return results
 
     def flush(self):
-        if self.buffer and not self.has_tool and not self.in_tool:
-            result = [{"text": self.buffer}]
-            self.buffer = ""
-            return result
+        out = []
+        if self.buffer and not self.in_tool:
+            out.append({"text": self.buffer})
+        elif self.in_tool:
+            stripped = re.sub(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_call|invoke|function_call|parameter)[^>]*>", "", self.buffer, flags=re.IGNORECASE).strip()
+            if stripped:
+                out.append({"text": stripped})
         self.buffer = ""
-        return []
+        return out
 
 
 def summarize_messages(messages, max_tokens=500):
@@ -705,7 +723,8 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 resp_json = await resp.json()
             status = resp_json["data"]["biz_data"]["status"]
             file_id = resp_json["data"]["biz_data"]["id"]
-            while status in ["PENDING", "PARSING"]:
+            deadline = time.time() + 300
+            while status in ["PENDING", "PARSING"] and time.time() < deadline:
                 await asyncio.sleep(0.3)
                 async with session.get(
                     "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
@@ -735,47 +754,48 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
         if r.status != 200:
             error_text = await r.text()
             raise Exception(f"HTTP {r.status}: {error_text}")
-        
+
         async for line in r.content:
             if not line:
                 continue
             decoded_line = line.decode("utf-8").strip()
-            if decoded_line.startswith("event:"):
+            if not decoded_line.startswith("data: "):
                 continue
-            if decoded_line.startswith("data: "):
-                json_str = decoded_line[6:]
-                if "FINISHED" in json_str or "BATCH" in json_str:
-                    return
-                data = json.loads(json_str)
-                if "v" in data and isinstance(data["v"], dict) and "response" in data["v"]:
-                    fragments = data["v"]["response"].get("fragments")
-                    if fragments:
-                        fragment = fragments[0]
+            try:
+                data = json.loads(decoded_line[6:])
+            except Exception:
+                continue
+            if data.get("p") == "response/status" and data.get("v") == "FINISHED":
+                return
+            if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
+                for op in data["v"]:
+                    if isinstance(op, dict) and op.get("p") == "quasi_status" and op.get("v") == "FINISHED":
+                        return
+            if "v" in data and isinstance(data["v"], dict) and "response" in data["v"]:
+                fragments = data["v"]["response"].get("fragments")
+                if fragments:
+                    for fragment in fragments:
                         if fragment.get("type") == "THINK":
                             yield "<think>\n" + fragment.get("content", "")
-                        elif fragment.get("type") == "RESPONSE":
-                            yield fragment.get("content", "")
                         else:
                             yield fragment.get("content", "")
-                    continue
-                
-                if data.get("p") == "response/fragments" and data.get("o") == "APPEND":
-                    fragments = data.get("v")
-                    if isinstance(fragments, list) and len(fragments) > 0:
-                        fragment = fragments[0]
+                continue
+
+            if data.get("p") == "response/fragments" and data.get("o") == "APPEND":
+                fragments = data.get("v")
+                if isinstance(fragments, list):
+                    for fragment in fragments:
                         if fragment.get("type") == "RESPONSE":
                             yield "\n</think>\n\n" + fragment.get("content", "")
                         elif fragment.get("type") == "THINK":
                             yield "\n<think>\n" + fragment.get("content", "")
                         else:
                             yield fragment.get("content", "")
-                    continue
+                continue
 
-                if "v" in data:
-                    if isinstance(data["v"], str):
-                        yield data["v"]
-                elif data.get("o") == "APPEND" and isinstance(data.get("v"), str):
-                    yield data["v"]
+            v = data.get("v")
+            if isinstance(v, str):
+                yield v
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):
@@ -805,7 +825,8 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
     js_data = resp_json["data"]["biz_data"]
     status = js_data["status"]
     headers = get_headers(auth_token)
-    while status in ["PENDING", "PARSING"]:
+    deadline = time.time() + 300
+    while status in ["PENDING", "PARSING"] and time.time() < deadline:
         yield ("uploaded", file_id)
         await asyncio.sleep(0.3)
         async with session.get(

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -46,7 +47,10 @@ from functions import (
     upload_file,
     get_file_content,
 )
-from plugin_helper import build_prompt, extract_and_upload_files, generate_signature
+from plugin_helper import build_prompt, extract_and_upload_files, generate_signature, generate_signature_sync
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def count_tok(text):
@@ -86,7 +90,7 @@ def check_key(request: Request):
     return key == API_KEY
 
 
-async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None):
+async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, _retried=False):
     auth_token = get_auth_token()
     if not auth_token:
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
@@ -111,8 +115,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                     gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, None if model == "instant" else model)
                     if stream:
                         if is_anthropic:
-                            return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, parent_message_id), media_type="text/event-stream")
-                        return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, parent_message_id), media_type="text/event-stream")
+                            return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0), media_type="text/event-stream")
+                        return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0), media_type="text/event-stream")
                     else:
                         resp_text = await collect_response(gen)
 
@@ -172,9 +176,11 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             save_session(next_sig, token_id, session_id, parent_message_id + 2)
             return format_response(resp_text, model, messages, tools)
     except Exception as e:
+        if _retried:
+            raise
         if "429" in str(e) or "rate" in str(e).lower():
             mark_limited(token_id)
-            return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model)
+            return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, _retried=True)
         raise
 
 
@@ -201,17 +207,17 @@ async def collect_response(gen):
 async def stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id=0):
     parser = StreamToolParser()
     full_text = ""
+    is_thinking = False
     try:
-        is_thinking = False
         async for chunk in gen:
             if not chunk:
                 continue
             full_text += chunk
-            
+
             if "<think>" in chunk:
                 is_thinking = True
                 chunk = chunk.replace("<think>", "").lstrip("\n")
-                
+
             end_thinking = False
             if "</think>" in chunk:
                 is_thinking = False
@@ -221,46 +227,60 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
                 if think_part:
                     yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': think_part}}]})}\n\n"
-                
+
             if is_thinking and chunk:
                 yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': chunk}}]})}\n\n"
                 continue
-                
+
             if end_thinking and not chunk:
                 continue
 
-            results = parser.feed(chunk)
-            for r in results:
-                if "text" in r and not parser.has_tool:
+            for r in parser.feed(chunk):
+                if "text" in r:
                     yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
-    except Exception:
-        pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        if "429" in str(e) or "rate" in str(e).lower():
+            mark_limited(token_id)
+        logger.exception("stream_response failed")
+        try:
+            yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
+        except Exception:
+            pass
+    finally:
+        parsed_tools, clean_text = parse_tools(full_text)
+        clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
+        clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
 
-    parsed_tools, clean_text = parse_tools(full_text)
-    clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-    clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+        next_messages = messages.copy()
+        ast_msg = {"role": "assistant"}
+        if parsed_tools:
+            ast_msg["tool_calls"] = parsed_tools
+        else:
+            ast_msg["content"] = clean_text
+        next_messages.append(ast_msg)
+        next_sig = generate_signature_sync(next_messages, model)
+        save_session(sig, token_id, session_id, parent_message_id + 2)
+        save_session(next_sig, token_id, session_id, parent_message_id + 2)
 
-    if not parsed_tools:
-        for r in parser.flush():
-            if "text" in r:
-                yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
+        try:
+            if not parsed_tools:
+                for r in parser.flush():
+                    if "text" in r:
+                        yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
 
-    if parsed_tools:
-        yield f"data: {json.dumps({'choices': [{'delta': {'tool_calls': parsed_tools}, 'finish_reason': 'tool_calls'}]})}\n\n"
-    else:
-        yield f"data: {json.dumps({'choices': [{'finish_reason': 'stop'}]})}\n\n"
-    yield "data: [DONE]\n\n"
-
-    next_messages = messages.copy()
-    ast_msg = {"role": "assistant"}
-    if parsed_tools:
-        ast_msg["tool_calls"] = parsed_tools
-    else:
-        ast_msg["content"] = clean_text
-    next_messages.append(ast_msg)
-    next_sig = await generate_signature(next_messages, model)
-    save_session(sig, token_id, session_id, parent_message_id + 2)
-    save_session(next_sig, token_id, session_id, parent_message_id + 2)
+            if parsed_tools:
+                for i, tc in enumerate(parsed_tools):
+                    delta_tc = {"index": i, "id": tc["id"], "type": "function",
+                                "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
+                    yield f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [delta_tc]}}]})}\n\n"
+                yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]})}\n\n"
+            else:
+                yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+            yield "data: [DONE]\n\n"
+        except asyncio.CancelledError:
+            pass
 
 
 async def stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model=None, parent_message_id=0):
@@ -281,13 +301,13 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
             if not chunk:
                 continue
             full_text += chunk
-            
+
             if "<think>" in chunk:
                 is_thinking = True
                 chunk = chunk.replace("<think>", "").lstrip("\n")
                 start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'thinking'}})}\n\n"
                 yield start_block
-                
+
             end_thinking = False
             if "</think>" in chunk:
                 is_thinking = False
@@ -298,12 +318,12 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                 if think_part:
                     delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': think_part}})}\n\n"
                     yield delta_evt
-                
+
             if is_thinking and chunk:
                 delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': chunk}})}\n\n"
                 yield delta_evt
                 continue
-                
+
             if end_thinking:
                 stop_evt = f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
                 yield stop_evt
@@ -311,79 +331,83 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                 if not chunk:
                     continue
 
-            results = parser.feed(chunk)
-            for r in results:
-                if "text" in r and not parser.has_tool:
+            for r in parser.feed(chunk):
+                if "text" in r:
                     if not text_block_started:
                         start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
                         yield start_block
                         text_block_started = True
                     delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': r['text']}})}\n\n"
                     yield delta_evt
-    except Exception:
-        pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        if "429" in str(e) or "rate" in str(e).lower():
+            mark_limited(token_id)
+        logger.exception("stream_anthropic_response failed")
+        try:
+            yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)[:300]}})}\n\n"
+        except Exception:
+            pass
+    finally:
+        parsed_tools, clean_text = parse_tools(full_text)
+        out_tokens = count_tok(full_text)
 
-    parsed_tools, clean_text = parse_tools(full_text)
-    out_tokens = count_tok(full_text)
+        clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
+        clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
 
-    if not parsed_tools:
-        for r in parser.flush():
-            if "text" in r:
-                if not text_block_started:
-                    start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                    yield start_block
-                    text_block_started = True
-                delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': r['text']}})}\n\n"
-                yield delta_evt
+        next_messages = messages.copy()
+        ast_msg = {"role": "assistant"}
+        if parsed_tools:
+            ast_msg["tool_calls"] = parsed_tools
+        else:
+            ast_msg["content"] = clean_text
+        next_messages.append(ast_msg)
+        next_sig = generate_signature_sync(next_messages, model)
+        save_session(sig, token_id, session_id, parent_message_id + 2)
+        save_session(next_sig, token_id, session_id, parent_message_id + 2)
 
-    clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-    clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+        def _tb(text):
+            return (f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                    f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index_local[0], 'delta': {'type': 'text_delta', 'text': text}})}\n\n"
+                    f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n")
 
-    if not text_block_started and not parsed_tools and clean_text:
-        start_evt = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-        yield start_evt
-        delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': clean_text}})}\n\n"
-        yield delta_evt
-        stop_evt = f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-        yield stop_evt
-        block_index += 1
-    elif text_block_started:
-        stop_evt = f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-        yield stop_evt
-        block_index += 1
+        block_index_local = [block_index]
+        tail_events = ""
+        if is_thinking:
+            tail_events += f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
+            block_index_local[0] += 1
 
-    if parsed_tools:
-        for tc in parsed_tools:
-            tool_input = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"]
-            json_str = json.dumps(tool_input)
-            start_tc = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'tool_use', 'id': tc['id'], 'name': tc['function']['name'], 'input': {}}})}\n\n"
-            yield start_tc
-            delta_tc = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'input_json_delta', 'partial_json': json_str}})}\n\n"
-            yield delta_tc
-            stop_tc = f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-            yield stop_tc
-            block_index += 1
-        msg_delta = f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use', 'stop_sequence': None}, 'usage': {'output_tokens': out_tokens}})}\n\n"
-        yield msg_delta
-    else:
-        msg_delta = f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': out_tokens}})}\n\n"
-        yield msg_delta
+        flushed_text = ""
+        if not parsed_tools:
+            for r in parser.flush():
+                if "text" in r:
+                    flushed_text += r["text"]
 
-    stop_evt = f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-    yield stop_evt
+        if not text_block_started and not parsed_tools and (clean_text or flushed_text):
+            tail_events += _tb(clean_text or flushed_text)
+        elif text_block_started and not parsed_tools:
+            tail_events += f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
 
-    next_messages = messages.copy()
-    clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-    ast_msg = {"role": "assistant"}
-    if parsed_tools:
-        ast_msg["tool_calls"] = parsed_tools
-    else:
-        ast_msg["content"] = clean_text
-    next_messages.append(ast_msg)
-    next_sig = await generate_signature(next_messages, model)
+        if parsed_tools:
+            for tc in parsed_tools:
+                tool_input = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"]
+                json_str = json.dumps(tool_input)
+                tail_events += f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'tool_use', 'id': tc['id'], 'name': tc['function']['name'], 'input': {}}})}\n\n"
+                tail_events += f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index_local[0], 'delta': {'type': 'input_json_delta', 'partial_json': json_str}})}\n\n"
+                tail_events += f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
+                block_index_local[0] += 1
+            tail_events += f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use', 'stop_sequence': None}, 'usage': {'output_tokens': out_tokens}})}\n\n"
+        else:
+            tail_events += f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': out_tokens}})}\n\n"
+        tail_events += f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
-    save_session(sig, token_id, session_id, parent_message_id + 2)
-    save_session(next_sig, token_id, session_id, parent_message_id + 2)
+        try:
+            for evt in tail_events.split("\n\n"):
+                if evt.strip():
+                    yield evt + "\n\n"
+        except asyncio.CancelledError:
+            pass
 
 
 def format_response(text, model, messages, tools=None):
@@ -965,7 +989,16 @@ async def root(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    active = sum(1 for t in get_tokens() if t["status"] == "ACTIVE")
+    cookies_valid = None
+    try:
+        c = json.load(open("aws_cookies_deepseek.json"))
+        exp = c.get("expiry")
+        cookies_valid = bool(exp and exp > time.time())
+    except Exception:
+        cookies_valid = False
+    ok = active > 0 and cookies_valid
+    return {"status": "ok" if ok else "degraded", "active_tokens": active, "cookies_valid": cookies_valid}
 
 
 if __name__ == "__main__":
