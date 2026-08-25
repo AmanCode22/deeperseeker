@@ -1,0 +1,12 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+.env
+*.db
+*.db.bak
+aws_cookies_deepseek.json
+.codegraph
+.opencode
