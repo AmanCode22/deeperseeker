@@ -125,7 +125,7 @@ async def get_cookies():
 
 
 async def _generate_cookies():
-    launch_kwargs = {"headless": os.getenv("DS_HEADLESS", "1") != "0"}
+    launch_kwargs = {"headless": False}
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         launch_kwargs["args"] = ["--no-sandbox"]
     async with async_playwright() as p:
