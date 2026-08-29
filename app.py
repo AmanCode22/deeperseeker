@@ -128,6 +128,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                 break
 
     if sess:
+
         token_id = sess["token_id"]
         session_id = sess["session_id"]
         parent_message_id = sess["parent_message_id"]
@@ -139,6 +140,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                 if new_tok:
                     new_session_id = await create_new_chat(new_tok["token"])
                     prompt = await build_prompt(messages, tools or [], model, is_first_message=True)
+
                     file_ids = await extract_and_upload_files(messages, new_tok["token"])
                     gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, None if model == "instant" else model, file_ids)
                     if stream:
@@ -165,6 +167,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         save_session(next_sig, new_token_id, new_session_id, 2)
                         return format_response(resp_text, model, messages, tools)
     else:
+
         create_lock = _sig_locks.setdefault(sig, asyncio.Lock())
         async with create_lock:
             sess = find_session(sig)
@@ -493,20 +496,20 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
 def format_response(text, model, messages, tools=None):
     from functions import DEEPSEEK_TARIFFS
     parsed_tools, clean_text = parse_tools(text)
-    
+
     reasoning = None
     match = re.search(r"<think>\s*(.*?)\s*</think>\s*", text, flags=re.DOTALL)
     if match:
         reasoning = match.group(1).strip()
     clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
     clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
-        
+
     in_tokens = count_tok(_messages_text(messages))
     out_tokens = count_tok(text)
     tariff_key = "deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash"
     tariff = DEEPSEEK_TARIFFS[tariff_key]
     cost = (in_tokens / 1_000_000 * tariff["cache_miss_input"]) + (out_tokens / 1_000_000 * tariff["output_generation"])
-    
+
     msg_dict = {
         "role": "assistant",
         "content": clean_text if not parsed_tools else None,
@@ -541,13 +544,13 @@ def format_anthropic_response(result, model):
     choice = result["choices"][0]
     msg = choice["message"]
     ant_content = []
-    
+
     if msg.get("reasoning_content"):
         ant_content.append({"type": "thinking", "thinking": msg["reasoning_content"]})
-        
+
     if msg.get("content"):
         ant_content.append({"type": "text", "text": msg["content"]})
-        
+
     if msg.get("tool_calls"):
         for tc in msg["tool_calls"]:
             args = tc["function"]["arguments"]
@@ -807,6 +810,7 @@ async def anthropic_messages(request: Request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
     body = await request.json()
     system = body.get("system", "")
+
     messages = body.get("messages", [])
     model = resolve_model(body.get("model", "expert"))
 
@@ -827,18 +831,27 @@ async def anthropic_messages(request: Request):
         content = m.get("content", "")
         if isinstance(content, list):
             parts = []
+            image_parts = []
             for c in content:
                 if isinstance(c, dict):
                     if c.get("type") == "text":
                         parts.append(c.get("text", ""))
+                    elif c.get("type") == "image":
+                        image_parts.append(c)
                     elif c.get("type") == "tool_use":
-                        parts.append(f"<tool_call>{json.dumps({'name': c.get('name'), 'arguments': c.get('input', {})})}</tool_call>")
+                        parts.append(f"{json.dumps({'name': c.get('name'), 'arguments': c.get('input', {})})}")
                     elif c.get("type") == "tool_result":
                         res_content = c.get("content", "")
                         if isinstance(res_content, list):
+                            for item in res_content:
+                                if isinstance(item, dict) and item.get("type") == "image":
+                                    image_parts.append(item)
                             res_content = " ".join(item.get("text", "") for item in res_content if isinstance(item, dict) and item.get("type") == "text")
                         parts.append(f"[Tool Result for {c.get('tool_use_id', 'tool')}]: {res_content}")
-            content = "\n".join(parts)
+            if image_parts:
+                content = [{"type": "text", "text": s} for s in parts if s] + image_parts
+            else:
+                content = "\n".join(parts)
         if m.get("role") == "system":
             if content:
                 openai_msgs.append({"role": "system", "content": content})

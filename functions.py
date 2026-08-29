@@ -872,7 +872,7 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         ) as resp:
             js_data = (await resp.json())["data"]["biz_data"]["files"][0]
         status = js_data["status"]
-    if status == "SUCCESS":
+    if status == "SUCCESS" or (status == "CONTENT_EMPTY" and str(file_content_type).startswith("image/")):
         tp_data = datetime.fromtimestamp(js_data["updated_at"], timezone.utc)
         yield ("success", {
             "file_id": file_id,
@@ -893,8 +893,19 @@ async def get_file_content(auth_token, file_id):
         headers=headers, cookies=cookie, timeout=aiohttp.ClientTimeout(total=30),
     ) as resp:
         resp_json = await resp.json()
-    yield mimetypes.guess_type(resp_json["data"]["biz_data"]["files"][0]["file_name"])[0]
-    file_path = "https://files.deepseeksvc.com/api" + resp_json["data"]["biz_data"]["files"][0]["signed_path"] + "&ty=r"
+    js_data = resp_json["data"]["biz_data"]["files"][0]
+    yield mimetypes.guess_type(js_data["file_name"])[0]
+    deadline = time.time() + 60
+    while js_data.get("status") in ("PENDING", "PARSING") and time.time() < deadline and not js_data.get("signed_path"):
+        await asyncio.sleep(0.5)
+        async with session.get(
+            "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
+            headers=headers, cookies=cookie, timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            js_data = (await resp.json())["data"]["biz_data"]["files"][0]
+    if not js_data.get("signed_path"):
+        return
+    file_path = "https://files.deepseeksvc.com/api" + js_data["signed_path"] + "&ty=r"
     async with session.get(file_path) as data:
         async for chunk in data.content.iter_chunked(8192):
             if chunk:

@@ -78,6 +78,14 @@ def _assert_public_url(url):
             raise ValueError("url resolves to non-public address")
 
 
+def _b64(data):
+    data = re.sub(r"[^A-Za-z0-9+/=]", "", data)
+    try:
+        return base64.b64decode(data + "=" * (-len(data) % 4))
+    except Exception:
+        return None
+
+
 async def extract_and_upload_files(messages, auth_token, last_user_only=False):
     result_fileids = []
     scan = messages
@@ -124,9 +132,11 @@ async def extract_and_upload_files(messages, auth_token, last_user_only=False):
                         + str(uuid.uuid4())
                         + (mimetypes.guess_extension(mime_type) or ".bin")
                     )
-                    data_bytes = base64.b64decode(
-                        (base64_data.split("data:")[1] if "data:" in base64_data else base64_data).encode()
+                    data_bytes = _b64(
+                        (base64_data.split("data:")[1] if "data:" in base64_data else base64_data)
                     )
+                    if data_bytes is None:
+                        continue
                     async for k in upload_file(data_bytes, filename, mime_type, auth_token):
                         if k[0] == "uploaded":
                             continue
@@ -143,9 +153,11 @@ async def extract_and_upload_files(messages, auth_token, last_user_only=False):
                     mimetype_base, base64_data = data_parts
 
                     mime_type = mimetype_base.split(":")[1].split(";")[0]
-                    data_bytes = base64.b64decode(
-                        (base64_data.split("data:")[1] if "data:" in base64_data else base64_data).encode()
+                    data_bytes = _b64(
+                        (base64_data.split("data:")[1] if "data:" in base64_data else base64_data)
                     )
+                    if data_bytes is None:
+                        continue
                     async for k in upload_file(data_bytes, filename, mime_type, auth_token):
                         if k[0] == "uploaded":
                             continue
@@ -160,7 +172,9 @@ async def extract_and_upload_files(messages, auth_token, last_user_only=False):
                         + str(uuid.uuid4())
                         + (mimetypes.guess_extension(mime_type) or ".bin")
                     )
-                    data_bytes = base64.b64decode(base64_data.encode())
+                    data_bytes = _b64(base64_data)
+                    if data_bytes is None:
+                        continue
                     async for k in upload_file(data_bytes, filename, mime_type, auth_token):
                         if k[0] == "uploaded":
                             continue
@@ -193,7 +207,7 @@ def canonicalize_messages(messages):
         role = m.get("role", "")
         content = m.get("content", "")
         tool_calls = m.get("tool_calls")
-        
+
         if tool_calls and isinstance(tool_calls, list):
             tc_parts = []
             for tc in tool_calls:
@@ -237,7 +251,7 @@ def canonicalize_messages(messages):
                 except Exception:
                     return match.group(0)
             content = re.sub(r"<tool_call>(.*?)</tool_call>", repl_tc, content, flags=re.DOTALL)
-            
+
         canon.append({"role": role, "content": str(content).strip()})
     return canon
 
