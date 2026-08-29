@@ -260,14 +260,12 @@ def delete_session(sig):
 
 DEEPSEEK_TARIFFS = {
     "deepseek-v4-flash": {
-        "cache_miss_input": 0.14,
-        "cache_hit_input": 0.0028,
-        "output_generation": 0.28,
+        "cache_miss_input": 0.66,
+        "output_generation": 1.32,
     },
     "deepseek-v4-pro": {
-        "cache_miss_input": 0.435,
-        "cache_hit_input": 0.003625,
-        "output_generation": 0.87,
+        "cache_miss_input": 1.32,
+        "output_generation": 1.98,
     },
 }
 
