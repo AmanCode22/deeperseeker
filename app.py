@@ -3,9 +3,11 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 import deepseek_tokenizer
 import uvicorn
@@ -15,6 +17,9 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(BASE_DIR)
 
 load_dotenv()
 
@@ -40,10 +45,9 @@ from functions import (
     parse_tools,
     pick_token,
     save_session,
-    save_session_map,
+    delete_session,
     send_message,
     StreamToolParser,
-    summarize_messages,
     upload_file,
     get_file_content,
 )
@@ -68,60 +72,86 @@ templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-SESSIONS = set()
+@app.middleware("http")
+async def limit_body_size(request: Request, call_next):
+    cl = request.headers.get("content-length", "")
+    if cl.isdigit() and int(cl) > 32 * 1024 * 1024:
+        return JSONResponse({"error": "Request body too large"}, status_code=413)
+    return await call_next(request)
+
+
+SESSIONS = {}
+SESSION_TTL = 7 * 24 * 3600
+_sig_locks = {}
+_login_fails = {"count": 0, "locked_until": 0}
 
 
 def get_current_admin(request: Request):
     sid = request.cookies.get("session_id")
-    if not sid or sid not in SESSIONS:
+    if not sid or sid not in SESSIONS or time.time() - SESSIONS[sid] > SESSION_TTL:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+    SESSIONS[sid] = time.time()
+    origin = request.headers.get("origin", "")
+    if origin:
+        parsed = urlparse(origin).netloc
+        if parsed and parsed != request.headers.get("host", ""):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     return "admin"
 
 
-def check_key(request: Request):
+def get_api_key(request: Request):
     auth = request.headers.get("authorization", "")
     api_key_header = request.headers.get("x-api-key", "")
     if auth.startswith("Bearer "):
-        key = auth[7:]
+        return auth[7:]
     elif auth:
-        key = auth
-    else:
-        key = api_key_header
-    return key == API_KEY
+        return auth
+    return api_key_header
 
 
-async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, _retried=False):
+def check_key(request: Request):
+    key = get_api_key(request)
+    return secrets.compare_digest(key.encode("utf-8"), API_KEY.encode("utf-8"))
+
+
+async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, scope="", _retried=False):
     auth_token = get_auth_token()
     if not auth_token:
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
 
-    sig = await generate_signature(messages, model)
+    sig = await generate_signature(messages, model, scope)
     sess = find_session(sig)
+    if not sess:
+        for i in range(len(messages) - 1, 0, -1):
+            sess = find_session(generate_signature_sync(messages[:i], model, scope))
+            if sess:
+                break
 
     if sess:
         token_id = sess["token_id"]
         session_id = sess["session_id"]
         parent_message_id = sess["parent_message_id"]
         tok = get_token(token_id)
-        if tok and tok["status"] == "RATE_LIMITED":
-            summary = summarize_messages(messages)
+        if not tok or tok["status"] == "RATE_LIMITED":
             new_token_id = pick_token()
-            if new_token_id and new_token_id != token_id:
+            if new_token_id and (not tok or new_token_id != token_id):
                 new_tok = get_token(new_token_id)
                 if new_tok:
                     new_session_id = await create_new_chat(new_tok["token"])
-                    save_session_map(session_id, new_session_id, new_token_id)
                     prompt = await build_prompt(messages, tools or [], model, is_first_message=True)
-                    gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, None if model == "instant" else model)
+                    file_ids = await extract_and_upload_files(messages, new_tok["token"])
+                    gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, None if model == "instant" else model, file_ids)
                     if stream:
                         if is_anthropic:
-                            return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0), media_type="text/event-stream")
-                        return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0), media_type="text/event-stream")
+                            return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0, scope), media_type="text/event-stream")
+                        return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0, scope), media_type="text/event-stream")
                     else:
                         resp_text = await collect_response(gen)
+                        mark_active(new_token_id)
 
                         parsed_tools, clean_text = parse_tools(resp_text)
                         clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
+                        clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
                         next_messages = messages.copy()
                         ast_msg = {"role": "assistant"}
                         if parsed_tools:
@@ -129,40 +159,51 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         else:
                             ast_msg["content"] = clean_text
                         next_messages.append(ast_msg)
-                        next_sig = await generate_signature(next_messages, model)
+                        next_sig = await generate_signature(next_messages, model, scope)
 
                         save_session(sig, new_token_id, new_session_id, 2)
                         save_session(next_sig, new_token_id, new_session_id, 2)
                         return format_response(resp_text, model, messages, tools)
     else:
-        token_id = pick_token()
-        if not token_id:
-            return JSONResponse({"error": "No tokens available"}, status_code=503)
-        tok = get_token(token_id)
-        if not tok:
-            return JSONResponse({"error": "Token not found"}, status_code=503)
-        session_id = await create_new_chat(tok["token"])
-        parent_message_id = 0
+        create_lock = _sig_locks.setdefault(sig, asyncio.Lock())
+        async with create_lock:
+            sess = find_session(sig)
+            if not sess:
+                token_id = pick_token()
+                if not token_id:
+                    return JSONResponse({"error": "No tokens available"}, status_code=503)
+                tok = get_token(token_id)
+                if not tok:
+                    return JSONResponse({"error": "Token not found"}, status_code=503)
+                session_id = await create_new_chat(tok["token"])
+                save_session(sig, token_id, session_id, 0)
+                parent_message_id = 0
+            else:
+                token_id = sess["token_id"]
+                session_id = sess["session_id"]
+                parent_message_id = sess["parent_message_id"]
 
     tok = get_token(token_id)
     if not tok:
         return JSONResponse({"error": "Token expired"}, status_code=503)
 
-    file_ids = await extract_and_upload_files(messages, tok["token"])
     is_first = parent_message_id == 0
+    file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
     prompt = await build_prompt(messages, tools or [], model, is_first)
 
     try:
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, None if model == "instant" else model, file_ids)
         if stream:
             if is_anthropic:
-                return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id), media_type="text/event-stream")
-            return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id), media_type="text/event-stream")
+                return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id, scope), media_type="text/event-stream")
+            return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope), media_type="text/event-stream")
         else:
             resp_text = await collect_response(gen)
+            mark_active(token_id)
 
             parsed_tools, clean_text = parse_tools(resp_text)
             clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
+            clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
             next_messages = messages.copy()
             ast_msg = {"role": "assistant"}
             if parsed_tools:
@@ -170,31 +211,20 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             else:
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
-            next_sig = await generate_signature(next_messages, model)
+            next_sig = await generate_signature(next_messages, model, scope)
 
             save_session(sig, token_id, session_id, parent_message_id + 2)
             save_session(next_sig, token_id, session_id, parent_message_id + 2)
             return format_response(resp_text, model, messages, tools)
     except Exception as e:
-        if _retried:
-            raise
-        if "429" in str(e) or "rate" in str(e).lower():
+        delete_session(sig)
+        m = re.match(r"HTTP (\d{3}):", str(e))
+        code = int(m.group(1)) if m else None
+        if code in (401, 403, 429):
             mark_limited(token_id)
-            return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, _retried=True)
-        raise
-
-
-async def extract_user_msg_text(messages):
-    for msg in reversed(messages):
-        if msg["role"] == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
-                if parts:
-                    return "\n".join(parts)
-    return ""
+        if _retried or code not in (401, 403, 429):
+            raise
+        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
 
 
 async def collect_response(gen):
@@ -204,12 +234,44 @@ async def collect_response(gen):
     return text
 
 
-async def stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id=0):
+def _messages_text(messages):
+    parts = []
+    for m in messages:
+        c = m.get("content", "")
+        if isinstance(c, list):
+            parts.append(" ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"))
+        else:
+            parts.append(str(c))
+    return "\n".join(parts)
+
+
+async def _hold_think_tags(gen):
+    carry = ""
+    async for chunk in gen:
+        chunk = carry + chunk
+        carry = ""
+        hold = 0
+        for tag in ("<think>", "</think>"):
+            for i in range(1, len(tag)):
+                if chunk.endswith(tag[:i]):
+                    hold = max(hold, i)
+        if hold:
+            carry = chunk[-hold:]
+            chunk = chunk[:-hold]
+        if chunk:
+            yield chunk
+    if carry:
+        yield carry
+
+
+async def stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id=0, scope=""):
     parser = StreamToolParser()
     full_text = ""
     is_thinking = False
+    aborted = False
+    failed = False
     try:
-        async for chunk in gen:
+        async for chunk in _hold_think_tags(gen):
             if not chunk:
                 continue
             full_text += chunk
@@ -238,10 +300,16 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
             for r in parser.feed(chunk):
                 if "text" in r:
                     yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
-    except asyncio.CancelledError:
+        mark_active(token_id)
+    except (asyncio.CancelledError, GeneratorExit):
+        aborted = True
+        failed = True
         raise
     except Exception as e:
-        if "429" in str(e) or "rate" in str(e).lower():
+        failed = True
+        m = re.match(r"HTTP (\d{3}):", str(e))
+        code = int(m.group(1)) if m else None
+        if code in (401, 403, 429):
             mark_limited(token_id)
         logger.exception("stream_response failed")
         try:
@@ -253,39 +321,41 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
         clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
 
-        next_messages = messages.copy()
-        ast_msg = {"role": "assistant"}
-        if parsed_tools:
-            ast_msg["tool_calls"] = parsed_tools
-        else:
-            ast_msg["content"] = clean_text
-        next_messages.append(ast_msg)
-        next_sig = generate_signature_sync(next_messages, model)
-        save_session(sig, token_id, session_id, parent_message_id + 2)
-        save_session(next_sig, token_id, session_id, parent_message_id + 2)
-
-        try:
-            if not parsed_tools:
-                for r in parser.flush():
-                    if "text" in r:
-                        yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
-
+        if not failed:
+            next_messages = messages.copy()
+            ast_msg = {"role": "assistant"}
             if parsed_tools:
-                for i, tc in enumerate(parsed_tools):
-                    delta_tc = {"index": i, "id": tc["id"], "type": "function",
-                                "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
-                    yield f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [delta_tc]}}]})}\n\n"
-                yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]})}\n\n"
+                ast_msg["tool_calls"] = parsed_tools
             else:
-                yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
-            yield "data: [DONE]\n\n"
-        except asyncio.CancelledError:
-            pass
+                ast_msg["content"] = clean_text
+            next_messages.append(ast_msg)
+            next_sig = generate_signature_sync(next_messages, model, scope)
+            save_session(sig, token_id, session_id, parent_message_id + 2)
+            save_session(next_sig, token_id, session_id, parent_message_id + 2)
+
+        if not aborted and not failed:
+            try:
+                if not parsed_tools:
+                    for r in parser.flush():
+                        if "text" in r:
+                            yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
+
+                if parsed_tools:
+                    for i, tc in enumerate(parsed_tools):
+                        delta_tc = {"index": i, "id": tc["id"], "type": "function",
+                                    "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
+                        yield f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [delta_tc]}}]})}\n\n"
+                    yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                yield "data: [DONE]\n\n"
+            except asyncio.CancelledError:
+                pass
 
 
-async def stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model=None, parent_message_id=0):
+async def stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model=None, parent_message_id=0, scope=""):
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-    in_tokens = count_tok(json.dumps(messages))
+    in_tokens = count_tok(_messages_text(messages))
     model_name = req_model if req_model else model
     start_evt = f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model_name, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': in_tokens, 'output_tokens': 1}}})}\n\n"
     yield start_evt
@@ -294,10 +364,12 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
     full_text = ""
     text_block_started = False
     block_index = 0
+    aborted = False
+    failed = False
 
     try:
         is_thinking = False
-        async for chunk in gen:
+        async for chunk in _hold_think_tags(gen):
             if not chunk:
                 continue
             full_text += chunk
@@ -339,10 +411,16 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                         text_block_started = True
                     delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': r['text']}})}\n\n"
                     yield delta_evt
-    except asyncio.CancelledError:
+        mark_active(token_id)
+    except (asyncio.CancelledError, GeneratorExit):
+        aborted = True
+        failed = True
         raise
     except Exception as e:
-        if "429" in str(e) or "rate" in str(e).lower():
+        failed = True
+        m = re.match(r"HTTP (\d{3}):", str(e))
+        code = int(m.group(1)) if m else None
+        if code in (401, 403, 429):
             mark_limited(token_id)
         logger.exception("stream_anthropic_response failed")
         try:
@@ -356,16 +434,17 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
         clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
 
-        next_messages = messages.copy()
-        ast_msg = {"role": "assistant"}
-        if parsed_tools:
-            ast_msg["tool_calls"] = parsed_tools
-        else:
-            ast_msg["content"] = clean_text
-        next_messages.append(ast_msg)
-        next_sig = generate_signature_sync(next_messages, model)
-        save_session(sig, token_id, session_id, parent_message_id + 2)
-        save_session(next_sig, token_id, session_id, parent_message_id + 2)
+        if not failed:
+            next_messages = messages.copy()
+            ast_msg = {"role": "assistant"}
+            if parsed_tools:
+                ast_msg["tool_calls"] = parsed_tools
+            else:
+                ast_msg["content"] = clean_text
+            next_messages.append(ast_msg)
+            next_sig = generate_signature_sync(next_messages, model, scope)
+            save_session(sig, token_id, session_id, parent_message_id + 2)
+            save_session(next_sig, token_id, session_id, parent_message_id + 2)
 
         def _tb(text):
             return (f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'text', 'text': ''}})}\n\n"
@@ -402,12 +481,13 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
             tail_events += f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': out_tokens}})}\n\n"
         tail_events += f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
-        try:
-            for evt in tail_events.split("\n\n"):
-                if evt.strip():
-                    yield evt + "\n\n"
-        except asyncio.CancelledError:
-            pass
+        if not aborted and not failed:
+            try:
+                for evt in tail_events.split("\n\n"):
+                    if evt.strip():
+                        yield evt + "\n\n"
+            except asyncio.CancelledError:
+                pass
 
 
 def format_response(text, model, messages, tools=None):
@@ -421,7 +501,7 @@ def format_response(text, model, messages, tools=None):
     clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
     clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
         
-    in_tokens = count_tok(json.dumps(messages))
+    in_tokens = count_tok(_messages_text(messages))
     out_tokens = count_tok(text)
     tariff_key = "deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash"
     tariff = DEEPSEEK_TARIFFS[tariff_key]
@@ -511,7 +591,9 @@ async def files_upload(request: Request):
     file_obj = form.get("file")
     if not file_obj:
         return JSONResponse({"error": "No file provided"}, status_code=400)
-    file_bytes = await file_obj.read()
+    file_bytes = await file_obj.read(25 * 1024 * 1024 + 1)
+    if len(file_bytes) > 25 * 1024 * 1024:
+        return JSONResponse({"error": "File too large"}, status_code=413)
     filename = getattr(file_obj, "filename", "file.bin")
     content_type = getattr(file_obj, "content_type", "application/octet-stream")
     file_info = None
@@ -550,7 +632,12 @@ async def files_content(file_id: str, request: Request):
         return JSONResponse({"error": "No tokens available"}, status_code=503)
     tok = get_token(tok_id)
     gen = get_file_content(tok["token"], file_id)
-    mime = await gen.__anext__()
+    try:
+        mime = await gen.__anext__()
+    except StopAsyncIteration:
+        return JSONResponse({"error": "File not found"}, status_code=404)
+    except Exception:
+        return JSONResponse({"error": "File fetch failed"}, status_code=502)
     async def stream_chunks():
         async for chunk in gen:
             yield chunk
@@ -641,7 +728,7 @@ async def chat_completions(request: Request):
     search = body.get("search", False)
     stream = body.get("stream", False)
     tools = body.get("tools", None)
-    return await handle_chat(messages, model, thinking, search, stream, tools)
+    return await handle_chat(messages, model, thinking, search, stream, tools, scope=get_api_key(request))
 
 
 @app.post("/v1/responses")
@@ -682,7 +769,7 @@ async def openai_responses(request: Request):
     stream = body.get("stream", False)
     tools = body.get("tools", None)
 
-    result = await handle_chat(messages, model, thinking, search, stream, tools)
+    result = await handle_chat(messages, model, thinking, search, stream, tools, scope=get_api_key(request))
 
     if stream:
         return result
@@ -789,9 +876,11 @@ async def anthropic_messages(request: Request):
 
     req_model = body.get("model")
     if stream:
-        return await handle_chat(openai_msgs, model, thinking, False, True, openai_tools or None, is_anthropic=True, req_model=req_model)
+        return await handle_chat(openai_msgs, model, thinking, False, True, openai_tools or None, is_anthropic=True, req_model=req_model, scope=get_api_key(request))
 
-    result = await handle_chat(openai_msgs, model, thinking, False, False, openai_tools or None, is_anthropic=True, req_model=req_model)
+    result = await handle_chat(openai_msgs, model, thinking, False, False, openai_tools or None, is_anthropic=True, req_model=req_model, scope=get_api_key(request))
+    if not isinstance(result, dict) or "choices" not in result:
+        return result
     return format_anthropic_response(result, req_model)
 
 
@@ -929,20 +1018,26 @@ async def login_submit(request: Request):
     form = await request.form()
     username = form.get("username", "")
     password = form.get("password", "")
-    if username == ADMIN_USER and password == ADMIN_PASSWORD:
+    if time.time() < _login_fails["locked_until"]:
+        return templates.TemplateResponse(request, "login.html", {"error": "Too many attempts. Try again later."})
+    if secrets.compare_digest(username.encode("utf-8"), ADMIN_USER.encode("utf-8")) and secrets.compare_digest(password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
+        _login_fails["count"] = 0
         sid = str(uuid.uuid4())
-        SESSIONS.add(sid)
+        SESSIONS[sid] = time.time()
         resp = HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
-        resp.set_cookie("session_id", sid, httponly=True)
+        resp.set_cookie("session_id", sid, httponly=True, samesite="lax")
         return resp
+    _login_fails["count"] += 1
+    if _login_fails["count"] >= 5:
+        _login_fails["locked_until"] = time.time() + 300
+        _login_fails["count"] = 0
     return templates.TemplateResponse(request, "login.html", {"error": "Invalid username or password"})
 
 
 @app.get("/logout")
 async def logout(request: Request):
     sid = request.cookies.get("session_id")
-    if sid in SESSIONS:
-        SESSIONS.remove(sid)
+    SESSIONS.pop(sid, None)
     resp = HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     resp.delete_cookie("session_id")
     return resp
@@ -988,18 +1083,23 @@ async def root(request: Request):
 
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
     active = sum(1 for t in get_tokens() if t["status"] == "ACTIVE")
-    cookies_valid = None
+    cookies_valid = False
     try:
-        c = json.load(open("aws_cookies_deepseek.json"))
+        with open("aws_cookies_deepseek.json") as f:
+            c = json.load(f)
         exp = c.get("expiry")
         cookies_valid = bool(exp and exp > time.time())
     except Exception:
         cookies_valid = False
     ok = active > 0 and cookies_valid
-    return {"status": "ok" if ok else "degraded", "active_tokens": active, "cookies_valid": cookies_valid}
+    data = {"status": "ok" if ok else "degraded"}
+    if check_key(request):
+        data["active_tokens"] = active
+        data["cookies_valid"] = cookies_valid
+    return JSONResponse(data, status_code=200 if ok else 503)
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=4000)
+    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "4000")))

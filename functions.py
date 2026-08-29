@@ -19,10 +19,19 @@ wasm_path = "wasm/deepseek_pow_solver.wasm"
 _session = None
 _db = "deeperseeker.db"
 
+try:
+    _TZ_OFFSET = str(int(datetime.now().astimezone().utcoffset().total_seconds()))
+except Exception:
+    _TZ_OFFSET = "19800"
+
 
 def get_db():
-    conn = sqlite3.connect(_db)
+    conn = sqlite3.connect(_db, timeout=30)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
     return conn
 
 
@@ -77,7 +86,7 @@ def get_headers(auth_token, pow=None):
         "x-client-bundle-id": "com.deepseek.chat",
         "x-client-locale": "en_US",
         "x-client-platform": "web",
-        "x-client-timezone-offset": "19800",
+        "x-client-timezone-offset": _TZ_OFFSET,
         "x-client-version": "2.3.0",
     }
     if auth_token:
@@ -91,14 +100,27 @@ _cookie_lock = asyncio.Lock()
 
 
 async def get_cookies():
+    try:
+        if os.path.exists("aws_cookies_deepseek.json"):
+            with open("aws_cookies_deepseek.json") as f:
+                cookies = json.load(f)
+            if cookies.get("expiry") is not None and cookies["expiry"] > time.time():
+                return cookies["cookie"]
+    except Exception:
+        pass
     async with _cookie_lock:
-        if not os.path.exists("aws_cookies_deepseek.json"):
+        fresh = False
+        try:
+            if os.path.exists("aws_cookies_deepseek.json"):
+                with open("aws_cookies_deepseek.json") as f:
+                    cookies = json.load(f)
+                fresh = cookies.get("expiry") is not None and cookies["expiry"] > time.time()
+        except Exception:
+            fresh = False
+        if not fresh:
             await _generate_cookies()
-        else:
-            cookies = json.load(open("aws_cookies_deepseek.json"))
-            if cookies.get("expiry") is None or cookies["expiry"] <= time.time():
-                await _generate_cookies()
-        cookies = json.load(open("aws_cookies_deepseek.json"))
+        with open("aws_cookies_deepseek.json") as f:
+            cookies = json.load(f)
         return cookies["cookie"]
 
 
@@ -108,27 +130,31 @@ async def _generate_cookies():
         launch_kwargs["args"] = ["--no-sandbox"]
     async with async_playwright() as p:
         browser = await p.chromium.launch(**launch_kwargs)
-        context = await browser.new_context()
-        page = await context.new_page()
-        await page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded")
-        await page.wait_for_selector("body")
         try:
-            await page.wait_for_url("**/sign_in*", timeout=120000)
-        except Exception:
-            pass
-        cookies = await context.cookies()
-        final_cookies = {}
-        expiry = None
-        for i in cookies:
-            if i.get("name") == "aws-waf-token":
-                expiry = i["expires"]
-            final_cookies[i["name"]] = i["value"]
-        final_cookies["ds_cookie_preference"] = "%257B%2522level%2522%253A%2522all%2522%257D"
-        if not expiry:
-            pass
-        await browser.close()
-    with open("aws_cookies_deepseek.json", "w") as f:
+            context = await browser.new_context()
+            page = await context.new_page()
+            await page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded")
+            await page.wait_for_selector("body")
+            try:
+                await page.wait_for_url("**/sign_in*", timeout=30000)
+            except Exception:
+                pass
+            cookies = await context.cookies()
+        finally:
+            await browser.close()
+    final_cookies = {}
+    expiry = None
+    for i in cookies:
+        if i.get("name") == "aws-waf-token":
+            expiry = i.get("expires")
+        final_cookies[i["name"]] = i["value"]
+    final_cookies["ds_cookie_preference"] = "%257B%2522level%2522%253A%2522all%2522%257D"
+    if not expiry or expiry < 0:
+        expiry = time.time() + 1800
+    tmp_path = "aws_cookies_deepseek.json.tmp"
+    with open(tmp_path, "w") as f:
         f.write(json.dumps({"cookie": final_cookies, "expiry": expiry}))
+    os.replace(tmp_path, "aws_cookies_deepseek.json")
 
 
 def get_auth_token():
@@ -225,24 +251,11 @@ def save_session(sig, token_id, session_id, parent_message_id=0):
     conn.close()
 
 
-def save_session_map(old_session, new_session, token_id):
+def delete_session(sig):
     conn = get_db()
-    conn.execute(
-        """INSERT OR REPLACE INTO session_map (old_session, new_session, token_id)
-           VALUES (?, ?, ?)""",
-        (old_session, new_session, token_id),
-    )
+    conn.execute("DELETE FROM sessions WHERE signature = ?", (sig,))
     conn.commit()
     conn.close()
-
-
-def get_session_map(old_session):
-    conn = get_db()
-    row = conn.execute("SELECT new_session, token_id FROM session_map WHERE old_session = ?", (old_session,)).fetchone()
-    conn.close()
-    if row:
-        return {"new_session": row[0], "token_id": row[1]}
-    return None
 
 
 DEEPSEEK_TARIFFS = {
@@ -625,19 +638,28 @@ def summarize_messages(messages, max_tokens=500):
     return summary
 
 
+_pow_setup = None
+
+
+def _get_pow_setup():
+    global _pow_setup
+    if _pow_setup is None:
+        engine = wasmtime.Engine()
+        with open(wasm_path, "rb") as f:
+            module = wasmtime.Module(engine, f.read())
+        _pow_setup = (engine, module, wasmtime.Linker(engine))
+    return _pow_setup
+
+
 def _find_pow_answer_blocking(challange_data):
-    engine = wasmtime.Engine()
-    with open(wasm_path, "rb") as f:
-        wasm_bytes = f.read()
-    module = wasmtime.Module(engine, wasm_bytes)
+    engine, module, linker = _get_pow_setup()
     store = wasmtime.Store(engine)
-    linker = wasmtime.Linker(engine)
     instance = linker.instantiate(store, module)
     memory = instance.exports(store)["memory"]
     alloc_func = instance.exports(store)["alloc"]
     solve_func = instance.exports(store)["solve_pow"]
-    ch_ptr, ch_len = asyncio.run(write_string_pow(challange_data["challenge"], alloc_func, memory, store))
-    salt_ptr, salt_len = asyncio.run(write_string_pow(challange_data["salt"], alloc_func, memory, store))
+    ch_ptr, ch_len = write_string_pow(challange_data["challenge"], alloc_func, memory, store)
+    salt_ptr, salt_len = write_string_pow(challange_data["salt"], alloc_func, memory, store)
     result = solve_func(store, ch_ptr, ch_len, salt_ptr, salt_len, challange_data["expire_at"], challange_data["difficulty"])
     if result < 0:
         result = result + 0x10000000000000000
@@ -651,12 +673,13 @@ async def create_challange_pow(target_path, auth_token):
     async with session.post(
         "https://chat.deepseek.com/api/v0/chat/create_pow_challenge",
         cookies=cookie, headers=headers, json={"target_path": target_path},
+        timeout=aiohttp.ClientTimeout(total=20),
     ) as response:
         data = await response.json()
     return data["data"]["biz_data"]["challenge"]
 
 
-async def write_string_pow(text, alloc_func, memory, store):
+def write_string_pow(text, alloc_func, memory, store):
     data = text.encode("utf-8")
     ptr = alloc_func(store, len(data))
     mem = memory.data_ptr(store)
@@ -672,6 +695,8 @@ async def find_pow_answer(challange_data):
 async def solve_create_pow(target_path, auth_token):
     pow = await create_challange_pow(target_path, auth_token)
     answer = await find_pow_answer(pow)
+    if answer is None:
+        raise Exception("PoW solve failed")
     json_data = {
         "algorithm": "DeepSeekHashV1",
         "challenge": pow["challenge"],
@@ -683,22 +708,12 @@ async def solve_create_pow(target_path, auth_token):
     return base64.b64encode(json.dumps(json_data).encode()).decode()
 
 
-async def fetch_chat_history(chat_id, auth_token):
-    headers = get_headers(auth_token)
-    cookie = await get_cookies()
-    session = await get_session()
-    url = "https://chat.deepseek.com/api/v0/chat/history_messages?chat_session_id=" + chat_id
-    async with session.get(url, cookies=cookie, headers=headers) as response:
-        data = await response.json()
-    return data["data"]["biz_data"]["chat_messages"]
-
-
 async def create_new_chat(auth_token):
     headers = get_headers(auth_token)
     cookie = await get_cookies()
     session = await get_session()
     url = "https://chat.deepseek.com/api/v0/chat_session/create"
-    async with session.post(url, cookies=cookie, headers=headers) as response:
+    async with session.post(url, cookies=cookie, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
         data = await response.json()
     return data["data"]["biz_data"]["chat_session"]["id"]
 
@@ -711,7 +726,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
     if parent_message_id == 0:
         parent_message_id = None
     if model_type == "expert":
-        file_ids = []
+        file_ids = list(file_ids_)
     elif model_type == "vision" and file_ids_:
         headers = get_headers(auth_token)
         file_ids = []
@@ -719,6 +734,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
             async with session.post(
                 "https://chat.deepseek.com/api/v0/file/fork_file_task",
                 headers=headers, json={"file_id": i, "to_model_type": "vision"}, cookies=cookie,
+                timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 resp_json = await resp.json()
             status = resp_json["data"]["biz_data"]["status"]
@@ -728,11 +744,12 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 await asyncio.sleep(0.3)
                 async with session.get(
                     "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
-                    headers=headers, cookies=cookie,
+                    headers=headers, cookies=cookie, timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     resp_json = await resp.json()
                 status = resp_json["data"]["biz_data"]["files"][0]["status"]
-            file_ids.append(file_id)
+            if status == "SUCCESS":
+                file_ids.append(file_id)
     else:
         file_ids = file_ids_
 
@@ -750,6 +767,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
         "action": None,
     }
 
+    think_open = False
     async with session.post(url, cookies=cookie, headers=headers, json=json_data) as r:
         if r.status != 200:
             error_text = await r.text()
@@ -766,18 +784,28 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
             except Exception:
                 continue
             if data.get("p") == "response/status" and data.get("v") == "FINISHED":
+                if think_open:
+                    yield "\n</think>\n\n"
                 return
             if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
                 for op in data["v"]:
                     if isinstance(op, dict) and op.get("p") == "quasi_status" and op.get("v") == "FINISHED":
+                        if think_open:
+                            yield "\n</think>\n\n"
                         return
             if "v" in data and isinstance(data["v"], dict) and "response" in data["v"]:
                 fragments = data["v"]["response"].get("fragments")
                 if fragments:
                     for fragment in fragments:
                         if fragment.get("type") == "THINK":
-                            yield "<think>\n" + fragment.get("content", "")
+                            if not think_open:
+                                yield "<think>\n"
+                                think_open = True
+                            yield fragment.get("content", "")
                         else:
+                            if think_open:
+                                yield "\n</think>\n\n"
+                                think_open = False
                             yield fragment.get("content", "")
                 continue
 
@@ -786,9 +814,15 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 if isinstance(fragments, list):
                     for fragment in fragments:
                         if fragment.get("type") == "RESPONSE":
-                            yield "\n</think>\n\n" + fragment.get("content", "")
+                            if think_open:
+                                yield "\n</think>\n\n"
+                                think_open = False
+                            yield fragment.get("content", "")
                         elif fragment.get("type") == "THINK":
-                            yield "\n<think>\n" + fragment.get("content", "")
+                            if not think_open:
+                                yield "<think>\n"
+                                think_open = True
+                            yield fragment.get("content", "")
                         else:
                             yield fragment.get("content", "")
                 continue
@@ -796,6 +830,8 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
             v = data.get("v")
             if isinstance(v, str):
                 yield v
+        if think_open:
+            yield "\n</think>\n\n"
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):
@@ -805,9 +841,10 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
     file_size = len(file_bytes)
     pow_response = await solve_create_pow("/api/v0/file/upload_file", auth_token)
     boundary = b"----WebKitFormBoundaryTB0pXOQR2RL219Hu"
+    safe_name = re.sub(r"[^ -~]", "_", file_name).replace('"', "_") or "file.bin"
     body_parts = [
         b"--" + boundary + b"\r\n",
-        f'Content-Disposition: form-data; name="file"; filename="{file_name}"\r\n'.encode("utf-8"),
+        f'Content-Disposition: form-data; name="file"; filename="{safe_name}"\r\n'.encode("utf-8"),
         f"Content-Type: {file_content_type}\r\n\r\n".encode("utf-8"),
         file_bytes,
         b"\r\n--" + boundary + b"--\r\n",
@@ -818,7 +855,7 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         "content-type": f"multipart/form-data; boundary={boundary.decode('utf-8')}",
         "x-file-size": str(file_size),
     })
-    async with session.post(url, data=reconstructed_body, cookies=cookie, headers=headers) as response:
+    async with session.post(url, data=reconstructed_body, cookies=cookie, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as response:
         resp_json = await response.json()
     file_id = resp_json["data"]["biz_data"]["id"]
     yield ("uploaded", file_id)
@@ -831,7 +868,7 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         await asyncio.sleep(0.3)
         async with session.get(
             "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
-            headers=headers, cookies=cookie,
+            headers=headers, cookies=cookie, timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             js_data = (await resp.json())["data"]["biz_data"]["files"][0]
         status = js_data["status"]
@@ -853,7 +890,7 @@ async def get_file_content(auth_token, file_id):
     headers = get_headers(auth_token)
     async with session.get(
         "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
-        headers=headers, cookies=cookie,
+        headers=headers, cookies=cookie, timeout=aiohttp.ClientTimeout(total=30),
     ) as resp:
         resp_json = await resp.json()
     yield mimetypes.guess_type(resp_json["data"]["biz_data"]["files"][0]["file_name"])[0]

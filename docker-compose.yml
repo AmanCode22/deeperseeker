@@ -4,10 +4,14 @@ services:
     container_name: deeperseeker
     ports:
       - "127.0.0.1:4000:4000"
+    environment:
+      - HOST=0.0.0.0
     env_file:
-      - .env
+      - path: .env
+        required: false
     volumes:
       - deeperseeker_data:/app/data
+    shm_size: "1gb"
     restart: unless-stopped
 
 volumes:

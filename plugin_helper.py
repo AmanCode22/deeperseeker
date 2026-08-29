@@ -1,10 +1,12 @@
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import mimetypes
 import random
 import re
+import socket
 import string
 import uuid
 from pathlib import Path
@@ -66,9 +68,25 @@ async def extract_tool_results(messages, latest_only=False):
     return "\n\n".join(tools_final) if tools_final else None
 
 
-async def extract_and_upload_files(messages, auth_token):
+def _assert_public_url(url):
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("unsupported url")
+    infos = socket.getaddrinfo(parts.hostname, None)
+    for info in infos:
+        if not ipaddress.ip_address(info[4][0]).is_global:
+            raise ValueError("url resolves to non-public address")
+
+
+async def extract_and_upload_files(messages, auth_token, last_user_only=False):
     result_fileids = []
-    for idx, i in enumerate(messages):
+    scan = messages
+    if last_user_only:
+        for idx in range(len(messages) - 1, -1, -1):
+            if messages[idx].get("role") == "user":
+                scan = messages[idx:]
+                break
+    for idx, i in enumerate(scan):
         content = i.get("content")
         if not content:
             continue
@@ -79,28 +97,32 @@ async def extract_and_upload_files(messages, auth_token):
                 continue
             elif j["type"] == "image_url":
                 if j["image_url"]["url"].startswith("http"):
+                    _assert_public_url(j["image_url"]["url"])
                     url_path = urlsplit(j["image_url"]["url"]).path
                     filename = Path(url_path).name
                     mime_type, _ = mimetypes.guess_type(filename)
                     session = await get_session()
                     async with session.get(j["image_url"]["url"]) as resp:
-                        file_bytes = await resp.read()
+                        file_bytes = await resp.content.read(20 * 1024 * 1024 + 1)
+                    if len(file_bytes) > 20 * 1024 * 1024:
+                        continue
 
                     async for k in upload_file(file_bytes, filename, mime_type, auth_token):
                         if k[0] == "uploaded":
                             continue
                         elif k[0] == "success":
                             result_fileids.append(k[1]["file_id"])
-                        elif k[0] == "error":
-                            result_fileids.append(k[1])
 
                 else:
-                    mimetype_base, base64_data = j["image_url"]["url"].split(",")
+                    url_parts = j["image_url"]["url"].split(",", 1)
+                    if len(url_parts) != 2:
+                        continue
+                    mimetype_base, base64_data = url_parts
                     mime_type = mimetype_base.split(":")[1].split(";")[0]
                     filename = (
                         "inline_uploaded_"
                         + str(uuid.uuid4())
-                        + mimetypes.guess_extension(mime_type)
+                        + (mimetypes.guess_extension(mime_type) or ".bin")
                     )
                     data_bytes = base64.b64decode(
                         (base64_data.split("data:")[1] if "data:" in base64_data else base64_data).encode()
@@ -110,14 +132,15 @@ async def extract_and_upload_files(messages, auth_token):
                             continue
                         elif k[0] == "success":
                             result_fileids.append(k[1]["file_id"])
-                        elif k[0] == "error":
-                            result_fileids.append(k[1])
             elif j["type"] == "file":
                 if "file_id" in j["file"]:
                     result_fileids.append(j["file"]["file_id"])
                 if "file_data" in j["file"]:
                     filename = j["file"]["filename"]
-                    mimetype_base, base64_data = j["file_data"].split(",")
+                    data_parts = j["file_data"].split(",", 1)
+                    if len(data_parts) != 2:
+                        continue
+                    mimetype_base, base64_data = data_parts
 
                     mime_type = mimetype_base.split(":")[1].split(";")[0]
                     data_bytes = base64.b64decode(
@@ -128,8 +151,6 @@ async def extract_and_upload_files(messages, auth_token):
                             continue
                         elif k[0] == "success":
                             result_fileids.append(k[1]["file_id"])
-                        elif k[0] == "error":
-                            result_fileids.append(k[1])
             elif j["type"] == "document" or j["type"] == "image":
                 if j["source"]["type"] == "base64":
                     base64_data = j["source"]["data"].split(",")[1] if "," in j["source"]["data"] else j["source"]["data"]
@@ -137,7 +158,7 @@ async def extract_and_upload_files(messages, auth_token):
                     filename = (
                         "inline_uploaded_"
                         + str(uuid.uuid4())
-                        + mimetypes.guess_extension(mime_type)
+                        + (mimetypes.guess_extension(mime_type) or ".bin")
                     )
                     data_bytes = base64.b64decode(base64_data.encode())
                     async for k in upload_file(data_bytes, filename, mime_type, auth_token):
@@ -145,8 +166,6 @@ async def extract_and_upload_files(messages, auth_token):
                             continue
                         elif k[0] == "success":
                             result_fileids.append(k[1]["file_id"])
-                        elif k[0] == "error":
-                            result_fileids.append(k[1])
                 elif j["source"]["type"] == "file":
                     result_fileids.append(j["source"]["file_id"])
     return result_fileids
@@ -223,7 +242,7 @@ def canonicalize_messages(messages):
     return canon
 
 
-def generate_signature_sync(messages, model):
+def generate_signature_sync(messages, model, scope=""):
     last_ast_idx = -1
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "assistant":
@@ -233,11 +252,11 @@ def generate_signature_sync(messages, model):
     history = messages if last_ast_idx == -1 else messages[:last_ast_idx + 1]
     canon_history = canonicalize_messages(history)
     dump = json.dumps(canon_history, sort_keys=True)
-    return hashlib.sha256(f"{model}_{dump}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{model}_{scope}_{dump}".encode("utf-8")).hexdigest()
 
 
-async def generate_signature(messages, model):
-    return generate_signature_sync(messages, model)
+async def generate_signature(messages, model, scope=""):
+    return generate_signature_sync(messages, model, scope)
 
 
 async def build_prompt(messages, tools, model, is_first_message=False):
@@ -316,88 +335,3 @@ async def build_prompt(messages, tools, model, is_first_message=False):
             final_prompt += tool_instructions + "\n"
 
     return final_prompt
-
-
-async def parse_tool_call(tools_list):
-    tools_called = []
-    for i in tools_list:
-        i = i.strip()
-        cleaned = i.replace("<tool_call>", "").replace("</tool_call>", "").replace("<function_call>", "").replace("</function_call>", "").strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned[7:]
-        elif cleaned.startswith("```"):
-            cleaned = cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
-        tool_json = json.loads(cleaned.strip())
-        characters = string.ascii_letters + string.digits
-        call_id = "call_" + "".join(random.choices(characters, k=8))
-        if "function" in tool_json and isinstance(tool_json["function"], dict):
-            tool_name = tool_json["function"].get("name") or tool_json.get("name")
-            tool_args = tool_json["function"].get("arguments") or tool_json["function"].get("parameters") or tool_json.get("arguments") or {}
-        else:
-            tool_name = tool_json.get("name") or tool_json.get("tool") or tool_json.get("tool_name") or tool_json.get("function") or tool_json.get("action")
-            tool_args = tool_json.get("arguments") or tool_json.get("parameters") or tool_json.get("input") or tool_json.get("args") or tool_json.get("params") or tool_json.get("tool_input") or tool_json.get("action_input") or {}
-        if isinstance(tool_args, (dict, list)):
-            tool_args = json.dumps(tool_args)
-        elif isinstance(tool_args, str):
-            try:
-                json.loads(tool_args)
-            except (json.JSONDecodeError, TypeError):
-                tool_args = json.dumps(tool_args)
-        if tool_name not in ["computer_use", "bash", "text_editor"]:
-            tools_called.append(
-                {
-                    "id": call_id,
-                    "type": "function",
-                    "function": {"name": tool_name, "arguments": tool_args},
-                }
-            )
-        else:
-            tools_called.append(
-                {
-                    "id": call_id,
-                    "type": tool_name,
-                    "function": {"name": tool_name, "arguments": tool_args},
-                }
-            )
-    return tools_called
-
-
-async def parse_tool_call_streaming(tool_txt):
-    tool_txt = tool_txt.strip()
-    cleaned = tool_txt.replace("<tool_call>", "").replace("</tool_call>", "").replace("<function_call>", "").replace("</function_call>", "").strip()
-    if cleaned.startswith("```json"):
-        cleaned = cleaned[7:]
-    elif cleaned.startswith("```"):
-        cleaned = cleaned[3:]
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3]
-    tool_json = json.loads(cleaned.strip())
-    characters = string.ascii_letters + string.digits
-    call_id = "call_" + "".join(random.choices(characters, k=8))
-    if "function" in tool_json and isinstance(tool_json["function"], dict):
-        tool_name = tool_json["function"].get("name") or tool_json.get("name")
-        tool_args = tool_json["function"].get("arguments") or tool_json["function"].get("parameters") or tool_json.get("arguments") or {}
-    else:
-        tool_name = tool_json.get("name") or tool_json.get("tool") or tool_json.get("tool_name") or tool_json.get("function") or tool_json.get("action")
-        tool_args = tool_json.get("arguments") or tool_json.get("parameters") or tool_json.get("input") or tool_json.get("args") or tool_json.get("params") or tool_json.get("tool_input") or tool_json.get("action_input") or {}
-    if isinstance(tool_args, (dict, list)):
-        tool_args = json.dumps(tool_args)
-    elif isinstance(tool_args, str):
-        try:
-            json.loads(tool_args)
-        except (json.JSONDecodeError, TypeError):
-            tool_args = json.dumps(tool_args)
-    if tool_name not in ["computer_use", "bash", "text_editor"]:
-        return {
-            "id": call_id,
-            "type": "function",
-            "function": {"name": tool_name, "arguments": tool_args},
-        }
-    else:
-        return {
-            "id": call_id,
-            "type": tool_name,
-            "function": {"name": tool_name, "arguments": tool_args},
-        }
