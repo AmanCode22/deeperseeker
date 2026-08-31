@@ -111,7 +111,17 @@ cp .env.example .env
 | | Peak Hours | $1.32 | $1.98 |
 
 Model mapping: `instant`/`vision` → V4 Flash, `expert` → V4 Pro. The `cost` reported in API responses uses the flat Peak Hour rates.
+## Star History
+
+<a href="https://www.star-history.com/?repos=amancode22%2Fdeeperseeker&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=amancode22/deeperseeker&type=date&theme=dark&legend=top-left&sealed_token=p51g9NMqgaq9Vca1q98lgnVZqL_FE7o7RLnrOq13r0inPOUkYbEE3LBTpI8D_4EkYuRvL_Ml_PBqRbO3z1hE_zUPPEan4-PMNLSBlic-1JWthx8oVIgbQlFve_lO8yAn2o-BZRIlGtxpWQr1ejz6_cJJVNCcx48izzlLcZcsQalxAg3DO-HVPukVbYlj" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=amancode22/deeperseeker&type=date&legend=top-left&sealed_token=p51g9NMqgaq9Vca1q98lgnVZqL_FE7o7RLnrOq13r0inPOUkYbEE3LBTpI8D_4EkYuRvL_Ml_PBqRbO3z1hE_zUPPEan4-PMNLSBlic-1JWthx8oVIgbQlFve_lO8yAn2o-BZRIlGtxpWQr1ejz6_cJJVNCcx48izzlLcZcsQalxAg3DO-HVPukVbYlj" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=amancode22/deeperseeker&type=date&legend=top-left&sealed_token=p51g9NMqgaq9Vca1q98lgnVZqL_FE7o7RLnrOq13r0inPOUkYbEE3LBTpI8D_4EkYuRvL_Ml_PBqRbO3z1hE_zUPPEan4-PMNLSBlic-1JWthx8oVIgbQlFve_lO8yAn2o-BZRIlGtxpWQr1ejz6_cJJVNCcx48izzlLcZcsQalxAg3DO-HVPukVbYlj" />
+ </picture>
+</a>
 
 ## Disclaimer
 
 Educational purpose only. This project is not affiliated with, endorsed by, or sponsored by DeepSeek. Use responsibly and in accordance with DeepSeek's terms of service.
+
