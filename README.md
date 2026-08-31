@@ -2,7 +2,7 @@
 
 DeepSeek website reverse-proxy server with FastAPI, supporting OpenAI & Anthropic API standards.
 
-> **v4.0** — rewritten chat pipeline (locked sessions, full-context token failover, truncation-free streaming), Claude Desktop auto-discovery, multi-format tool calling, and hardened dashboard/deployment. See [Breaking changes](#breaking-changes-in-v40) below.
+If you want to use deeperseeker with claude desktop app see [Claude Desktop Setup Guide](CLAUDE_DESKTOP_SETUP.md)
 
 ## Quickstart
 
@@ -92,15 +92,6 @@ cp .env.example .env
 - **File & Vision Support**: Base64/URL image extraction (with SSRF protection), file upload streaming, and vision-model file forking.
 - **Claude Desktop Compatible**: Rich `/v1/models` capability metadata + `anthropic/claude-*` aliases for automatic client discovery.
 - **Hardened Dashboard**: Session TTL, brute-force login lockout (5 attempts → 5 min), CSRF origin check.
-
-## Breaking changes in v4.0
-
-- **Default model is now `expert`** (was `instant`). Unknown or missing model names resolve to `expert` instead of `instant`.
-- **Docker Compose binds to `127.0.0.1` only** by default (was `0.0.0.0`).
-- **Chromium runs `headless=False`** for cookie generation; bare-metal installs need `xvfb-run` or an X display.
-- **Sessions are scoped per API key** — different API keys no longer share or resume each other's sessions.
-- **Old session-failover mapping is removed** (`session_map` / summarization), replaced by full-history injection.
-- **`numpy` dependency dropped** from `requirements.txt`.
 
 ## Pricing (per 1M tokens, as of 2026-08-30)
 
