@@ -3,6 +3,8 @@
 DeepSeek website reverse-proxy server with FastAPI, supporting OpenAI & Anthropic API standards.
 
 If you want to use deeperseeker with claude desktop app see [Claude Desktop Setup Guide](CLAUDE_DESKTOP_SETUP.md)
+For solving deepseek pow challenge the wasm file included is from my other repo: https://github.com/AmanCode22/deepseek_pow_solver/
+
 
 ## Quickstart
 
