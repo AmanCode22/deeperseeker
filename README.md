@@ -8,9 +8,13 @@ For solving deepseek pow challenge the wasm file included is from my other repo:
 
 If you liked this repo please star it and star the solver also.
 
-⚠️ Warning: Automated use violates DeepSeek's Terms of Use.Use a dedicated throwaway account, never your personal one.Accounts may be banned at any time. Use at your own risk.
+⚠️ Warning: Automated use violates DeepSeek's Terms ofUse.
+Use a dedicated throwaway account, never your personal one.
+Accounts may be banned at any time. 
+Use at your own risk.
 
-A kind request to users that do not spam server and respect limits of deepseek and use for personal use only
+A kind request: do not spam the server, respect DeepSeek's limits, and use it for personal purposes only.
+
 
 ## Quickstart
 
