@@ -8,7 +8,7 @@ For solving deepseek pow challenge the wasm file included is from my other repo:
 
 If you liked this repo please star it and star the solver also.
 
-⚠️ Warning: Automated use violates DeepSeek's Terms ofUse.
+⚠️ Warning: Automated use violates DeepSeek's Terms of Use.
 Use a dedicated throwaway account, never your personal one.
 Accounts may be banned at any time. 
 Use at your own risk.
