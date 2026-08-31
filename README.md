@@ -8,7 +8,8 @@ For solving deepseek pow challenge the wasm file included is from my other repo:
 
 If you liked this repo please star it and star the solver also.
 
-I recommend you to not to use your personal account as it might get banned, so use on your own risk.
+⚠️ Warning: Automated use violates DeepSeek's Terms of Use.Use a dedicated throwaway account, never your personal one.Accounts may be banned at any time. Use at your own risk.
+
 
 ## Quickstart
 
