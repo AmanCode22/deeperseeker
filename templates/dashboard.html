@@ -1,77 +1,413 @@
 {% extends "base.html" %}
-{% block title %}Dashboard - DeeperSeeker{% endblock %}
-{% block content %}
-<h1>Dashboard</h1>
+{% block title %}Dashboard — DeeperSeeker{% endblock %}
 
-<section>
-    <h2>Add Auth Token</h2>
-    <div class="steps">
-        <p><strong>Steps:</strong></p>
+{% block content %}
+<div class="page-header">
+    <h1>Dashboard <span class="sub">· Управление токенами</span></h1>
+    <span style="color: var(--text-secondary); font-size: 0.9rem;">
+        <i class="fas fa-database"></i> Всего: <strong id="totalTokens">{{ tokens|length }}</strong>
+    </span>
+</div>
+
+<!-- ============================================================
+     СТАТИСТИКА
+     ============================================================ -->
+<div class="stats-grid" id="statsGrid">
+    <div class="stat-card">
+        <div class="stat-label"><i class="fas fa-hashtag"></i> Всего</div>
+        <div class="stat-value" id="statTotal">{{ tokens|length }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label"><i class="fas fa-check-circle"></i> Активных</div>
+        <div class="stat-value green" id="statActive">
+            {{ tokens|selectattr('status', 'equalto', 'ACTIVE')|list|length }}
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label"><i class="fas fa-clock"></i> Ограничены</div>
+        <div class="stat-value yellow" id="statLimited">
+            {{ tokens|selectattr('status', 'equalto', 'RATE_LIMITED')|list|length }}
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label"><i class="fas fa-times-circle"></i> Неактивны</div>
+        <div class="stat-value red" id="statInactive">
+            {{ tokens|rejectattr('status', 'equalto', 'ACTIVE')|rejectattr('status', 'equalto', 'RATE_LIMITED')|list|length }}
+        </div>
+    </div>
+</div>
+
+<!-- ============================================================
+     ДОБАВЛЕНИЕ ТОКЕНА
+     ============================================================ -->
+<div class="card">
+    <div class="card-header">
+        <h2><i class="fas fa-plus-circle" style="color: var(--success);"></i> Добавить токен</h2>
+        <span class="badge">Новый</span>
+    </div>
+
+    <div class="steps-box">
+        <strong><i class="fas fa-lightbulb"></i> Как получить токен:</strong>
         <ol>
-            <li>Open <strong>incognito/private</strong> window</li>
-            <li>Go to <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a> and login</li>
-            <li>Open DevTools (F12) → Console → paste:</li>
+            <li>Откройте <strong>инкогнито/приватное</strong> окно и войдите на <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a></li>
+            <li>Нажмите F12 → Console → вставьте:</li>
         </ol>
         <code>JSON.parse(localStorage.getItem("userToken")).value</code>
-        <ol start="4">
-            <li>Copy the token and paste below</li>
-            <li><strong>Remove any surrounding quotes</strong> — paste only the raw token string</li>
-            <li><strong>Close the incognito window</strong> to preserve the login</li>
+        <ol start="3">
+            <li>Скопируйте токен (без кавычек) и вставьте ниже</li>
+            <li><strong>Закройте инкогнито-окно</strong>, чтобы сохранить сессию</li>
         </ol>
     </div>
-    <div class="warning">
-        If you logout from DeepSeek in browser, this token stops working.
+    <div class="warning-box">
+        <i class="fas fa-exclamation-triangle"></i>
+        Если вы выйдете из DeepSeek в браузере, токен перестанет работать.
     </div>
-    <form method="post" action="/tokens/add">
-        <input type="text" name="alias" placeholder="Alias (optional, e.g. personal, work)" style="width:200px">
-        <input type="text" name="auth_token" placeholder="Paste auth token here (no quotes)" style="width:400px">
-        <button type="submit">Add Token</button>
+
+    <form id="addTokenForm" method="post" action="/tokens/add" autocomplete="off">
+        <div class="form-group">
+            <label for="aliasInput"><i class="fas fa-tag"></i> Алиас</label>
+            <input type="text" id="aliasInput" name="alias" placeholder="Например: personal, work, test" style="flex: 0 0 200px;">
+        </div>
+        <div class="form-group">
+            <label for="tokenInput"><i class="fas fa-key"></i> Токен</label>
+            <input type="password" id="tokenInput" name="auth_token" placeholder="Вставьте токен сюда (без кавычек)" required>
+            <button type="button" class="btn btn-outline btn-sm" id="toggleTokenBtn" title="Показать/скрыть токен">
+                <i class="fas fa-eye"></i>
+            </button>
+            <button type="button" class="btn btn-outline btn-sm" id="pasteTokenBtn" title="Вставить из буфера">
+                <i class="fas fa-paste"></i>
+            </button>
+        </div>
+        <button type="submit" class="btn btn-primary" id="addTokenBtn">
+            <i class="fas fa-save"></i> Добавить
+        </button>
+        <span id="addTokenStatus" style="margin-left: 12px; font-size: 0.9rem;"></span>
     </form>
-</section>
+</div>
 
-<section>
-    <h2>Tokens ({{ tokens|length }})</h2>
+<!-- ============================================================
+     ТАБЛИЦА ТОКЕНОВ
+     ============================================================ -->
+<div class="card">
+    <div class="card-header">
+        <h2><i class="fas fa-list-ul"></i> Токены</h2>
+        <span class="badge" id="tableCount">{{ tokens|length }}</span>
+    </div>
+
     {% if tokens %}
-    <table>
-        <thead>
-            <tr>
-                <th>ID</th>
-                <th>Alias</th>
-                <th>Token</th>
-                <th>Status</th>
-                <th>Actions</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for tok in tokens %}
-            <tr>
-                <td>{{ tok['id'] }}</td>
-                <td>{{ tok['alias'] or '—' }}</td>
-                <td><code>{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
-                <td>
-                    <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] == 'RATE_LIMITED' %}warn{% else %}err{% endif %}">
-                        {{ tok['status'] }}
-                    </span>
-                </td>
-                <td>
-                    <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
-                          onsubmit="return confirm('Delete?')">
-                        <button type="submit" class="btn-sm btn-danger">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+    <div class="table-wrapper">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Алиас</th>
+                    <th>Токен</th>
+                    <th>Статус</th>
+                    <th>Валидация</th>
+                    <th style="text-align: right;">Действие</th>
+                </tr>
+            </thead>
+            <tbody id="tokenTableBody">
+                {% for tok in tokens %}
+                <tr data-token-id="{{ tok['id'] }}">
+                    <td>{{ tok['id'] }}</td>
+                    <td>{{ tok['alias'] or '—' }}</td>
+                    <td class="token-cell">{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</td>
+                    <td>
+                        {% if tok['status'] == 'ACTIVE' %}
+                        <span class="status-badge ok"><span class="dot"></span> ACTIVE</span>
+                        {% elif tok['status'] == 'RATE_LIMITED' %}
+                        <span class="status-badge warn"><span class="dot"></span> RATE_LIMITED</span>
+                        {% else %}
+                        <span class="status-badge err"><span class="dot"></span> {{ tok['status'] }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if tok['validated'] is none %}
+                        <span class="status-badge info validation-status" data-token-id="{{ tok['id'] }}"><span class="dot"></span> <i class="fas fa-clock"></i> Ожидает</span>
+                        {% elif tok['validated'] %}
+                        <span class="status-badge ok validation-status" data-token-id="{{ tok['id'] }}"><span class="dot"></span> <i class="fas fa-check-circle"></i> Валидный</span>
+                        {% else %}
+                        <span class="status-badge err validation-status" data-token-id="{{ tok['id'] }}"><span class="dot"></span> <i class="fas fa-times-circle"></i> Невалидный</span>
+                        {% endif %}
+                        {% if tok['last_checked'] %}
+                        <span class="validation-time" style="font-size:0.7rem;color:var(--text-muted);display:block;margin-top:2px;">{{ tok['last_checked'][:16] }}</span>
+                        {% endif %}
+                    </td>
+                    <td style="text-align: right;">
+                        <button class="btn btn-sm btn-outline check-token-btn" data-id="{{ tok['id'] }}" title="Проверить токен">
+                            <i class="fas fa-sync-alt"></i>
+                        </button>
+                        <button class="btn btn-danger btn-sm delete-token-btn" data-id="{{ tok['id'] }}" data-alias="{{ tok['alias'] or tok['id'] }}">
+                            <i class="fas fa-trash-alt"></i> Удалить
+                        </button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
     {% else %}
-    <p>No tokens yet.</p>
+    <div class="empty-state">
+        <div class="icon">📭</div>
+        <p>Нет ни одного токена. Добавьте первый выше.</p>
+    </div>
     {% endif %}
-</section>
+</div>
 
-<section>
-    <h2>API</h2>
-    <p>OpenAI: <code>http://localhost:4000/v1</code></p>
-    <p>Anthropic: <code>http://localhost:4000</code></p>
-    <p>Models: <code>instant</code>, <code>vision</code>, <code>expert</code></p>
-</section>
+<!-- ============================================================
+     API ИНФО
+     ============================================================ -->
+<div class="card">
+    <div class="card-header">
+        <h2><i class="fas fa-code"></i> API</h2>
+        <span class="badge">Эндпоинты</span>
+    </div>
+    <div style="display: flex; flex-wrap: wrap; gap: 16px 32px; font-size: 0.9rem;">
+        <div><span style="color: var(--text-muted);">OpenAI:</span> <code>http://localhost:4000/v1</code></div>
+        <div><span style="color: var(--text-muted);">Anthropic:</span> <code>http://localhost:4000</code></div>
+        <div><span style="color: var(--text-muted);">Модели:</span> <code>instant</code>, <code>vision</code>, <code>expert</code></div>
+    </div>
+</div>
+
+<!-- ============================================================
+     МОДАЛКА ПОДТВЕРЖДЕНИЯ УДАЛЕНИЯ
+     ============================================================ -->
+<div id="deleteModal" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 10000; align-items: center; justify-content: center; backdrop-filter: blur(4px);">
+    <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius); padding: 28px 32px; max-width: 400px; width: 90%; box-shadow: var(--shadow-card);">
+        <h3 style="margin-bottom: 6px;"><i class="fas fa-exclamation-triangle" style="color: var(--danger);"></i> Удалить токен?</h3>
+        <p style="color: var(--text-secondary); margin-bottom: 16px;">
+            Токен <strong id="deleteModalAlias"></strong> будет удалён безвозвратно.
+        </p>
+        <form id="deleteForm" method="post" style="display: flex; gap: 12px; justify-content: flex-end;">
+            <button type="button" class="btn" id="deleteModalCancel"><i class="fas fa-times"></i> Отмена</button>
+            <button type="submit" class="btn btn-danger"><i class="fas fa-trash-alt"></i> Удалить</button>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    (function() {
+        'use strict';
+
+        // ============================================================
+        // Toggle token visibility
+        // ============================================================
+        const tokenInput = document.getElementById('tokenInput');
+        const toggleBtn = document.getElementById('toggleTokenBtn');
+        if (tokenInput && toggleBtn) {
+            toggleBtn.addEventListener('click', function(e) {
+                e.preventDefault();
+                if (tokenInput.type === 'password') {
+                    tokenInput.type = 'text';
+                    toggleBtn.innerHTML = '<i class="fas fa-eye-slash"></i>';
+                } else {
+                    tokenInput.type = 'password';
+                    toggleBtn.innerHTML = '<i class="fas fa-eye"></i>';
+                }
+            });
+        }
+
+        // ============================================================
+        // Paste from clipboard
+        // ============================================================
+        const pasteBtn = document.getElementById('pasteTokenBtn');
+        if (pasteBtn && tokenInput) {
+            pasteBtn.addEventListener('click', async function(e) {
+                e.preventDefault();
+                try {
+                    const text = await navigator.clipboard.readText();
+                    if (text) {
+                        tokenInput.value = text.replace(/^["']+|["']+$/g, '').trim();
+                        showToast('Токен вставлен из буфера', 'success');
+                    }
+                } catch (_) {
+                    showToast('Не удалось прочитать буфер обмена. Вставьте вручную.', 'error');
+                }
+            });
+        }
+
+        // ============================================================
+        // Add token via AJAX (no page reload)
+        // ============================================================
+        const addForm = document.getElementById('addTokenForm');
+        const addBtn = document.getElementById('addTokenBtn');
+        const addStatus = document.getElementById('addTokenStatus');
+
+        if (addForm) {
+            addForm.addEventListener('submit', async function(e) {
+                e.preventDefault();
+                const formData = new FormData(addForm);
+                const alias = formData.get('alias') || '';
+                const token = formData.get('auth_token') || '';
+
+                if (!token.trim()) {
+                    showToast('Введите токен', 'error');
+                    return;
+                }
+
+                addBtn.disabled = true;
+                addBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Добавление...';
+                addStatus.textContent = '';
+
+                try {
+                    const resp = await fetch('/tokens/add', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await resp.json();
+                    if (resp.ok && data.token_id) {
+                        showToast('Токен добавлен успешно', 'success');
+                        // После добавления автоматически проверим токен
+                        await checkToken(data.token_id);
+                        setTimeout(() => window.location.reload(), 800);
+                    } else {
+                        showToast(data.error || 'Ошибка при добавлении токена', 'error');
+                        addBtn.disabled = false;
+                        addBtn.innerHTML = '<i class="fas fa-save"></i> Добавить';
+                    }
+                } catch (err) {
+                    showToast('Ошибка сети: ' + err.message, 'error');
+                    addBtn.disabled = false;
+                    addBtn.innerHTML = '<i class="fas fa-save"></i> Добавить';
+                }
+            });
+        }
+
+        // ============================================================
+        // Delete token with modal
+        // ============================================================
+        const modal = document.getElementById('deleteModal');
+        const modalAlias = document.getElementById('deleteModalAlias');
+        const deleteForm = document.getElementById('deleteForm');
+        const cancelBtn = document.getElementById('deleteModalCancel');
+
+        let currentDeleteId = null;
+
+        function showDeleteModal(tokenId, alias) {
+            currentDeleteId = tokenId;
+            modalAlias.textContent = alias || tokenId;
+            deleteForm.action = `/tokens/${tokenId}/delete`;
+            modal.style.display = 'flex';
+        }
+
+        function hideDeleteModal() {
+            modal.style.display = 'none';
+            currentDeleteId = null;
+        }
+
+        // Attach delete button listeners
+        document.querySelectorAll('.delete-token-btn').forEach(btn => {
+            btn.addEventListener('click', function(e) {
+                e.preventDefault();
+                const id = this.dataset.id;
+                const alias = this.dataset.alias || id;
+                showDeleteModal(id, alias);
+            });
+        });
+
+        if (cancelBtn) {
+            cancelBtn.addEventListener('click', hideDeleteModal);
+        }
+
+        if (modal) {
+            modal.addEventListener('click', function(e) {
+                if (e.target === modal) hideDeleteModal();
+            });
+        }
+
+        if (deleteForm) {
+            deleteForm.addEventListener('submit', async function(e) {
+                e.preventDefault();
+                if (!currentDeleteId) return;
+
+                const submitBtn = deleteForm.querySelector('button[type="submit"]');
+                submitBtn.disabled = true;
+                submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Удаление...';
+
+                try {
+                    const resp = await fetch(deleteForm.action, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+                    });
+                    hideDeleteModal();
+                    if (resp.ok || resp.redirected) {
+                        showToast('Токен удалён', 'success');
+                        setTimeout(() => window.location.reload(), 500);
+                    } else {
+                        showToast('Ошибка при удалении', 'error');
+                        submitBtn.disabled = false;
+                        submitBtn.innerHTML = '<i class="fas fa-trash-alt"></i> Удалить';
+                    }
+                } catch (err) {
+                    hideDeleteModal();
+                    showToast('Ошибка сети: ' + err.message, 'error');
+                    submitBtn.disabled = false;
+                    submitBtn.innerHTML = '<i class="fas fa-trash-alt"></i> Удалить';
+                }
+            });
+        }
+
+        // ============================================================
+        // Check token validation (AJAX)
+        // ============================================================
+        document.querySelectorAll('.check-token-btn').forEach(btn => {
+            btn.addEventListener('click', async function(e) {
+                e.preventDefault();
+                const tokenId = this.dataset.id;
+                const cell = document.querySelector(`.validation-status[data-token-id="${tokenId}"]`);
+                const timeSpan = cell?.parentElement?.querySelector('.validation-time');
+
+                if (!cell) return;
+
+                // Show checking state
+                const originalHtml = cell.innerHTML;
+                cell.innerHTML = '<span class="dot"></span> <i class="fas fa-spinner fa-spin"></i> Проверка...';
+                cell.className = 'status-badge info validation-status';
+                this.disabled = true;
+
+                try {
+                    const resp = await fetch(`/tokens/${tokenId}/check`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                    const data = await resp.json();
+
+                    if (resp.ok && data.valid !== undefined) {
+                        // Update validation status
+                        if (data.valid) {
+                            cell.innerHTML = '<span class="dot"></span> <i class="fas fa-check-circle"></i> Валидный';
+                            cell.className = 'status-badge ok validation-status';
+                        } else {
+                            cell.innerHTML = '<span class="dot"></span> <i class="fas fa-times-circle"></i> Невалидный';
+                            cell.className = 'status-badge err validation-status';
+                        }
+                        // Update timestamp if present
+                        if (timeSpan) {
+                            const now = new Date();
+                            timeSpan.textContent = now.toISOString().replace('T', ' ').slice(0, 16);
+                        }
+                        showToast('Токен проверен', 'success');
+                    } else {
+                        showToast('Ошибка при проверке токена', 'error');
+                        cell.innerHTML = originalHtml;
+                        cell.className = 'status-badge err validation-status';
+                    }
+                } catch (err) {
+                    showToast('Ошибка сети: ' + err.message, 'error');
+                    cell.innerHTML = originalHtml;
+                    cell.className = 'status-badge err validation-status';
+                } finally {
+                    this.disabled = false;
+                }
+            });
+        });
+
+        // ============================================================
+        // Toast notification system (if not already defined)
+        // ============================================================
+    })();
+</script>
 {% endblock %}

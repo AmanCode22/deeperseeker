@@ -50,6 +50,8 @@ from functions import (
     StreamToolParser,
     upload_file,
     get_file_content,
+    validate_token,
+    set_token_validated,
 )
 from plugin_helper import build_prompt, extract_and_upload_files, generate_signature, generate_signature_sync
 
@@ -1071,13 +1073,14 @@ async def tokens_add(request: Request):
     try:
         get_current_admin(request)
     except HTTPException:
-        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     form = await request.form()
     auth_token = form.get("auth_token", "").strip().strip("'\"")
     alias = form.get("alias", "").strip() or None
-    if auth_token:
-        add_token(auth_token, alias)
-    return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+    if not auth_token:
+        return JSONResponse({"error": "Token required"}, status_code=400)
+    token_id = add_token(auth_token, alias)
+    return JSONResponse({"token_id": token_id})
 
 
 @app.post("/tokens/{token_id}/delete")
@@ -1088,6 +1091,23 @@ async def tokens_delete(token_id: int, request: Request):
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     delete_token(token_id)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+
+
+@app.post("/tokens/{token_id}/check")
+async def tokens_check(token_id: int, request: Request):
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    tok = get_token(token_id)
+    if not tok:
+        return JSONResponse({"error": "Token not found"}, status_code=404)
+
+    is_valid = await validate_token(tok["token"])
+    set_token_validated(token_id, is_valid)
+
+    return JSONResponse({"valid": is_valid, "token_id": token_id})
 
 
 @app.get("/", response_class=HTMLResponse)

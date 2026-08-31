@@ -42,7 +42,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             alias TEXT,
             token TEXT,
-            status TEXT DEFAULT 'ACTIVE'
+            status TEXT DEFAULT 'ACTIVE',
+            validated INTEGER DEFAULT 0,
+            last_checked TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS sessions (
             signature TEXT PRIMARY KEY,
@@ -57,6 +59,14 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+    try:
+        conn.execute("ALTER TABLE tokens ADD COLUMN validated INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE tokens ADD COLUMN last_checked TIMESTAMP")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -178,24 +188,89 @@ def add_token(token, alias=None):
             WHERE t2.id IS NULL
         """).fetchone()
         next_id = row[0] if row and row[0] else 1
-    conn.execute("INSERT INTO tokens (id, alias, token, status) VALUES (?, ?, ?, 'ACTIVE')", (next_id, alias, token))
+    conn.execute(
+        "INSERT INTO tokens (id, alias, token, status, validated, last_checked) VALUES (?, ?, ?, 'ACTIVE', NULL, NULL)",
+        (next_id, alias, token)
+    )
     conn.commit()
+    new_id = next_id
     conn.close()
+    return new_id
 
 
 def get_tokens():
     conn = get_db()
-    rows = conn.execute("SELECT id, alias, token, status FROM tokens").fetchall()
+    rows = conn.execute("SELECT id, alias, token, status, validated, last_checked FROM tokens").fetchall()
     conn.close()
-    return [{"id": r[0], "alias": r[1], "token": r[2], "status": r[3]} for r in rows]
+    result = []
+    for r in rows:
+        validated = r[4]
+        last_checked = r[5]
+        # Если validated = 0 и не было проверки, считаем состояние "не проверен" (None)
+        if validated == 0 and last_checked is None:
+            validated = None
+        result.append({
+            "id": r[0],
+            "alias": r[1],
+            "token": r[2],
+            "status": r[3],
+            "validated": validated,
+            "last_checked": last_checked
+        })
+    return result
+
+
+async def validate_token(auth_token):
+    """Проверяет, работает ли токен, пытаясь создать новую сессию.
+    Возвращает True, если токен рабочий, False — если невалидный.
+    """
+    try:
+        # Пытаемся создать новую сессию — если успешно, токен валидный
+        await create_new_chat(auth_token)
+        return True
+    except Exception as e:
+        error_str = str(e).lower()
+        # 401/403 — токен невалидный
+        if "401" in error_str or "403" in error_str:
+            return False
+        # 429 — rate limit, токен рабочий, но ограничен
+        if "429" in error_str:
+            return True
+        # 500, таймаут, проблемы с сетью — скорее всего проблема на стороне DeepSeek
+        if "500" in error_str or "timeout" in error_str or "connection" in error_str or "503" in error_str:
+            return True
+        # Если ошибка говорит о том, что сессия уже существует, токен рабочий
+        if "session" in error_str and ("exists" in error_str or "already" in error_str):
+            return True
+        # В остальных случаях считаем невалидным
+        return False
+
+
+def set_token_validated(token_id, is_valid):
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET validated = ?, last_checked = CURRENT_TIMESTAMP WHERE id = ?",
+        (1 if is_valid else 0, token_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_token_validation_status(token_id):
+    conn = get_db()
+    row = conn.execute("SELECT validated, last_checked FROM tokens WHERE id = ?", (token_id,)).fetchone()
+    conn.close()
+    if row:
+        return {"validated": bool(row[0]), "last_checked": row[1]}
+    return None
 
 
 def get_token(token_id):
     conn = get_db()
-    row = conn.execute("SELECT id, alias, token, status FROM tokens WHERE id = ?", (token_id,)).fetchone()
+    row = conn.execute("SELECT id, alias, token, status, validated, last_checked FROM tokens WHERE id = ?", (token_id,)).fetchone()
     conn.close()
     if row:
-        return {"id": row[0], "alias": row[1], "token": row[2], "status": row[3]}
+        return {"id": row[0], "alias": row[1], "token": row[2], "status": row[3], "validated": bool(row[4]), "last_checked": row[5]}
     return None
 
 
@@ -208,11 +283,13 @@ def delete_token(token_id):
 
 def pick_token():
     conn = get_db()
-    row = conn.execute("SELECT id FROM tokens WHERE status = 'ACTIVE' ORDER BY RANDOM() LIMIT 1").fetchone()
+    # Сначала ищем валидные активные токены
+    row = conn.execute("SELECT id FROM tokens WHERE status = 'ACTIVE' AND validated = 1 ORDER BY RANDOM() LIMIT 1").fetchone()
     if row:
         conn.close()
         return row[0]
-    row = conn.execute("SELECT id FROM tokens ORDER BY id LIMIT 1").fetchone()
+    # Если валидных нет, пробуем взять любой активный (но тогда он будет помечен как невалидный при ошибке)
+    row = conn.execute("SELECT id FROM tokens WHERE status = 'ACTIVE' ORDER BY id LIMIT 1").fetchone()
     conn.close()
     return row[0] if row else None
 

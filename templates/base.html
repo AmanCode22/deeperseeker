@@ -4,18 +4,109 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}DeeperSeeker{% endblock %}</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=3">
+    <!-- Font Awesome for icons (free) -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
 </head>
 <body>
-    <nav>
-        <a href="/">Dashboard</a>
-        <span class="sep">|</span>
-        <a href="/logout">Logout</a>
-        <span class="sep">|</span>
-        <span class="brand">DeeperSeeker</span>
+    <nav class="navbar">
+        <div class="navbar-brand">
+            <span class="logo"><i class="fas fa-search"></i></span>
+            DeeperSeeker
+        </div>
+        <div class="navbar-links">
+            <a href="/dashboard" class="{% if request.path == '/dashboard' or request.path == '/' %}active{% endif %}">
+                <i class="fas fa-th-large"></i> Dashboard
+            </a>
+            <span class="sep">|</span>
+            <a href="/logout" class="logout">
+                <i class="fas fa-sign-out-alt"></i> Logout
+            </a>
+        </div>
+        <div class="navbar-status" id="navbarStatus">
+            <span class="dot ok" id="statusDot"></span>
+            <span id="statusText">API ready</span>
+            <span style="color: var(--text-muted); margin-left: 4px;">|</span>
+            <span id="tokenCount">0 tokens</span>
+        </div>
     </nav>
-    <main>
+
+    <div class="main-wrapper">
         {% block content %}{% endblock %}
-    </main>
+    </div>
+
+    <!-- Toast container -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <!-- Scripts -->
+    <script>
+        // ============================================================
+        // Toast system
+        // ============================================================
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            const iconMap = {
+                success: '<i class="fas fa-check-circle" style="color: var(--success);"></i>',
+                error: '<i class="fas fa-exclamation-circle" style="color: var(--danger);"></i>',
+                info: '<i class="fas fa-info-circle" style="color: var(--accent);"></i>'
+            };
+            toast.innerHTML = `
+                <span class="toast-icon">${iconMap[type] || iconMap.info}</span>
+                <span class="toast-msg">${message}</span>
+            `;
+            container.appendChild(toast);
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateY(10px)';
+                setTimeout(() => toast.remove(), 300);
+            }, 4000);
+        }
+
+        // ============================================================
+        // Fetch status and token count (only if on dashboard)
+        // ============================================================
+        async function fetchStatus() {
+            try {
+                const resp = await fetch('/health');
+                const data = await resp.json();
+                const dot = document.getElementById('statusDot');
+                const text = document.getElementById('statusText');
+                if (data.status === 'ok') {
+                    dot.className = 'dot ok';
+                    text.textContent = 'API ready';
+                } else {
+                    dot.className = 'dot err';
+                    text.textContent = 'Degraded';
+                }
+                if (data.active_tokens !== undefined) {
+                    document.getElementById('tokenCount').textContent = `${data.active_tokens} active`;
+                }
+            } catch (_) {
+                // ignore
+            }
+        }
+
+        // Run on pages that have the status elements
+        if (document.getElementById('statusDot')) {
+            fetchStatus();
+            setInterval(fetchStatus, 30000);
+        }
+
+        // ============================================================
+        // Auto-dismiss flash messages from server (if any)
+        // ============================================================
+        document.addEventListener('DOMContentLoaded', function() {
+            const flash = document.querySelector('.flash-message');
+            if (flash) {
+                const type = flash.dataset.type || 'info';
+                showToast(flash.textContent.trim(), type);
+                flash.remove();
+            }
+        });
+    </script>
+
+    {% block scripts %}{% endblock %}
 </body>
 </html>

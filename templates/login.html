@@ -1,17 +1,98 @@
-{% extends "base.html" %}
-{% block title %}Login - DeeperSeeker{% endblock %}
-{% block content %}
-<h1>Login</h1>
-{% if error %}
-<p style="color:red;">{{ error }}</p>
-{% endif %}
-<form method="post" action="/login">
-    <div style="margin-bottom:10px;">
-        <input type="text" name="username" placeholder="Username" required style="width:300px;">
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login — DeeperSeeker</title>
+    <link rel="stylesheet" href="/static/style.css?v=2">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+</head>
+<body class="login-page">
+    <div class="login-card">
+        <div class="logo"><i class="fas fa-search"></i> DeeperSeeker</div>
+        <div class="sub">Вход в панель управления</div>
+
+        {% if error %}
+        <div class="login-error">
+            <i class="fas fa-exclamation-circle"></i> {{ error }}
+        </div>
+        {% endif %}
+
+        <form method="post" action="/login" id="loginForm" autocomplete="off">
+            <div class="form-group">
+                <label for="username"><i class="fas fa-user"></i> Логин</label>
+                <input type="text" id="username" name="username" placeholder="admin" required autofocus>
+            </div>
+            <div class="form-group">
+                <label for="password"><i class="fas fa-lock"></i> Пароль</label>
+                <input type="password" id="password" name="password" placeholder="••••••••" required>
+            </div>
+            <button type="submit" class="btn btn-primary" id="loginBtn">
+                <i class="fas fa-sign-in-alt"></i> Войти
+            </button>
+        </form>
+
+        <div style="margin-top: 20px; text-align: center; font-size: 0.75rem; color: var(--text-muted);">
+            <i class="fas fa-shield-alt"></i> Доступ только для администраторов
+        </div>
     </div>
-    <div style="margin-bottom:10px;">
-        <input type="password" name="password" placeholder="Password" required style="width:300px;">
-    </div>
-    <button type="submit">Login</button>
-</form>
-{% endblock %}
+
+    <!-- Toast container -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script>
+        // ============================================================
+        // Toast system (same as base, but self-contained for login)
+        // ============================================================
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            const iconMap = {
+                success: '<i class="fas fa-check-circle" style="color: var(--success);"></i>',
+                error: '<i class="fas fa-exclamation-circle" style="color: var(--danger);"></i>',
+                info: '<i class="fas fa-info-circle" style="color: var(--accent);"></i>'
+            };
+            toast.innerHTML = `
+                <span class="toast-icon">${iconMap[type] || iconMap.info}</span>
+                <span class="toast-msg">${message}</span>
+            `;
+            container.appendChild(toast);
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateY(10px)';
+                setTimeout(() => toast.remove(), 300);
+            }, 4000);
+        }
+
+        // ============================================================
+        // Login form: show loading state
+        // ============================================================
+        const loginForm = document.getElementById('loginForm');
+        const loginBtn = document.getElementById('loginBtn');
+
+        if (loginForm) {
+            loginForm.addEventListener('submit', function(e) {
+                const username = document.getElementById('username').value.trim();
+                const password = document.getElementById('password').value.trim();
+                if (!username || !password) {
+                    e.preventDefault();
+                    showToast('Заполните оба поля', 'error');
+                    return;
+                }
+                loginBtn.disabled = true;
+                loginBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Вход...';
+                // form submits normally; if error, page reloads with error message
+            });
+        }
+
+        // If there's an error from server, show it as toast too (if no error div)
+        document.addEventListener('DOMContentLoaded', function() {
+            const errorDiv = document.querySelector('.login-error');
+            if (errorDiv && !errorDiv.textContent.includes('Too many')) {
+                // Already shown inline; no need to duplicate
+            }
+        });
+    </script>
+</body>
+</html>
