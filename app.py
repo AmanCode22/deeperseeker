@@ -114,7 +114,7 @@ def check_key(request: Request):
     return secrets.compare_digest(key.encode("utf-8"), API_KEY.encode("utf-8"))
 
 
-async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, scope="", _retried=False):
+async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, scope="", response_format="chat", _retried=False):
     auth_token = get_auth_token()
     if not auth_token:
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
@@ -144,6 +144,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                     file_ids = await extract_and_upload_files(messages, new_tok["token"])
                     gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, None if model == "instant" else model, file_ids)
                     if stream:
+                        if response_format == "responses":
+                            return StreamingResponse(stream_responses_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0, scope, req_model), media_type="text/event-stream")
                         if is_anthropic:
                             return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0, scope), media_type="text/event-stream")
                         return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0, scope), media_type="text/event-stream")
@@ -197,6 +199,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     try:
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, None if model == "instant" else model, file_ids)
         if stream:
+            if response_format == "responses":
+                return StreamingResponse(stream_responses_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope, req_model), media_type="text/event-stream")
             if is_anthropic:
                 return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id, scope), media_type="text/event-stream")
             return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope), media_type="text/event-stream")
@@ -227,7 +231,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             mark_limited(token_id)
         if _retried or code not in (401, 403, 429):
             raise
-        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
+        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, response_format, _retried=True)
 
 
 async def collect_response(gen):
@@ -273,6 +277,13 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
     is_thinking = False
     aborted = False
     failed = False
+
+    def _chunk(delta, finish_reason=None):
+        choice = {"index": 0, "delta": delta}
+        if finish_reason:
+            choice["finish_reason"] = finish_reason
+        return f"data: {json.dumps({'choices': [choice]})}\n\n"
+
     try:
         async for chunk in _hold_think_tags(gen):
             if not chunk:
@@ -291,10 +302,10 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 think_part = parts[0]
                 chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
                 if think_part:
-                    yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': think_part}}]})}\n\n"
+                    yield _chunk({"reasoning_content": think_part})
 
             if is_thinking and chunk:
-                yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': chunk}}]})}\n\n"
+                yield _chunk({"reasoning_content": chunk})
                 continue
 
             if end_thinking and not chunk:
@@ -302,7 +313,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
 
             for r in parser.feed(chunk):
                 if "text" in r:
-                    yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
+                    yield _chunk({"content": r["text"]})
         mark_active(token_id)
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
@@ -341,17 +352,196 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 if not parsed_tools:
                     for r in parser.flush():
                         if "text" in r:
-                            yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
+                            yield _chunk({"content": r["text"]})
 
                 if parsed_tools:
                     for i, tc in enumerate(parsed_tools):
                         delta_tc = {"index": i, "id": tc["id"], "type": "function",
                                     "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
-                        yield f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [delta_tc]}}]})}\n\n"
-                    yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]})}\n\n"
+                        yield _chunk({"tool_calls": [delta_tc]})
+                    yield _chunk({}, "tool_calls")
                 else:
-                    yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                    yield _chunk({}, "stop")
+                in_tokens = count_tok(_messages_text(messages))
+                out_tokens = count_tok(full_text)
+                yield f"data: {json.dumps({'choices': [], 'usage': {'prompt_tokens': in_tokens, 'completion_tokens': out_tokens, 'total_tokens': in_tokens + out_tokens}})}\n\n"
                 yield "data: [DONE]\n\n"
+            except asyncio.CancelledError:
+                pass
+
+
+async def stream_responses_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id=0, scope="", req_model=None):
+    resp_id = f"resp_{uuid.uuid4().hex[:24]}"
+    msg_item_id = f"msg_{uuid.uuid4().hex[:24]}"
+    reason_item_id = f"rs_{uuid.uuid4().hex[:16]}"
+    parser = StreamToolParser()
+    full_text = ""
+    is_thinking = False
+    aborted = False
+    failed = False
+    in_tokens = count_tok(_messages_text(messages))
+    model_name = req_model if req_model else model
+    next_output_index = 0
+    reasoning_index = None
+    reasoning_text = ""
+    text_index = None
+    text_accum = ""
+
+    def _usage(out_tokens=0):
+        return {
+            "input_tokens": in_tokens,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": out_tokens,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": in_tokens + out_tokens,
+        }
+
+    def _summary(status="in_progress", output=None, out_tokens=0):
+        return {
+            "id": resp_id,
+            "object": "response",
+            "created_at": int(time.time()),
+            "status": status,
+            "model": model_name,
+            "output": output or [],
+            "usage": _usage(out_tokens),
+        }
+
+    def _evt(etype, **fields):
+        payload = {"type": etype}
+        payload.update(fields)
+        return f"data: {json.dumps(payload)}\n\n"
+
+    try:
+        yield _evt("response.created", response=_summary())
+        yield _evt("response.in_progress", response=_summary())
+
+        async for chunk in _hold_think_tags(gen):
+            if not chunk:
+                continue
+            full_text += chunk
+
+            if " thinking" in chunk:
+                is_thinking = True
+                chunk = chunk.replace(" thinking", "").lstrip("\n")
+                if reasoning_index is None:
+                    reasoning_index = next_output_index
+                    next_output_index += 1
+                    reason_item = {"id": reason_item_id, "type": "reasoning", "summary": [], "content": [], "status": "in_progress"}
+                    yield _evt("response.output_item.added", output_index=reasoning_index, item=reason_item)
+
+            end_thinking = False
+            if " response" in chunk:
+                is_thinking = False
+                end_thinking = True
+                parts = chunk.split(" response")
+                think_part = parts[0]
+                chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
+                if think_part and reasoning_index is not None:
+                    reasoning_text += think_part
+                    yield _evt("response.reasoning.delta", item_id=reason_item_id, output_index=reasoning_index, delta=think_part)
+
+            if is_thinking and chunk:
+                reasoning_text += chunk
+                yield _evt("response.reasoning.delta", item_id=reason_item_id, output_index=reasoning_index, delta=chunk)
+                continue
+
+            if end_thinking:
+                if reasoning_index is not None:
+                    yield _evt("response.reasoning.done", item_id=reason_item_id, output_index=reasoning_index, text=reasoning_text)
+                    reason_done = {"id": reason_item_id, "type": "reasoning", "summary": [{"type": "summary_text", "text": reasoning_text}] if reasoning_text else [], "content": [], "status": "completed"}
+                    yield _evt("response.output_item.done", output_index=reasoning_index, item=reason_done)
+                if not chunk:
+                    continue
+
+            for r in parser.feed(chunk):
+                if "text" in r:
+                    if text_index is None:
+                        text_index = next_output_index
+                        next_output_index += 1
+                        msg_item = {"id": msg_item_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []}
+                        yield _evt("response.output_item.added", output_index=text_index, item=msg_item)
+                        yield _evt("response.content_part.added", item_id=msg_item_id, output_index=text_index, content_index=0, part={"type": "text", "text": ""})
+                    text_accum += r["text"]
+                    yield _evt("response.output_text.delta", item_id=msg_item_id, output_index=text_index, content_index=0, delta=r["text"])
+        mark_active(token_id)
+    except (asyncio.CancelledError, GeneratorExit):
+        aborted = True
+        failed = True
+        raise
+    except Exception as e:
+        failed = True
+        m = re.match(r"HTTP (\d{3}):", str(e))
+        code = int(m.group(1)) if m else None
+        if code in (401, 403, 429):
+            mark_limited(token_id)
+        logger.exception("stream_responses_response failed")
+        try:
+            yield _evt("response.failed", response=_summary(status="failed"))
+            yield _evt("error", error={"code": "api_error", "message": str(e)[:300]})
+        except Exception:
+            pass
+    finally:
+        parsed_tools, clean_text = parse_tools(full_text)
+        clean_text = re.sub(r" thinking.*? response", "", clean_text, flags=re.DOTALL).strip()
+        clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+
+        if not failed:
+            next_messages = messages.copy()
+            ast_msg = {"role": "assistant"}
+            if parsed_tools:
+                ast_msg["tool_calls"] = parsed_tools
+            else:
+                ast_msg["content"] = clean_text
+            next_messages.append(ast_msg)
+            next_sig = generate_signature_sync(next_messages, model, scope)
+            save_session(sig, token_id, session_id, parent_message_id + 2)
+            save_session(next_sig, token_id, session_id, parent_message_id + 2)
+
+        if not aborted and not failed:
+            try:
+                if not parsed_tools:
+                    for r in parser.flush():
+                        if "text" in r:
+                            if text_index is None:
+                                text_index = next_output_index
+                                next_output_index += 1
+                                msg_item = {"id": msg_item_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []}
+                                yield _evt("response.output_item.added", output_index=text_index, item=msg_item)
+                                yield _evt("response.content_part.added", item_id=msg_item_id, output_index=text_index, content_index=0, part={"type": "text", "text": ""})
+                            text_accum += r["text"]
+                            yield _evt("response.output_text.delta", item_id=msg_item_id, output_index=text_index, content_index=0, delta=r["text"])
+
+                if text_index is not None:
+                    final_text = text_accum or clean_text
+                    yield _evt("response.output_text.done", item_id=msg_item_id, output_index=text_index, content_index=0, text=final_text)
+                    yield _evt("response.content_part.done", item_id=msg_item_id, output_index=text_index, content_index=0, part={"type": "text", "text": final_text})
+                    msg_done = {"id": msg_item_id, "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "text", "text": final_text}]}
+                    yield _evt("response.output_item.done", output_index=text_index, item=msg_done)
+
+                if parsed_tools:
+                    for tc in parsed_tools:
+                        t_index = next_output_index
+                        next_output_index += 1
+                        t_item_id = tc["id"]
+                        args = tc["function"]["arguments"]
+                        fc_added = {"id": t_item_id, "type": "function_call", "call_id": t_item_id, "name": tc["function"]["name"], "arguments": "", "status": "in_progress"}
+                        yield _evt("response.output_item.added", output_index=t_index, item=fc_added)
+                        yield _evt("response.function_call_arguments.delta", item_id=t_item_id, output_index=t_index, delta=args)
+                        yield _evt("response.function_call_arguments.done", item_id=t_item_id, output_index=t_index, arguments=args)
+                        fc_done = {"id": t_item_id, "type": "function_call", "call_id": t_item_id, "name": tc["function"]["name"], "arguments": args, "status": "completed"}
+                        yield _evt("response.output_item.done", output_index=t_index, item=fc_done)
+
+                final_output = []
+                if reasoning_index is not None:
+                    final_output.append({"id": reason_item_id, "type": "reasoning", "summary": [{"type": "summary_text", "text": reasoning_text}] if reasoning_text else [], "content": [], "status": "completed"})
+                if text_index is not None:
+                    final_output.append({"id": msg_item_id, "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "text", "text": text_accum or clean_text}]})
+                for tc in parsed_tools:
+                    final_output.append({"id": tc["id"], "type": "function_call", "call_id": tc["id"], "name": tc["function"]["name"], "arguments": tc["function"]["arguments"], "status": "completed"})
+
+                out_tokens = count_tok(full_text)
+                yield _evt("response.completed", response=_summary(status="completed", output=final_output, out_tokens=out_tokens))
             except asyncio.CancelledError:
                 pass
 
@@ -772,7 +962,7 @@ async def openai_responses(request: Request):
     stream = body.get("stream", False)
     tools = body.get("tools", None)
 
-    result = await handle_chat(messages, model, thinking, search, stream, tools, scope=get_api_key(request))
+    result = await handle_chat(messages, model, thinking, search, stream, tools, scope=get_api_key(request), response_format="responses")
 
     if stream:
         return result
