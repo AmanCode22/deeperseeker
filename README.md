@@ -129,3 +129,6 @@ Model mapping: `instant`/`vision` → V4 Flash, `expert` → V4 Pro. The `cost` 
 
 Educational purpose only. This project is not affiliated with, endorsed by, or sponsored by DeepSeek. Use responsibly and in accordance with DeepSeek's terms of service.
 
+## Contributors
+
+[![Contributors](https://contrib.rocks/image?repo=amancode22/deeperseeker)](https://github.com/amancode22/deeperseeker/graphs/contributors)
