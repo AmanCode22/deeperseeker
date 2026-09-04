@@ -344,7 +344,7 @@ def parse_tools(text):
             for pm in p_matches:
                 p_name = pm.group(1).strip()
                 p_val = pm.group(2).strip()
-                p_val = re.sub(r"</?[A-Za-z0-9_\-]+[^>]*>", "", p_val).strip()
+                p_val = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>", "", p_val, flags=re.IGNORECASE).strip()
                 try:
                     args[p_name] = json.loads(p_val)
                 except Exception:
@@ -354,7 +354,7 @@ def parse_tools(text):
                 t_name = pm.group(1).strip().lower()
                 if t_name in param_names:
                     t_val = pm.group(2).strip()
-                    t_val = re.sub(r"</?[A-Za-z0-9_\-]+[^>]*>", "", t_val).strip()
+                    t_val = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>", "", t_val, flags=re.IGNORECASE).strip()
                     try:
                         args[t_name] = json.loads(t_val)
                     except Exception:
