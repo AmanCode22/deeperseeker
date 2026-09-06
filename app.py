@@ -42,6 +42,7 @@ from functions import (
     init_db,
     mark_limited,
     mark_active,
+    next_parent,
     parse_tools,
     pick_token,
     save_session,
@@ -163,8 +164,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         next_messages.append(ast_msg)
                         next_sig = await generate_signature(next_messages, model, scope)
 
-                        save_session(sig, new_token_id, new_session_id, 2)
-                        save_session(next_sig, new_token_id, new_session_id, 2)
+                        save_session(sig, new_token_id, new_session_id, next_parent(0))
+                        save_session(next_sig, new_token_id, new_session_id, next_parent(0))
                         return format_response(resp_text, model, messages, tools)
     else:
 
@@ -216,8 +217,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             next_messages.append(ast_msg)
             next_sig = await generate_signature(next_messages, model, scope)
 
-            save_session(sig, token_id, session_id, parent_message_id + 2)
-            save_session(next_sig, token_id, session_id, parent_message_id + 2)
+            save_session(sig, token_id, session_id, next_parent(parent_message_id))
+            save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
             return format_response(resp_text, model, messages, tools)
     except Exception as e:
         delete_session(sig)
@@ -333,8 +334,8 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
-            save_session(sig, token_id, session_id, parent_message_id + 2)
-            save_session(next_sig, token_id, session_id, parent_message_id + 2)
+            save_session(sig, token_id, session_id, next_parent(parent_message_id))
+            save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
 
         if not aborted and not failed:
             try:
@@ -446,8 +447,8 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
-            save_session(sig, token_id, session_id, parent_message_id + 2)
-            save_session(next_sig, token_id, session_id, parent_message_id + 2)
+            save_session(sig, token_id, session_id, next_parent(parent_message_id))
+            save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
 
         def _tb(text):
             return (f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'text', 'text': ''}})}\n\n"

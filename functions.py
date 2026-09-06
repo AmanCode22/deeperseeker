@@ -258,6 +258,22 @@ def delete_session(sig):
     conn.close()
 
 
+def next_parent(parent_message_id):
+    """Compute the parent_message_id to use for the next turn on a chat session.
+
+    Invariant: each successful /chat/completion request appends exactly one user
+    message and one assistant message to the DeepSeek chat session, so if the
+    request was sent with parent_message_id P, the last message id afterwards is
+    P + 1 and the next request must use P + 2.
+
+    DeepSeek's web API exposes no endpoint to list a session's messages, so this
+    increment cannot be verified against the server; it is centralized here so
+    every save_session() call site (token-rotation branch, non-stream and both
+    streaming paths) stays consistent if the invariant ever changes.
+    """
+    return parent_message_id + 2
+
+
 DEEPSEEK_TARIFFS = {
     "deepseek-v4-flash": {
         "cache_miss_input": 0.66,
