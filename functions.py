@@ -324,14 +324,27 @@ def clean_json_str(s):
     return s.strip()
 
 
+def _code_fence_spans(text):
+    """Return the (start, end) spans of markdown fenced code blocks.
+
+    Tool-call markup inside a fence is documentation/example text, not an
+    actual tool call, so matches falling inside these spans are ignored.
+    Unclosed fences extend to end-of-text.
+    """
+    return [(m.start(), m.end()) for m in re.finditer(r"```.*?(?:```|$)", text, re.DOTALL)]
+
+
 def parse_tools(text):
     tools = []
     clean_text = text
-    seen_sigs = set()
+    fence_spans = _code_fence_spans(text)
+
+    def fenced(pos):
+        return any(s <= pos < e for s, e in fence_spans)
 
     param_names = {"command", "description", "file_path", "content", "path", "prompt", "query", "subject", "old_string", "new_string", "url", "input"}
     tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_call|invoke|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
-    real_tool_matches = tool_matches
+    real_tool_matches = [tm for tm in tool_matches if not fenced(tm.start())]
 
     if real_tool_matches:
         for i, tm in enumerate(real_tool_matches):
@@ -362,10 +375,7 @@ def parse_tools(text):
             if candidate_name:
                 norm = normalize_tool_call(candidate_name, args)
                 if norm:
-                    sig = (norm["function"]["name"], norm["function"]["arguments"])
-                    if sig not in seen_sigs:
-                        seen_sigs.add(sig)
-                        tools.append(norm)
+                    tools.append(norm)
 
     if tools:
         clean_text = re.sub(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_calls?|tool_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_calls?|tool_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
@@ -375,6 +385,8 @@ def parse_tools(text):
         dsml_block_pattern = re.compile(r"<[｜\|]{2}DSML[｜\|]{2}([A-Za-z0-9_]+)>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}\1>|$)", re.DOTALL | re.IGNORECASE)
         param_pattern_b = re.compile(r"<[｜\|]{2}DSML[｜\|]{2}B([A-Za-z0-9_]+)[^>]*>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}B.*?>|$)", re.DOTALL | re.IGNORECASE)
         for m in dsml_block_pattern.finditer(text):
+            if fenced(m.start()):
+                continue
             tool_name = m.group(1).strip()
             body = m.group(2)
             args = {}
@@ -387,13 +399,10 @@ def parse_tools(text):
                     args[p_name] = p_val
             norm = normalize_tool_call(tool_name, args)
             if norm:
-                sig = (norm["function"]["name"], norm["function"]["arguments"])
-                if sig not in seen_sigs:
-                    seen_sigs.add(sig)
-                    tools.append(norm)
+                tools.append(norm)
         if not tools:
             tool_match = re.search(r"[｜\|]{2}DSML[｜\|]{2}(Bash|Read|Write|Edit|Agent|TaskList|TaskCreate|WebSearch|[A-Za-z0-9_]+)", text, re.IGNORECASE)
-            if tool_match:
+            if tool_match and not fenced(tool_match.start()):
                 candidate = tool_match.group(1).strip()
                 tool_name = "Bash" if candidate.lower().startswith("b") and candidate.lower() not in ["bdescription", "bparam"] else candidate
                 args = {}
@@ -407,10 +416,7 @@ def parse_tools(text):
                     args["description"] = clean_desc
                 norm = normalize_tool_call(tool_name, args)
                 if norm:
-                    sig = (norm["function"]["name"], norm["function"]["arguments"])
-                    if sig not in seen_sigs:
-                        seen_sigs.add(sig)
-                        tools.append(norm)
+                    tools.append(norm)
         if tools:
             clean_text = re.sub(r"<[｜\|]{2}DSML[｜\|]{2}[^>]*>.*?(?:</[｜\|]{2}DSML[｜\|]{2}[^>]*>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
             clean_text = re.sub(r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
@@ -418,6 +424,8 @@ def parse_tools(text):
     if not tools:
         fn_call_pattern = re.compile(r"<function_call>\s*<name>([^<]+)</name>\s*<arguments>(.*?)</arguments>\s*</function_call>", re.DOTALL | re.IGNORECASE)
         for m in fn_call_pattern.finditer(text):
+            if fenced(m.start()):
+                continue
             name = m.group(1).strip()
             args_raw = m.group(2).strip()
             try:
@@ -426,17 +434,14 @@ def parse_tools(text):
                 args = args_raw
             norm = normalize_tool_call(name, args)
             if norm:
-                sig = (norm["function"]["name"], norm["function"]["arguments"])
-                if sig not in seen_sigs:
-                    seen_sigs.add(sig)
-                    tools.append(norm)
+                tools.append(norm)
         if tools:
             clean_text = re.sub(r"<function_call>.*?</function_call>", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     if not tools:
         tag_regex = re.compile(r"<(?:tool_call|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>", re.IGNORECASE)
         decoder = json.JSONDecoder()
-        matches = list(tag_regex.finditer(text))
+        matches = [m for m in tag_regex.finditer(text) if not fenced(m.start())]
         if matches:
             for m in matches:
                 tag_name = m.group(1)
@@ -478,10 +483,7 @@ def parse_tools(text):
                         if name:
                             norm = normalize_tool_call(name, args)
                             if norm:
-                                sig = (norm["function"]["name"], norm["function"]["arguments"])
-                                if sig not in seen_sigs:
-                                    seen_sigs.add(sig)
-                                    tools.append(norm)
+                                tools.append(norm)
             clean_text = re.sub(r"<(?:tool_call|function_call)[^>]*>.*?(?:</(?:tool_call|function_call)>|$)", "", text, flags=re.DOTALL).strip()
 
     if not tools:
@@ -496,10 +498,7 @@ def parse_tools(text):
                     args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or {}
                     norm = normalize_tool_call(name, args)
                     if norm:
-                        sig = (norm["function"]["name"], norm["function"]["arguments"])
-                        if sig not in seen_sigs:
-                            seen_sigs.add(sig)
-                            tools.append(norm)
+                        tools.append(norm)
             except Exception:
                 pass
         if tools:
@@ -517,16 +516,14 @@ def parse_tools(text):
                     args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or {}
                     norm = normalize_tool_call(name, args)
                     if norm:
-                        sig = (norm["function"]["name"], norm["function"]["arguments"])
-                        if sig not in seen_sigs:
-                            seen_sigs.add(sig)
-                            tools.append(norm)
+                        tools.append(norm)
             except Exception:
                 pass
-    if tools:
-        clean_text = ""
-    else:
-        clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+        if tools:
+            clean_text = re.sub(json_pattern, "", clean_text, flags=re.DOTALL).strip()
+    # Keep companion text: the tool-call blocks themselves were already removed
+    # from clean_text above; only leftover bare tags are stripped here.
+    clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
     return tools, clean_text
 
 
