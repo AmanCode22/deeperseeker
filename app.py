@@ -23,7 +23,7 @@ os.chdir(BASE_DIR)
 
 load_dotenv()
 
-API_KEY = os.getenv("DEEPSEEKER_API_KEY", "dseeker")
+API_KEY = os.getenv("DEEPSEEKER_API_KEY") or "dseeker"
 ADMIN_USER = os.getenv("DEEPSEEKER_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("DEEPSEEKER_ADMIN_PASSWORD", "admin")
 
@@ -121,11 +121,6 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
 
     sig = await generate_signature(messages, model, scope)
     sess = find_session(sig)
-    if not sess:
-        for i in range(len(messages) - 1, 0, -1):
-            sess = find_session(generate_signature_sync(messages[:i], model, scope))
-            if sess:
-                break
 
     if sess:
 
@@ -803,6 +798,73 @@ async def openai_responses(request: Request):
     return result
 
 
+def convert_anthropic_messages(messages):
+    """Translate Anthropic message dicts into OpenAI-style dicts.
+
+    tool_use blocks become assistant tool_calls and tool_result blocks become
+    role="tool" messages so that build_prompt()/extract_tool_results() see real
+    tool results and the signature cache can match across turns.
+    """
+    openai_msgs = []
+    for m in messages:
+        content = m.get("content", "")
+        tool_calls = []
+        tool_results = []
+        if isinstance(content, list):
+            parts = []
+            image_parts = []
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "text":
+                    parts.append(c.get("text", ""))
+                elif c.get("type") == "image":
+                    image_parts.append(c)
+                elif c.get("type") == "tool_use":
+                    tool_calls.append({
+                        "id": c.get("id") or ("call_" + uuid.uuid4().hex[:8]),
+                        "type": "function",
+                        "function": {
+                            "name": c.get("name", ""),
+                            "arguments": json.dumps(c.get("input", {})),
+                        },
+                    })
+                elif c.get("type") == "tool_result":
+                    res_content = c.get("content", "")
+                    if isinstance(res_content, list):
+                        for item in res_content:
+                            if isinstance(item, dict) and item.get("type") == "image":
+                                image_parts.append(item)
+                        res_content = " ".join(item.get("text", "") for item in res_content if isinstance(item, dict) and item.get("type") == "text")
+                    elif not isinstance(res_content, str):
+                        res_content = str(res_content)
+                    tool_results.append({"tool_call_id": c.get("tool_use_id", ""), "content": res_content})
+            if image_parts:
+                content = [{"type": "text", "text": s} for s in parts if s] + image_parts
+            else:
+                content = "\n".join(p for p in parts if p)
+        if m.get("role") == "system":
+            if content:
+                openai_msgs.append({"role": "system", "content": content})
+            continue
+        if m.get("role") == "assistant":
+            if isinstance(content, str) and (not content.strip() or content.strip() == "(no content)"):
+                content = None
+            msg = {"role": "assistant", "content": content}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+            if msg["content"] is None and not tool_calls:
+                continue
+            openai_msgs.append(msg)
+            continue
+        for tr in tool_results:
+            openai_msgs.append({"role": "tool", "tool_call_id": tr["tool_call_id"], "content": tr["content"]})
+        has_content = bool(content) if not isinstance(content, list) else len(content) > 0
+        if has_content or not tool_results:
+            openai_msgs.append({"role": m.get("role", "user"), "content": content})
+    return openai_msgs
+
+
 @app.post("/v1/messages")
 @app.post("/messages")
 async def anthropic_messages(request: Request):
@@ -827,38 +889,7 @@ async def anthropic_messages(request: Request):
         if system_str:
             openai_msgs.append({"role": "system", "content": system_str})
 
-    for m in messages:
-        content = m.get("content", "")
-        if isinstance(content, list):
-            parts = []
-            image_parts = []
-            for c in content:
-                if isinstance(c, dict):
-                    if c.get("type") == "text":
-                        parts.append(c.get("text", ""))
-                    elif c.get("type") == "image":
-                        image_parts.append(c)
-                    elif c.get("type") == "tool_use":
-                        parts.append(f"{json.dumps({'name': c.get('name'), 'arguments': c.get('input', {})})}")
-                    elif c.get("type") == "tool_result":
-                        res_content = c.get("content", "")
-                        if isinstance(res_content, list):
-                            for item in res_content:
-                                if isinstance(item, dict) and item.get("type") == "image":
-                                    image_parts.append(item)
-                            res_content = " ".join(item.get("text", "") for item in res_content if isinstance(item, dict) and item.get("type") == "text")
-                        parts.append(f"[Tool Result for {c.get('tool_use_id', 'tool')}]: {res_content}")
-            if image_parts:
-                content = [{"type": "text", "text": s} for s in parts if s] + image_parts
-            else:
-                content = "\n".join(parts)
-        if m.get("role") == "system":
-            if content:
-                openai_msgs.append({"role": "system", "content": content})
-            continue
-        if m["role"] == "assistant" and (not content or content.strip() == "(no content)"):
-            continue
-        openai_msgs.append({"role": m["role"], "content": content})
+    openai_msgs.extend(convert_anthropic_messages(messages))
 
     openai_tools = []
     for t in tools:
