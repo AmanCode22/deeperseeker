@@ -4,6 +4,7 @@ import hashlib
 import ipaddress
 import json
 import mimetypes
+import os
 import random
 import re
 import socket
@@ -13,7 +14,11 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import aiohttp
-from functions import get_session, upload_file
+from functions import get_session, upload_file, count_tokens
+
+# Token budgets for injected history when (re)building a session prompt.
+MAX_HISTORY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_HISTORY_TOKENS", "24000"))
+MAX_TOOL_RESULTS_TOKENS = int(os.getenv("DEEPSEEKER_MAX_TOOL_RESULT_TOKENS", "12000"))
 
 
 async def extract_system(messages):
@@ -146,8 +151,8 @@ async def extract_and_upload_files(messages, auth_token, last_user_only=False):
                 if "file_id" in j["file"]:
                     result_fileids.append(j["file"]["file_id"])
                 if "file_data" in j["file"]:
-                    filename = j["file"]["filename"]
-                    data_parts = j["file_data"].split(",", 1)
+                    filename = j["file"].get("filename") or "file.bin"
+                    data_parts = j["file"]["file_data"].split(",", 1)
                     if len(data_parts) != 2:
                         continue
                     mimetype_base, base64_data = data_parts
@@ -199,6 +204,26 @@ async def extract_user_msg(messages):
                 if parts:
                     return "\n".join(parts)
     return ""
+
+
+def _cap_parts(parts, max_tokens):
+    """Drop the oldest parts until the total fits the token budget (always keeps the newest part)."""
+    if not parts:
+        return parts, False
+    sizes = [count_tokens(p) for p in parts]
+    total = sum(sizes)
+    if total <= max_tokens:
+        return parts, False
+    drop = 0
+    while total > max_tokens and drop < len(parts) - 1:
+        total -= sizes[drop]
+        drop += 1
+    return parts[drop:], True
+
+
+def _capped_text(text, max_tokens, marker):
+    parts, truncated = _cap_parts(text.split("\n\n"), max_tokens)
+    return (marker + "\n" if truncated else "") + "\n\n".join(parts)
 
 
 def canonicalize_messages(messages):
@@ -297,7 +322,7 @@ async def build_prompt(messages, tools, model, is_first_message=False):
             history_parts = []
             for msg in messages[:-1]:
                 role = msg.get("role", "unknown")
-                if role == "system":
+                if role in ("system", "tool"):
                     continue
                 content = msg.get("content", "")
                 if isinstance(content, list):
@@ -305,11 +330,14 @@ async def build_prompt(messages, tools, model, is_first_message=False):
                 if content:
                     history_parts.append(f"{role.upper()}: {content}")
             if history_parts:
-                history_text = "\n".join(history_parts)
+                history_parts, truncated = _cap_parts(history_parts, MAX_HISTORY_TOKENS)
+                marker = "[... earlier conversation history truncated ...]\n" if truncated else ""
+                history_text = marker + "\n".join(history_parts)
                 final_prompt += f"[PREVIOUS CONVERSATION HISTORY]\n{history_text}\n\n"
 
         tools_result_extract = await extract_tool_results(messages, latest_only=False)
         if tools_result_extract:
+            tools_result_extract = _capped_text(tools_result_extract, MAX_TOOL_RESULTS_TOKENS, "[... earlier tool results truncated ...]")
             final_prompt += f"[TOOL RESULTS]\n{tools_result_extract}\n\n"
 
         user_msg = await extract_user_msg(messages)
@@ -325,6 +353,7 @@ async def build_prompt(messages, tools, model, is_first_message=False):
         trailing_messages = messages[last_ast_idx + 1:] if last_ast_idx != -1 else [messages[-1]]
         tools_result_extract = await extract_tool_results(messages, latest_only=True)
         if tools_result_extract:
+            tools_result_extract = _capped_text(tools_result_extract, MAX_TOOL_RESULTS_TOKENS, "[... earlier tool results truncated ...]")
             final_prompt += f"[TOOL RESULTS]\n{tools_result_extract}\n\n"
 
         trailing_user_parts = []

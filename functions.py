@@ -274,14 +274,26 @@ def next_parent(parent_message_id):
     return parent_message_id + 2
 
 
+def delete_sessions_for_chat(token_id, session_id):
+    conn = get_db()
+    conn.execute("DELETE FROM sessions WHERE token_id = ? AND deepseek_session_id = ?", (token_id, session_id))
+    conn.commit()
+    conn.close()
+
+
+# Flat peak-hour rates (per 1M tokens) per https://api-docs.deepseek.com/quick_start/pricing
 DEEPSEEK_TARIFFS = {
     "deepseek-v4-flash": {
-        "cache_miss_input": 0.66,
+        "cache_miss_input": 0.44,
+        "output_generation": 1.32,
+    },
+    "deepseek-v4-flash-exp": {
+        "cache_miss_input": 0.44,
         "output_generation": 1.32,
     },
     "deepseek-v4-pro": {
         "cache_miss_input": 1.32,
-        "output_generation": 1.98,
+        "output_generation": 3.96,
     },
 }
 
@@ -779,6 +791,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
     }
 
     think_open = False
+    got_output = False
     async with session.post(url, cookies=cookie, headers=headers, json=json_data) as r:
         if r.status != 200:
             error_text = await r.text()
@@ -797,12 +810,16 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
             if data.get("p") == "response/status" and data.get("v") == "FINISHED":
                 if think_open:
                     yield "\n</think>\n\n"
+                if not got_output:
+                    raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
                 return
             if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
                 for op in data["v"]:
                     if isinstance(op, dict) and op.get("p") == "quasi_status" and op.get("v") == "FINISHED":
                         if think_open:
                             yield "\n</think>\n\n"
+                        if not got_output:
+                            raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
                         return
             if "v" in data and isinstance(data["v"], dict) and "response" in data["v"]:
                 fragments = data["v"]["response"].get("fragments")
@@ -812,11 +829,13 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                             if not think_open:
                                 yield "<think>\n"
                                 think_open = True
+                            got_output = True
                             yield fragment.get("content", "")
                         else:
                             if think_open:
                                 yield "\n</think>\n\n"
                                 think_open = False
+                            got_output = True
                             yield fragment.get("content", "")
                 continue
 
@@ -828,21 +847,27 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                             if think_open:
                                 yield "\n</think>\n\n"
                                 think_open = False
+                            got_output = True
                             yield fragment.get("content", "")
                         elif fragment.get("type") == "THINK":
                             if not think_open:
                                 yield "<think>\n"
                                 think_open = True
+                            got_output = True
                             yield fragment.get("content", "")
                         else:
+                            got_output = True
                             yield fragment.get("content", "")
                 continue
 
             v = data.get("v")
-            if isinstance(v, str):
+            if isinstance(v, str) and v:
+                got_output = True
                 yield v
         if think_open:
             yield "\n</think>\n\n"
+        if not got_output:
+            raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):

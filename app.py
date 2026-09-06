@@ -35,6 +35,7 @@ from functions import (
     count_tokens,
     create_new_chat,
     delete_token,
+    delete_sessions_for_chat,
     find_session,
     get_auth_token,
     get_token,
@@ -46,7 +47,6 @@ from functions import (
     parse_tools,
     pick_token,
     save_session,
-    delete_session,
     send_message,
     StreamToolParser,
     upload_file,
@@ -115,6 +115,36 @@ def check_key(request: Request):
     return secrets.compare_digest(key.encode("utf-8"), API_KEY.encode("utf-8"))
 
 
+def _api_error_response(e, is_anthropic=False):
+    m = re.match(r"HTTP (\d{3}):", str(e))
+    code = int(m.group(1)) if m else 502
+    if code < 400 or code > 599:
+        code = 502
+    if is_anthropic:
+        payload = {"type": "error", "error": {"type": "api_error", "message": str(e)[:500]}}
+    else:
+        payload = {"error": {"message": str(e)[:500], "type": "api_error", "code": code}}
+    return JSONResponse(payload, status_code=code)
+
+
+def _replay_stream(gen, first):
+    async def _wrapped():
+        if first is not None:
+            yield first
+        async for chunk in gen:
+            yield chunk
+    return _wrapped()
+
+
+async def _preflight_stream(gen):
+    """Consume the first chunk eagerly so upstream errors surface before streaming starts."""
+    try:
+        first = await gen.__anext__()
+    except StopAsyncIteration:
+        first = None
+    return _replay_stream(gen, first)
+
+
 async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, scope="", _retried=False):
     auth_token = get_auth_token()
     if not auth_token:
@@ -134,17 +164,29 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             if new_token_id and (not tok or new_token_id != token_id):
                 new_tok = get_token(new_token_id)
                 if new_tok:
-                    new_session_id = await create_new_chat(new_tok["token"])
-                    prompt = await build_prompt(messages, tools or [], model, is_first_message=True)
+                    try:
+                        delete_sessions_for_chat(token_id, session_id)
+                        new_session_id = await create_new_chat(new_tok["token"])
+                        prompt = await build_prompt(messages, tools or [], model, is_first_message=True)
 
-                    file_ids = await extract_and_upload_files(messages, new_tok["token"])
-                    gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, None if model == "instant" else model, file_ids)
+                        file_ids = await extract_and_upload_files(messages, new_tok["token"])
+                        gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, None if model == "instant" else model, file_ids)
+                        gen = await _preflight_stream(gen)
+                    except Exception as e:
+                        if _retried:
+                            return _api_error_response(e, is_anthropic)
+                        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
                     if stream:
                         if is_anthropic:
                             return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0, scope), media_type="text/event-stream")
                         return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0, scope), media_type="text/event-stream")
                     else:
-                        resp_text = await collect_response(gen)
+                        try:
+                            resp_text = await collect_response(gen)
+                        except Exception as e:
+                            if _retried:
+                                return _api_error_response(e, is_anthropic)
+                            return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
                         mark_active(new_token_id)
 
                         parsed_tools, clean_text = parse_tools(resp_text)
@@ -162,6 +204,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         save_session(sig, new_token_id, new_session_id, next_parent(0))
                         save_session(next_sig, new_token_id, new_session_id, next_parent(0))
                         return format_response(resp_text, model, messages, tools)
+            return JSONResponse({"error": {"message": "No active tokens available (all rate limited). Try again later.", "type": "rate_limit_error"}}, status_code=429)
     else:
 
         create_lock = _sig_locks.setdefault(sig, asyncio.Lock())
@@ -187,11 +230,12 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         return JSONResponse({"error": "Token expired"}, status_code=503)
 
     is_first = parent_message_id == 0
-    file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
-    prompt = await build_prompt(messages, tools or [], model, is_first)
-
     try:
+        file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
+        prompt = await build_prompt(messages, tools or [], model, is_first)
+
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, None if model == "instant" else model, file_ids)
+        gen = await _preflight_stream(gen)
         if stream:
             if is_anthropic:
                 return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id, scope), media_type="text/event-stream")
@@ -216,13 +260,15 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
             return format_response(resp_text, model, messages, tools)
     except Exception as e:
-        delete_session(sig)
         m = re.match(r"HTTP (\d{3}):", str(e))
         code = int(m.group(1)) if m else None
         if code in (401, 403, 429):
             mark_limited(token_id)
-        if _retried or code not in (401, 403, 429):
-            raise
+        delete_sessions_for_chat(token_id, session_id)
+        if _retried:
+            return _api_error_response(e, is_anthropic)
+        if code not in (401, 403, 429) and parent_message_id == 0:
+            return _api_error_response(e, is_anthropic)
         return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
 
 
@@ -502,7 +548,7 @@ def format_response(text, model, messages, tools=None):
 
     in_tokens = count_tok(_messages_text(messages))
     out_tokens = count_tok(text)
-    tariff_key = "deepseek-v4-pro" if model == "expert" else "deepseek-v4-flash"
+    tariff_key = "deepseek-v4-pro" if model == "expert" else ("deepseek-v4-flash-exp" if model == "vision" else "deepseek-v4-flash")
     tariff = DEEPSEEK_TARIFFS[tariff_key]
     cost = (in_tokens / 1_000_000 * tariff["cache_miss_input"]) + (out_tokens / 1_000_000 * tariff["output_generation"])
 
@@ -1147,4 +1193,4 @@ async def health(request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "4000")))
+    uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "4000")))

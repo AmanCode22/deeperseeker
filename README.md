@@ -100,21 +100,23 @@ cp .env.example .env
 - **Context-Based Session Selector**: Computes a SHA-256 signature over the canonicalized message history (up to the last assistant turn), the model, and the API key scope, to match and resume existing web chat sessions. Session creation is lock-protected to avoid duplicates.
 - **Full History Injection**: Inject full conversation history into new sessions when session signature is not in DB or when account fails over.
 - **Automatic Rate-Limit Recovery**: Auto-marks tokens `RATE_LIMITED` on HTTP 401/403/429, provisions a new token, transfers full context (including files), and continues seamless chat with a single retry.
+- **Long-Context Resilience**: If the upstream web session fails or returns an empty response (e.g. context overflow), the broken session is discarded and the request is retried once on a fresh session with a compacted, token-capped history injection; unrecoverable upstream errors are returned as proper JSON API errors instead of raw 500s.
 - **Tool Calling & Streaming**: Server-sent events (SSE) streaming with think-tag reassembly across chunk boundaries (no truncation) and multi-format tool-call parsing — DSML XML, `<tool_call>` XML, `<function_call>` blocks, and JSON — into OpenAI/Anthropic tool schemas.
 - **File & Vision Support**: Base64/URL image extraction (with SSRF protection), file upload streaming, and vision-model file forking.
 - **Claude Desktop Compatible**: Rich `/v1/models` capability metadata + `anthropic/claude-*` aliases for automatic client discovery.
 - **Hardened Dashboard**: Session TTL, brute-force login lockout (5 attempts → 5 min), CSRF origin check.
 
-## Pricing (per 1M tokens, as of 2026-08-30)
+## Pricing (per 1M tokens, as of 2026-09-06)
 
-| Model Tier | Time Window | Input Cost (Cache Miss) | Output Cost |
-|---|---|---|---|
-| **DeepSeek V4 Flash** (fast, lightweight tasks) | Off-Peak Hours | $0.22 | $0.44 |
-| | Peak Hours | $0.66 | $1.32 |
-| **DeepSeek V4 Pro** (flagship, coding, reasoning) | Off-Peak Hours | $0.66 | $1.32 |
-| | Peak Hours | $1.32 | $1.98 |
+Flat peak-hour rates:
 
-Model mapping: `instant`/`vision` → V4 Flash, `expert` → V4 Pro. The `cost` reported in API responses uses the flat Peak Hour rates.
+| Model Tier | Input Cost (Cache Miss) | Output Cost |
+|---|---|---|
+| **DeepSeek V4 Flash** (`instant`) | $0.44 | $1.32 |
+| **DeepSeek V4 Flash Exp** (`vision`) | $0.44 | $1.32 |
+| **DeepSeek V4 Pro** (`expert`) | $1.32 | $3.96 |
+
+Model mapping: `instant` → V4 Flash, `vision` → V4 Flash Exp, `expert` → V4 Pro. The `cost` reported in API responses uses these flat rates.
 ## Star History
 
 <a href="https://www.star-history.com/?repos=amancode22%2Fdeeperseeker&type=date&legend=top-left">
