@@ -39,6 +39,8 @@ RUN mkdir -p /app/data && \
 
 EXPOSE 4000
 
+ENV HOST=0.0.0.0
+
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD curl -sf http://localhost:4000/health || exit 1
 
 CMD ["sh", "-c", "xvfb-run -a -s '-screen 0 1280x720x24' python3 app.py"]
