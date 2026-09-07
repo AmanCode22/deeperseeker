@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import mimetypes
 import os
 import random
@@ -15,9 +16,36 @@ import deepseek_tokenizer
 import wasmtime
 from playwright.async_api import async_playwright
 
+logger = logging.getLogger("deeperseeker.functions")
+
 wasm_path = "wasm/deepseek_pow_solver.wasm"
 _session = None
-_db = "deeperseeker.db"
+_db = os.getenv("DB_PATH", "deeperseeker.db")
+
+
+def cookie_file_path():
+    """Resolve where the DeepSeek cookie file lives.
+
+    Order: DEEPSEEKER_COOKIE_PATH env > the target of a legacy Docker symlink
+    > next to the real DB file (which honors DB_PATH) > CWD. Writing goes to
+    the RESOLVED path so os.replace() can never destroy a symlink that bridges
+    the file into the persistent data volume.
+    """
+    p = os.getenv("DEEPSEEKER_COOKIE_PATH")
+    if p:
+        return p
+    p = "aws_cookies_deepseek.json"
+    try:
+        if os.path.islink(p):
+            target = os.path.realpath(p)
+            if target:
+                return target
+    except Exception:
+        pass
+    d = os.path.dirname(os.path.abspath(_db))
+    if d and os.path.abspath(d) != os.path.abspath(os.getcwd()):
+        return os.path.join(d, "aws_cookies_deepseek.json")
+    return p
 
 try:
     _TZ_OFFSET = str(int(datetime.now().astimezone().utcoffset().total_seconds()))
@@ -59,12 +87,22 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+    try:
+        prune_sessions()
+    except Exception:
+        logger.exception("Startup session pruning failed (non-fatal)")
+
+
+_session_lock = asyncio.Lock()
 
 
 async def get_session():
     global _session
-    if _session is None:
-        _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15, sock_read=600))
+    if _session is None or _session.closed:
+        async with _session_lock:
+            if _session is None or _session.closed:
+                logger.info("Opening shared aiohttp ClientSession")
+                _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15, sock_read=600))
     return _session
 
 
@@ -98,30 +136,94 @@ def get_headers(auth_token, pow=None):
 
 _cookie_lock = asyncio.Lock()
 
+# Tunables for cookie generation resilience (the previous failure mode: one
+# failed generation serialized EVERY request behind _cookie_lock forever, so
+# the whole server stopped responding — even to brand-new chats).
+COOKIE_REGEN_ATTEMPTS = int(os.getenv("DEEPSEEKER_COOKIE_ATTEMPTS", "2"))
+COOKIE_REGEN_TIMEOUT = float(os.getenv("DEEPSEEKER_COOKIE_TIMEOUT", "120"))
+COOKIE_FAIL_COOLDOWN = float(os.getenv("DEEPSEEKER_COOKIE_COOLDOWN", "20"))
 
-async def get_cookies():
+_cookie_fail = {"until": 0.0, "error": ""}
+
+
+class CookieGenerationError(Exception):
+    """Raised when the DeepSeek WAF cookie file cannot be produced."""
+
+
+def _read_cookie_file():
+    """Return valid (unexpired) cookies, or None."""
     try:
-        if os.path.exists("aws_cookies_deepseek.json"):
-            with open("aws_cookies_deepseek.json") as f:
-                cookies = json.load(f)
-            if cookies.get("expiry") is not None and cookies["expiry"] > time.time():
-                return cookies["cookie"]
+        with open(cookie_file_path()) as f:
+            c = json.load(f)
+        if c.get("expiry") is not None and c["expiry"] > time.time():
+            return c["cookie"]
     except Exception:
         pass
+    return None
+
+
+def _read_stale_cookie_file():
+    """Return cookies even if expired (last-resort fallback)."""
+    try:
+        with open(cookie_file_path()) as f:
+            c = json.load(f)
+        return c.get("cookie") or None
+    except Exception:
+        return None
+
+
+async def get_cookies():
+    cookies = _read_cookie_file()
+    if cookies:
+        return cookies
+
+    def _cooldown_error():
+        return CookieGenerationError(
+            _cookie_fail["error"] + " (cooling down; will retry automatically — try again shortly)"
+        )
+
+    # Fail fast while a regeneration attempt recently failed, instead of
+    # queueing every request behind a full Chromium launch that will fail again.
+    if time.time() < _cookie_fail["until"]:
+        stale = _read_stale_cookie_file()
+        if stale:
+            return stale
+        raise _cooldown_error()
     async with _cookie_lock:
-        fresh = False
-        try:
-            if os.path.exists("aws_cookies_deepseek.json"):
-                with open("aws_cookies_deepseek.json") as f:
-                    cookies = json.load(f)
-                fresh = cookies.get("expiry") is not None and cookies["expiry"] > time.time()
-        except Exception:
-            fresh = False
-        if not fresh:
-            await _generate_cookies()
-        with open("aws_cookies_deepseek.json") as f:
-            cookies = json.load(f)
-        return cookies["cookie"]
+        cookies = _read_cookie_file()
+        if cookies:
+            return cookies
+        if time.time() < _cookie_fail["until"]:
+            stale = _read_stale_cookie_file()
+            if stale:
+                return stale
+            raise _cooldown_error()
+        last_err = None
+        for attempt in range(1, COOKIE_REGEN_ATTEMPTS + 1):
+            try:
+                logger.info("Generating DeepSeek cookies (attempt %d/%d)...", attempt, COOKIE_REGEN_ATTEMPTS)
+                await asyncio.wait_for(_generate_cookies(), timeout=COOKIE_REGEN_TIMEOUT)
+                cookies = _read_cookie_file()
+                if cookies:
+                    _cookie_fail["until"] = 0.0
+                    _cookie_fail["error"] = ""
+                    return cookies
+                last_err = CookieGenerationError("cookie file missing/invalid after generation")
+            except Exception as e:
+                last_err = e
+                logger.warning("DeepSeek cookie generation attempt %d/%d failed: %s", attempt, COOKIE_REGEN_ATTEMPTS, e)
+            if attempt < COOKIE_REGEN_ATTEMPTS:
+                await asyncio.sleep(min(5 * attempt, 10))
+        _cookie_fail["until"] = time.time() + COOKIE_FAIL_COOLDOWN
+        _cookie_fail["error"] = f"Could not generate DeepSeek cookies: {last_err}"
+        logger.error("%s", _cookie_fail["error"])
+        # Last resort: stale cookies may still be accepted upstream — better
+        # than hard-failing every request.
+        stale = _read_stale_cookie_file()
+        if stale:
+            logger.warning("Serving STALE DeepSeek cookies after generation failure (upstream may reject them)")
+            return stale
+        raise CookieGenerationError(_cookie_fail["error"])
 
 
 async def _generate_cookies():
@@ -133,8 +235,8 @@ async def _generate_cookies():
         try:
             context = await browser.new_context()
             page = await context.new_page()
-            await page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded")
-            await page.wait_for_selector("body")
+            await page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_selector("body", timeout=30000)
             try:
                 await page.wait_for_url("**/sign_in*", timeout=30000)
             except Exception:
@@ -151,10 +253,20 @@ async def _generate_cookies():
     final_cookies["ds_cookie_preference"] = "%257B%2522level%2522%253A%2522all%2522%257D"
     if not expiry or expiry < 0:
         expiry = time.time() + 1800
-    tmp_path = "aws_cookies_deepseek.json.tmp"
+    # Resolve the REAL storage path first: the Docker image bridges the cookie
+    # file into the persistent volume via a symlink at /app, and os.replace()
+    # (rename) does NOT follow symlinks — the old code replaced the symlink
+    # itself with a plain file in the container layer, so cookies were lost on
+    # every container recreation. Write the tmp file next to the target and
+    # atomically replace the resolved path instead.
+    target = cookie_file_path()
+    target_dir = os.path.dirname(os.path.abspath(target))
+    os.makedirs(target_dir, exist_ok=True)
+    tmp_path = os.path.join(target_dir, os.path.basename(target) + ".tmp")
     with open(tmp_path, "w") as f:
         f.write(json.dumps({"cookie": final_cookies, "expiry": expiry}))
-    os.replace(tmp_path, "aws_cookies_deepseek.json")
+    os.replace(tmp_path, target)
+    logger.info("DeepSeek cookies saved to %s (expires %s)", target, datetime.fromtimestamp(expiry) if expiry else "n/a")
 
 
 def get_auth_token():
@@ -218,6 +330,7 @@ def pick_token():
 
 
 def mark_limited(token_id):
+    logger.warning("Token #%d marked RATE_LIMITED", token_id)
     conn = get_db()
     conn.execute("UPDATE tokens SET status = ? WHERE id = ?", ("RATE_LIMITED", token_id))
     conn.commit()
@@ -240,6 +353,34 @@ def find_session(sig):
     return None
 
 
+# Cap on stored session signatures. Every request stores 2 rows and nothing
+# ever removed them, so after many chats the SQLite file (and its WAL) grew
+# unbounded — on volume-limited deployments a full disk freezes ALL requests,
+# including brand-new chats. PRUNE_EVERY saves trigger a prune that keeps the
+# newest MAX_SESSIONS rows (rowid order = insertion order).
+MAX_SESSIONS = int(os.getenv("DEEPSEEKER_MAX_SESSIONS", "20000"))
+PRUNE_EVERY = int(os.getenv("DEEPSEEKER_PRUNE_EVERY", "500"))
+_save_counter = {"n": 0}
+
+
+def prune_sessions():
+    conn = get_db()
+    try:
+        deleted = conn.execute(
+            "DELETE FROM sessions WHERE rowid NOT IN "
+            "(SELECT rowid FROM sessions ORDER BY rowid DESC LIMIT ?)",
+            (MAX_SESSIONS,),
+        ).rowcount
+        deleted_map = conn.execute(
+            "DELETE FROM session_map WHERE created_at < datetime('now', '-7 days')"
+        ).rowcount
+        conn.commit()
+        if deleted or deleted_map:
+            logger.info("Pruned %d session signature(s) and %d stale session_map row(s)", deleted, deleted_map)
+    finally:
+        conn.close()
+
+
 def save_session(sig, token_id, session_id, parent_message_id=0):
     conn = get_db()
     conn.execute(
@@ -249,6 +390,13 @@ def save_session(sig, token_id, session_id, parent_message_id=0):
     )
     conn.commit()
     conn.close()
+    _save_counter["n"] += 1
+    if _save_counter["n"] >= PRUNE_EVERY:
+        _save_counter["n"] = 0
+        try:
+            prune_sessions()
+        except Exception:
+            logger.exception("Session pruning failed (non-fatal)")
 
 
 def delete_session(sig):
@@ -795,6 +943,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
     async with session.post(url, cookies=cookie, headers=headers, json=json_data) as r:
         if r.status != 200:
             error_text = await r.text()
+            logger.warning("DeepSeek completion HTTP %d for chat %s: %s", r.status, chat_id, error_text[:300])
             raise Exception(f"HTTP {r.status}: {error_text}")
 
         async for line in r.content:

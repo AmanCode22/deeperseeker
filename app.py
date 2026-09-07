@@ -31,6 +31,8 @@ security = HTTPBasic()
 
 
 from functions import (
+    CookieGenerationError,
+    cookie_file_path,
     add_token,
     count_tokens,
     create_new_chat,
@@ -56,6 +58,14 @@ from plugin_helper import build_prompt, extract_and_upload_files, generate_signa
 
 
 logger = logging.getLogger("uvicorn.error")
+
+# Surface deeperseeker.* logs (cookie generation, prunes, rate-limit events,
+# upstream failures) alongside uvicorn's own output, unless already configured.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 
 def count_tok(text):
@@ -83,7 +93,13 @@ async def limit_body_size(request: Request, call_next):
 
 SESSIONS = {}
 SESSION_TTL = 7 * 24 * 3600
+# One asyncio.Lock per conversation signature, used to serialize first-time
+# session creation. Signatures are unique per message prefix, so without a cap
+# this dict grows FOREVER — after many chats it becomes a serious memory leak.
+# When the cap is hit, the oldest half of currently-unlocked entries is
+# evicted (worst case: an extra benign session re-creation).
 _sig_locks = {}
+SIG_LOCKS_MAX = int(os.getenv("DEEPSEEKER_MAX_SIG_LOCKS", "4096"))
 _login_fails = {"count": 0, "locked_until": 0}
 
 
@@ -118,6 +134,8 @@ def check_key(request: Request):
 def _api_error_response(e, is_anthropic=False):
     m = re.match(r"HTTP (\d{3}):", str(e))
     code = int(m.group(1)) if m else 502
+    if isinstance(e, CookieGenerationError):
+        code = 503  # WAF cookies cannot be produced right now — upstream unreachable, not a client error
     if code < 400 or code > 599:
         code = 502
     if is_anthropic:
@@ -173,6 +191,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, None if model == "instant" else model, file_ids)
                         gen = await _preflight_stream(gen)
                     except Exception as e:
+                        logger.exception("Token-rotation recovery failed (chat %s): %s", session_id, e)
                         if _retried:
                             return _api_error_response(e, is_anthropic)
                         return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
@@ -184,6 +203,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         try:
                             resp_text = await collect_response(gen)
                         except Exception as e:
+                            logger.exception("Upstream failed during token-rotation request: %s", e)
                             if _retried:
                                 return _api_error_response(e, is_anthropic)
                             return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
@@ -207,6 +227,13 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             return JSONResponse({"error": {"message": "No active tokens available (all rate limited). Try again later.", "type": "rate_limit_error"}}, status_code=429)
     else:
 
+        while len(_sig_locks) >= SIG_LOCKS_MAX:
+            chunk = list(_sig_locks.items())[: SIG_LOCKS_MAX // 2 + 1]
+            evictable = [k for k, v in chunk if not v.locked()]
+            if not evictable:
+                break  # everything in the chunk is in use; retry on a later request
+            for k in evictable:
+                _sig_locks.pop(k, None)
         create_lock = _sig_locks.setdefault(sig, asyncio.Lock())
         async with create_lock:
             sess = find_session(sig)
@@ -260,6 +287,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
             return format_response(resp_text, model, messages, tools)
     except Exception as e:
+        logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
         m = re.match(r"HTTP (\d{3}):", str(e))
         code = int(m.group(1)) if m else None
         if code in (401, 403, 429):
@@ -1178,7 +1206,7 @@ async def health(request: Request):
     active = sum(1 for t in get_tokens() if t["status"] == "ACTIVE")
     cookies_valid = False
     try:
-        with open("aws_cookies_deepseek.json") as f:
+        with open(cookie_file_path()) as f:
             c = json.load(f)
         exp = c.get("expiry")
         cookies_valid = bool(exp and exp > time.time())
