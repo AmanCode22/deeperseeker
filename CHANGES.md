@@ -101,3 +101,75 @@ fresh chat with compacted, token-capped history → single clean retry.
   prompt dedup/capping, tariff values, preflight/replay streaming, empty
   response detection, mocked `handle_chat` recovery + 429 path, tool-parser
   regressions.
+
+## 5. FOLLOW-UP BUG — Server freezes after many chats / cookies vanish across restarts (fixed)
+
+Reported: after enough chats the server stopped responding to **any** request
+(even brand-new chats), and after a mid-session restart the DeepSeek cookie
+file was missing from the data volume and never regenerated.
+
+Root causes found (all fixed):
+
+**a) Cookie file silently escaped the persistent volume** (`functions.py` +
+`Dockerfile`): the Docker image bridges `aws_cookies_deepseek.json` into
+`/app/data` via a **symlink**, but `_generate_cookies()` ends with
+`os.replace(tmp, "aws_cookies_deepseek.json")` — POSIX `rename()` does **not**
+follow symlinks, so the very first cookie write replaced the *symlink itself*
+with a plain file in the ephemeral container layer. The volume never received
+the cookie; any container recreation lost it permanently (SQLite writes
+*through* the symlink, which is why `deeperseeker.db` survived).
+→ Cookie path is now resolved (`cookie_file_path()`: `DEEPSEEKER_COOKIE_PATH`
+env > symlink target > directory of the real DB file) and the atomic
+`os.replace()` targets the **resolved** path, so the symlink is preserved.
+`Dockerfile` additionally sets `DB_PATH` / `DEEPSEEKER_COOKIE_PATH` to point
+straight into `/app/data`, making the symlinks unnecessary.
+
+**b) One failed cookie generation froze the whole server** (`functions.py`):
+`get_cookies()` serialized **every** request on `_cookie_lock` and each queued
+request re-attempted a full non-headless Chromium launch; when generation kept
+failing (missing/expired WAF token, display problems), requests queued
+indefinitely — the "server stops responding" symptom.
+→ `get_cookies()` now: double-checks under the lock; bounds each generation
+cycle (`DEEPSEEKER_COOKIE_TIMEOUT`, default 120s) and attempts
+(`DEEPSEEKER_COOKIE_ATTEMPTS`, default 2); arms a fail-fast cooldown
+(`DEEPSEEKER_COOKIE_COOLDOWN`, default 20s) so further requests error in
+milliseconds instead of queueing; falls back to a **stale** cookie file rather
+than hard-failing; raises a clear `CookieGenerationError` (mapped to HTTP 503
+by `_api_error_response`) when nothing is available.
+
+**c) Zero observability** (`functions.py` / `app.py`): cookie generation,
+rate-limit events and upstream failures failed silently, so nothing appeared
+in `docker logs`.
+→ Added `deeperseeker.functions` logging (generation start/success/failure
+with cause, cookie save path + expiry, token rate-limiting, session pruning,
+upstream non-200 responses, recovery failures) and `basicConfig` in `app.py`.
+
+**d) `_sig_locks` grew forever** (`app.py`): one `asyncio.Lock` per unique
+conversation signature, never evicted — a real memory leak after many chats.
+→ Capped at `DEEPSEEKER_MAX_SIG_LOCKS` (default 4096) with locked-entry-aware
+eviction of the oldest entries.
+
+**e) Sessions table grew forever** (`functions.py`): 2 rows stored per request
+with no cleanup; on volume-limited deployments a full disk also freezes all
+requests. → `prune_sessions()` keeps the newest `DEEPSEEKER_MAX_SESSIONS`
+(default 20000) rows, runs every `DEEPSEEKER_PRUNE_EVERY` (500) saves and once
+at startup; stale `session_map` rows older than 7 days are removed too.
+
+**f) `get_session()` double-init race** (`functions.py`): two concurrent
+first requests could create two `aiohttp.ClientSession`s (one leaked).
+→ Now guarded by a lock and re-checked for closed sessions.
+
+Net effect: cookies persist across restarts/recreations, a failing cookie
+regeneration degrades to fast, well-described 503s (and auto-retries) instead
+of a full-server freeze, and memory/DB growth is bounded.
+
+## 6. Verification (follow-up round)
+
+- `py_compile` clean on all modified files.
+- `tests/test_local_fixes.py` 5/5 (PR #11 regression suite).
+- 15/15 integration sanity checks (previous fix round).
+- 16/16 stability checks: symlink-safe cookie write (symlink survives atomic
+  replace, file lands in the volume), regeneration on missing file, fail-fast
+  cooldown with root-cause message, stale-cookie fallback, shared-session
+  double-init race, lock-cap eviction (held locks preserved), session pruning
+  to cap with oldest-first eviction.

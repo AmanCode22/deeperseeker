@@ -39,6 +39,13 @@ RUN mkdir -p /app/data && \
 
 EXPOSE 4000
 
+# Persist both state files DIRECTLY in the mounted volume (/app/data). The old
+# symlink bridge broke: os.replace() on the cookie path did not follow the
+# symlink and wrote into the container layer instead, so cookies were lost on
+# every container recreation. Explicit env paths avoid the symlink entirely.
+ENV DB_PATH=/app/data/deeperseeker.db
+ENV DEEPSEEKER_COOKIE_PATH=/app/data/aws_cookies_deepseek.json
+
 ENV HOST=0.0.0.0
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD curl -sf http://localhost:4000/health || exit 1
