@@ -14,38 +14,12 @@ from datetime import datetime, timezone
 import aiohttp
 import deepseek_tokenizer
 import wasmtime
-from playwright.async_api import async_playwright
 
 logger = logging.getLogger("deeperseeker.functions")
 
 wasm_path = "wasm/deepseek_pow_solver.wasm"
 _session = None
 _db = os.getenv("DB_PATH", "deeperseeker.db")
-
-
-def cookie_file_path():
-    """Resolve where the DeepSeek cookie file lives.
-
-    Order: DEEPSEEKER_COOKIE_PATH env > the target of a legacy Docker symlink
-    > next to the real DB file (which honors DB_PATH) > CWD. Writing goes to
-    the RESOLVED path so os.replace() can never destroy a symlink that bridges
-    the file into the persistent data volume.
-    """
-    p = os.getenv("DEEPSEEKER_COOKIE_PATH")
-    if p:
-        return p
-    p = "aws_cookies_deepseek.json"
-    try:
-        if os.path.islink(p):
-            target = os.path.realpath(p)
-            if target:
-                return target
-    except Exception:
-        pass
-    d = os.path.dirname(os.path.abspath(_db))
-    if d and os.path.abspath(d) != os.path.abspath(os.getcwd()):
-        return os.path.join(d, "aws_cookies_deepseek.json")
-    return p
 
 try:
     _TZ_OFFSET = str(int(datetime.now().astimezone().utcoffset().total_seconds()))
@@ -109,23 +83,16 @@ async def get_session():
 def get_headers(auth_token, pow=None):
     headers = {
         "accept": "*/*",
-        "accept-language": "en-GB,en-US;q=0.9,en;q=0.8",
+        "accept-language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
         "content-type": "application/json",
         "origin": "https://chat.deepseek.com",
-        "priority": "u=1, i",
         "referer": "https://chat.deepseek.com/",
-        "sec-ch-ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Linux"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+        "user-agent": "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 7)",
+        "x-client-platform": "android",
+        "x-client-version": "2.4.5",
+        "x-client-locale": "fr_FR",
         "x-client-bundle-id": "com.deepseek.chat",
-        "x-client-locale": "en_US",
-        "x-client-platform": "web",
         "x-client-timezone-offset": _TZ_OFFSET,
-        "x-client-version": "2.3.0",
     }
     if auth_token:
         headers["authorization"] = f"Bearer {auth_token}"
@@ -133,140 +100,6 @@ def get_headers(auth_token, pow=None):
         headers["x-ds-pow-response"] = pow
     return headers
 
-
-_cookie_lock = asyncio.Lock()
-
-# Tunables for cookie generation resilience (the previous failure mode: one
-# failed generation serialized EVERY request behind _cookie_lock forever, so
-# the whole server stopped responding — even to brand-new chats).
-COOKIE_REGEN_ATTEMPTS = int(os.getenv("DEEPSEEKER_COOKIE_ATTEMPTS", "2"))
-COOKIE_REGEN_TIMEOUT = float(os.getenv("DEEPSEEKER_COOKIE_TIMEOUT", "120"))
-COOKIE_FAIL_COOLDOWN = float(os.getenv("DEEPSEEKER_COOKIE_COOLDOWN", "20"))
-
-_cookie_fail = {"until": 0.0, "error": ""}
-
-
-class CookieGenerationError(Exception):
-    """Raised when the DeepSeek WAF cookie file cannot be produced."""
-
-
-def _read_cookie_file():
-    """Return valid (unexpired) cookies, or None."""
-    try:
-        with open(cookie_file_path()) as f:
-            c = json.load(f)
-        if c.get("expiry") is not None and c["expiry"] > time.time():
-            return c["cookie"]
-    except Exception:
-        pass
-    return None
-
-
-def _read_stale_cookie_file():
-    """Return cookies even if expired (last-resort fallback)."""
-    try:
-        with open(cookie_file_path()) as f:
-            c = json.load(f)
-        return c.get("cookie") or None
-    except Exception:
-        return None
-
-
-async def get_cookies():
-    cookies = _read_cookie_file()
-    if cookies:
-        return cookies
-
-    def _cooldown_error():
-        return CookieGenerationError(
-            _cookie_fail["error"] + " (cooling down; will retry automatically — try again shortly)"
-        )
-
-    # Fail fast while a regeneration attempt recently failed, instead of
-    # queueing every request behind a full Chromium launch that will fail again.
-    if time.time() < _cookie_fail["until"]:
-        stale = _read_stale_cookie_file()
-        if stale:
-            return stale
-        raise _cooldown_error()
-    async with _cookie_lock:
-        cookies = _read_cookie_file()
-        if cookies:
-            return cookies
-        if time.time() < _cookie_fail["until"]:
-            stale = _read_stale_cookie_file()
-            if stale:
-                return stale
-            raise _cooldown_error()
-        last_err = None
-        for attempt in range(1, COOKIE_REGEN_ATTEMPTS + 1):
-            try:
-                logger.info("Generating DeepSeek cookies (attempt %d/%d)...", attempt, COOKIE_REGEN_ATTEMPTS)
-                await asyncio.wait_for(_generate_cookies(), timeout=COOKIE_REGEN_TIMEOUT)
-                cookies = _read_cookie_file()
-                if cookies:
-                    _cookie_fail["until"] = 0.0
-                    _cookie_fail["error"] = ""
-                    return cookies
-                last_err = CookieGenerationError("cookie file missing/invalid after generation")
-            except Exception as e:
-                last_err = e
-                logger.warning("DeepSeek cookie generation attempt %d/%d failed: %s", attempt, COOKIE_REGEN_ATTEMPTS, e)
-            if attempt < COOKIE_REGEN_ATTEMPTS:
-                await asyncio.sleep(min(5 * attempt, 10))
-        _cookie_fail["until"] = time.time() + COOKIE_FAIL_COOLDOWN
-        _cookie_fail["error"] = f"Could not generate DeepSeek cookies: {last_err}"
-        logger.error("%s", _cookie_fail["error"])
-        # Last resort: stale cookies may still be accepted upstream — better
-        # than hard-failing every request.
-        stale = _read_stale_cookie_file()
-        if stale:
-            logger.warning("Serving STALE DeepSeek cookies after generation failure (upstream may reject them)")
-            return stale
-        raise CookieGenerationError(_cookie_fail["error"])
-
-
-async def _generate_cookies():
-    launch_kwargs = {"headless": False}
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        launch_kwargs["args"] = ["--no-sandbox"]
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(**launch_kwargs)
-        try:
-            context = await browser.new_context()
-            page = await context.new_page()
-            await page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_selector("body", timeout=30000)
-            try:
-                await page.wait_for_url("**/sign_in*", timeout=30000)
-            except Exception:
-                pass
-            cookies = await context.cookies()
-        finally:
-            await browser.close()
-    final_cookies = {}
-    expiry = None
-    for i in cookies:
-        if i.get("name") == "aws-waf-token":
-            expiry = i.get("expires")
-        final_cookies[i["name"]] = i["value"]
-    final_cookies["ds_cookie_preference"] = "%257B%2522level%2522%253A%2522all%2522%257D"
-    if not expiry or expiry < 0:
-        expiry = time.time() + 1800
-    # Resolve the REAL storage path first: the Docker image bridges the cookie
-    # file into the persistent volume via a symlink at /app, and os.replace()
-    # (rename) does NOT follow symlinks — the old code replaced the symlink
-    # itself with a plain file in the container layer, so cookies were lost on
-    # every container recreation. Write the tmp file next to the target and
-    # atomically replace the resolved path instead.
-    target = cookie_file_path()
-    target_dir = os.path.dirname(os.path.abspath(target))
-    os.makedirs(target_dir, exist_ok=True)
-    tmp_path = os.path.join(target_dir, os.path.basename(target) + ".tmp")
-    with open(tmp_path, "w") as f:
-        f.write(json.dumps({"cookie": final_cookies, "expiry": expiry}))
-    os.replace(tmp_path, target)
-    logger.info("DeepSeek cookies saved to %s (expires %s)", target, datetime.fromtimestamp(expiry) if expiry else "n/a")
 
 
 def get_auth_token():
@@ -839,11 +672,10 @@ def _find_pow_answer_blocking(challange_data):
 
 async def create_challange_pow(target_path, auth_token):
     headers = get_headers(auth_token)
-    cookie = await get_cookies()
     session = await get_session()
     async with session.post(
         "https://chat.deepseek.com/api/v0/chat/create_pow_challenge",
-        cookies=cookie, headers=headers, json={"target_path": target_path},
+        headers=headers, json={"target_path": target_path},
         timeout=aiohttp.ClientTimeout(total=20),
     ) as response:
         data = await response.json()
@@ -881,10 +713,9 @@ async def solve_create_pow(target_path, auth_token):
 
 async def create_new_chat(auth_token):
     headers = get_headers(auth_token)
-    cookie = await get_cookies()
     session = await get_session()
     url = "https://chat.deepseek.com/api/v0/chat_session/create"
-    async with session.post(url, cookies=cookie, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
+    async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
         data = await response.json()
     return data["data"]["biz_data"]["chat_session"]["id"]
 
@@ -892,7 +723,6 @@ async def create_new_chat(auth_token):
 async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, model_type=None, file_ids_=None):
     if file_ids_ is None:
         file_ids_ = []
-    cookie = await get_cookies()
     session = await get_session()
     if parent_message_id == 0:
         parent_message_id = None
@@ -904,7 +734,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
         for i in file_ids_:
             async with session.post(
                 "https://chat.deepseek.com/api/v0/file/fork_file_task",
-                headers=headers, json={"file_id": i, "to_model_type": "vision"}, cookies=cookie,
+                headers=headers, json={"file_id": i, "to_model_type": "vision"},
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 resp_json = await resp.json()
@@ -915,7 +745,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 await asyncio.sleep(0.3)
                 async with session.get(
                     "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
-                    headers=headers, cookies=cookie, timeout=aiohttp.ClientTimeout(total=30),
+                    headers=headers, timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     resp_json = await resp.json()
                 status = resp_json["data"]["biz_data"]["files"][0]["status"]
@@ -940,7 +770,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
 
     think_open = False
     got_output = False
-    async with session.post(url, cookies=cookie, headers=headers, json=json_data) as r:
+    async with session.post(url, headers=headers, json=json_data) as r:
         if r.status != 200:
             error_text = await r.text()
             logger.warning("DeepSeek completion HTTP %d for chat %s: %s", r.status, chat_id, error_text[:300])
@@ -1020,7 +850,6 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):
-    cookie = await get_cookies()
     session = await get_session()
     url = "https://chat.deepseek.com/api/v0/file/upload_file"
     file_size = len(file_bytes)
@@ -1040,7 +869,7 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         "content-type": f"multipart/form-data; boundary={boundary.decode('utf-8')}",
         "x-file-size": str(file_size),
     })
-    async with session.post(url, data=reconstructed_body, cookies=cookie, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as response:
+    async with session.post(url, data=reconstructed_body, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as response:
         resp_json = await response.json()
     file_id = resp_json["data"]["biz_data"]["id"]
     yield ("uploaded", file_id)
@@ -1053,7 +882,7 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         await asyncio.sleep(0.3)
         async with session.get(
             "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
-            headers=headers, cookies=cookie, timeout=aiohttp.ClientTimeout(total=30),
+            headers=headers, timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             js_data = (await resp.json())["data"]["biz_data"]["files"][0]
         status = js_data["status"]
@@ -1070,12 +899,11 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
 
 
 async def get_file_content(auth_token, file_id):
-    cookie = await get_cookies()
     session = await get_session()
     headers = get_headers(auth_token)
     async with session.get(
         "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
-        headers=headers, cookies=cookie, timeout=aiohttp.ClientTimeout(total=30),
+        headers=headers, timeout=aiohttp.ClientTimeout(total=30),
     ) as resp:
         resp_json = await resp.json()
     js_data = resp_json["data"]["biz_data"]["files"][0]
@@ -1085,7 +913,7 @@ async def get_file_content(auth_token, file_id):
         await asyncio.sleep(0.5)
         async with session.get(
             "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
-            headers=headers, cookies=cookie, timeout=aiohttp.ClientTimeout(total=30),
+            headers=headers, timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             js_data = (await resp.json())["data"]["biz_data"]["files"][0]
     if not js_data.get("signed_path"):

@@ -31,8 +31,6 @@ security = HTTPBasic()
 
 
 from functions import (
-    CookieGenerationError,
-    cookie_file_path,
     add_token,
     count_tokens,
     create_new_chat,
@@ -134,8 +132,6 @@ def check_key(request: Request):
 def _api_error_response(e, is_anthropic=False):
     m = re.match(r"HTTP (\d{3}):", str(e))
     code = int(m.group(1)) if m else 502
-    if isinstance(e, CookieGenerationError):
-        code = 503  # WAF cookies cannot be produced right now — upstream unreachable, not a client error
     if code < 400 or code > 599:
         code = 502
     if is_anthropic:
@@ -1204,19 +1200,10 @@ async def root(request: Request):
 @app.get("/health")
 async def health(request: Request):
     active = sum(1 for t in get_tokens() if t["status"] == "ACTIVE")
-    cookies_valid = False
-    try:
-        with open(cookie_file_path()) as f:
-            c = json.load(f)
-        exp = c.get("expiry")
-        cookies_valid = bool(exp and exp > time.time())
-    except Exception:
-        cookies_valid = False
-    ok = active > 0 and cookies_valid
+    ok = active > 0
     data = {"status": "ok" if ok else "degraded"}
     if check_key(request):
         data["active_tokens"] = active
-        data["cookies_valid"] = cookies_valid
     return JSONResponse(data, status_code=200 if ok else 503)
 
 
