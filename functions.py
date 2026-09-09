@@ -83,14 +83,14 @@ async def get_session():
 def get_headers(auth_token, pow=None):
     headers = {
         "accept": "*/*",
-        "accept-language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "accept-language": "en-US,en;q=0.9",
         "content-type": "application/json",
         "origin": "https://chat.deepseek.com",
         "referer": "https://chat.deepseek.com/",
         "user-agent": "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 7)",
         "x-client-platform": "android",
         "x-client-version": "2.4.5",
-        "x-client-locale": "fr_FR",
+        "x-client-locale": "en_US",
         "x-client-bundle-id": "com.deepseek.chat",
         "x-client-timezone-offset": _TZ_OFFSET,
     }
