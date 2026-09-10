@@ -14,12 +14,41 @@ from datetime import datetime, timezone
 import aiohttp
 import deepseek_tokenizer
 import wasmtime
+try:
+    from playwright.async_api import async_playwright
+except ImportError:
+    async_playwright = None
 
 logger = logging.getLogger("deeperseeker.functions")
 
 wasm_path = "wasm/deepseek_pow_solver.wasm"
 _session = None
 _db = os.getenv("DB_PATH", "deeperseeker.db")
+
+
+def cookie_file_path():
+    """Resolve where the DeepSeek cookie file lives.
+
+    Order: DEEPSEEKER_COOKIE_PATH env > the target of a legacy Docker symlink
+    > next to the real DB file (which honors DB_PATH) > CWD. Writing goes to
+    the RESOLVED path so os.replace() can never destroy a symlink that bridges
+    the file into the persistent data volume.
+    """
+    p = os.getenv("DEEPSEEKER_COOKIE_PATH")
+    if p:
+        return p
+    p = "aws_cookies_deepseek.json"
+    try:
+        if os.path.islink(p):
+            target = os.path.realpath(p)
+            if target:
+                return target
+    except Exception:
+        pass
+    d = os.path.dirname(os.path.abspath(_db))
+    if d and os.path.abspath(d) != os.path.abspath(os.getcwd()):
+        return os.path.join(d, "aws_cookies_deepseek.json")
+    return p
 
 try:
     _TZ_OFFSET = str(int(datetime.now().astimezone().utcoffset().total_seconds()))
@@ -100,6 +129,138 @@ def get_headers(auth_token, pow=None):
         headers["x-ds-pow-response"] = pow
     return headers
 
+
+# ==============================================================================
+# BACKUP WAF COOKIE GENERATION (DEPRECATED IN FAVOR OF ANDROID CLIENT HEADERS)
+#
+# DeepSeek's backend does not enforce AWS WAF on requests using Android client
+# headers. The Playwright/Chromium cookie generation below is retained as a backup
+# so that if DeepSeek ever tightens WAF rules in the future, it can easily be
+# re-enabled simply by uncommenting cookies=cookie in API calls.
+# ==============================================================================
+
+_cookie_lock = asyncio.Lock()
+
+COOKIE_REGEN_ATTEMPTS = int(os.getenv("DEEPSEEKER_COOKIE_ATTEMPTS", "2"))
+COOKIE_REGEN_TIMEOUT = float(os.getenv("DEEPSEEKER_COOKIE_TIMEOUT", "120"))
+COOKIE_FAIL_COOLDOWN = float(os.getenv("DEEPSEEKER_COOKIE_COOLDOWN", "20"))
+
+_cookie_fail = {"until": 0.0, "error": ""}
+
+
+class CookieGenerationError(Exception):
+    """Raised when the DeepSeek WAF cookie file cannot be produced."""
+
+
+def _read_cookie_file():
+    """Return valid (unexpired) cookies, or None."""
+    try:
+        with open(cookie_file_path()) as f:
+            c = json.load(f)
+        if c.get("expiry") is not None and c["expiry"] > time.time():
+            return c["cookie"]
+    except Exception:
+        pass
+    return None
+
+
+def _read_stale_cookie_file():
+    """Return cookies even if expired (last-resort fallback)."""
+    try:
+        with open(cookie_file_path()) as f:
+            c = json.load(f)
+        return c.get("cookie") or None
+    except Exception:
+        return None
+
+
+async def get_cookies():
+    cookies = _read_cookie_file()
+    if cookies:
+        return cookies
+
+    def _cooldown_error():
+        return CookieGenerationError(
+            _cookie_fail["error"] + " (cooling down; will retry automatically — try again shortly)"
+        )
+
+    if time.time() < _cookie_fail["until"]:
+        stale = _read_stale_cookie_file()
+        if stale:
+            return stale
+        raise _cooldown_error()
+    async with _cookie_lock:
+        cookies = _read_cookie_file()
+        if cookies:
+            return cookies
+        if time.time() < _cookie_fail["until"]:
+            stale = _read_stale_cookie_file()
+            if stale:
+                return stale
+            raise _cooldown_error()
+        last_err = None
+        for attempt in range(1, COOKIE_REGEN_ATTEMPTS + 1):
+            try:
+                logger.info("Generating DeepSeek cookies (attempt %d/%d)...", attempt, COOKIE_REGEN_ATTEMPTS)
+                await asyncio.wait_for(_generate_cookies(), timeout=COOKIE_REGEN_TIMEOUT)
+                cookies = _read_cookie_file()
+                if cookies:
+                    _cookie_fail["until"] = 0.0
+                    _cookie_fail["error"] = ""
+                    return cookies
+                last_err = CookieGenerationError("cookie file missing/invalid after generation")
+            except Exception as e:
+                last_err = e
+                logger.warning("DeepSeek cookie generation attempt %d/%d failed: %s", attempt, COOKIE_REGEN_ATTEMPTS, e)
+            if attempt < COOKIE_REGEN_ATTEMPTS:
+                await asyncio.sleep(min(5 * attempt, 10))
+        _cookie_fail["until"] = time.time() + COOKIE_FAIL_COOLDOWN
+        _cookie_fail["error"] = f"Could not generate DeepSeek cookies: {last_err}"
+        logger.error("%s", _cookie_fail["error"])
+        stale = _read_stale_cookie_file()
+        if stale:
+            logger.warning("Serving STALE DeepSeek cookies after generation failure (upstream may reject them)")
+            return stale
+        raise CookieGenerationError(_cookie_fail["error"])
+
+
+async def _generate_cookies():
+    if async_playwright is None:
+        raise CookieGenerationError("playwright is not installed")
+    launch_kwargs = {"headless": False}
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        launch_kwargs["args"] = ["--no-sandbox"]
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(**launch_kwargs)
+        try:
+            context = await browser.new_context()
+            page = await context.new_page()
+            await page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_selector("body", timeout=30000)
+            try:
+                await page.wait_for_url("**/sign_in*", timeout=30000)
+            except Exception:
+                pass
+            cookies = await context.cookies()
+        finally:
+            await browser.close()
+    final_cookies = {}
+    expiry = None
+    for i in cookies:
+        if i.get("name") == "aws-waf-token":
+            expiry = i.get("expires")
+        final_cookies[i["name"]] = i["value"]
+    final_cookies["ds_cookie_preference"] = "%257B%2522level%2522%253A%2522all%2522%257D"
+    if not expiry or expiry < 0:
+        expiry = time.time() + 1800
+    target = cookie_file_path()
+    target_dir = os.path.dirname(os.path.abspath(target))
+    os.makedirs(target_dir, exist_ok=True)
+    tmp_path = os.path.join(target_dir, os.path.basename(target) + ".tmp")
+    with open(tmp_path, "w") as f:
+        f.write(json.dumps({"cookie": final_cookies, "expiry": expiry}))
+    os.replace(tmp_path, target)
+    logger.info("DeepSeek cookies saved to %s (expires %s)", target, datetime.fromtimestamp(expiry) if expiry else "n/a")
 
 
 def get_auth_token():
@@ -672,10 +833,13 @@ def _find_pow_answer_blocking(challange_data):
 
 async def create_challange_pow(target_path, auth_token):
     headers = get_headers(auth_token)
+    # Backup: WAF cookies not required with Android headers. Kept as fallback:
+    # cookie = await get_cookies()
     session = await get_session()
     async with session.post(
         "https://chat.deepseek.com/api/v0/chat/create_pow_challenge",
         headers=headers, json={"target_path": target_path},
+        # cookies=cookie,  # Backup WAF fallback
         timeout=aiohttp.ClientTimeout(total=20),
     ) as response:
         data = await response.json()
@@ -713,9 +877,15 @@ async def solve_create_pow(target_path, auth_token):
 
 async def create_new_chat(auth_token):
     headers = get_headers(auth_token)
+    # Backup: WAF cookies not required with Android headers. Kept as fallback:
+    # cookie = await get_cookies()
     session = await get_session()
     url = "https://chat.deepseek.com/api/v0/chat_session/create"
-    async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
+    async with session.post(
+        url, headers=headers,
+        # cookies=cookie,  # Backup WAF fallback
+        timeout=aiohttp.ClientTimeout(total=20),
+    ) as response:
         data = await response.json()
     return data["data"]["biz_data"]["chat_session"]["id"]
 
@@ -723,6 +893,8 @@ async def create_new_chat(auth_token):
 async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, model_type=None, file_ids_=None):
     if file_ids_ is None:
         file_ids_ = []
+    # Backup: WAF cookies not required with Android headers. Kept as fallback:
+    # cookie = await get_cookies()
     session = await get_session()
     if parent_message_id == 0:
         parent_message_id = None
@@ -735,6 +907,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
             async with session.post(
                 "https://chat.deepseek.com/api/v0/file/fork_file_task",
                 headers=headers, json={"file_id": i, "to_model_type": "vision"},
+                # cookies=cookie,  # Backup WAF fallback
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 resp_json = await resp.json()
@@ -745,7 +918,9 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 await asyncio.sleep(0.3)
                 async with session.get(
                     "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
-                    headers=headers, timeout=aiohttp.ClientTimeout(total=30),
+                    headers=headers,
+                    # cookies=cookie,  # Backup WAF fallback
+                    timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     resp_json = await resp.json()
                 status = resp_json["data"]["biz_data"]["files"][0]["status"]
@@ -770,7 +945,10 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
 
     think_open = False
     got_output = False
-    async with session.post(url, headers=headers, json=json_data) as r:
+    async with session.post(
+        url, headers=headers, json=json_data,
+        # cookies=cookie,  # Backup WAF fallback
+    ) as r:
         if r.status != 200:
             error_text = await r.text()
             logger.warning("DeepSeek completion HTTP %d for chat %s: %s", r.status, chat_id, error_text[:300])
@@ -850,6 +1028,8 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):
+    # Backup: WAF cookies not required with Android headers. Kept as fallback:
+    # cookie = await get_cookies()
     session = await get_session()
     url = "https://chat.deepseek.com/api/v0/file/upload_file"
     file_size = len(file_bytes)
@@ -869,7 +1049,11 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         "content-type": f"multipart/form-data; boundary={boundary.decode('utf-8')}",
         "x-file-size": str(file_size),
     })
-    async with session.post(url, data=reconstructed_body, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as response:
+    async with session.post(
+        url, data=reconstructed_body, headers=headers,
+        # cookies=cookie,  # Backup WAF fallback
+        timeout=aiohttp.ClientTimeout(total=120),
+    ) as response:
         resp_json = await response.json()
     file_id = resp_json["data"]["biz_data"]["id"]
     yield ("uploaded", file_id)
@@ -882,7 +1066,9 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         await asyncio.sleep(0.3)
         async with session.get(
             "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
-            headers=headers, timeout=aiohttp.ClientTimeout(total=30),
+            headers=headers,
+            # cookies=cookie,  # Backup WAF fallback
+            timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             js_data = (await resp.json())["data"]["biz_data"]["files"][0]
         status = js_data["status"]
@@ -899,11 +1085,15 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
 
 
 async def get_file_content(auth_token, file_id):
+    # Backup: WAF cookies not required with Android headers. Kept as fallback:
+    # cookie = await get_cookies()
     session = await get_session()
     headers = get_headers(auth_token)
     async with session.get(
         "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
-        headers=headers, timeout=aiohttp.ClientTimeout(total=30),
+        headers=headers,
+        # cookies=cookie,  # Backup WAF fallback
+        timeout=aiohttp.ClientTimeout(total=30),
     ) as resp:
         resp_json = await resp.json()
     js_data = resp_json["data"]["biz_data"]["files"][0]
@@ -913,7 +1103,9 @@ async def get_file_content(auth_token, file_id):
         await asyncio.sleep(0.5)
         async with session.get(
             "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
-            headers=headers, timeout=aiohttp.ClientTimeout(total=30),
+            headers=headers,
+            # cookies=cookie,  # Backup WAF fallback
+            timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             js_data = (await resp.json())["data"]["biz_data"]["files"][0]
     if not js_data.get("signed_path"):

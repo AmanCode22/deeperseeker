@@ -27,6 +27,8 @@ cp .env.example .env
 python3 app.py
 ```
 
+> **Note:** Playwright and Chromium are deprecated and kept as backup (DeepSeek does not enforce AWS WAF on requests using Android client headers). You no longer need to run `playwright install chromium` or `xvfb-run` unless reverting to the backup cookie mechanism.
+
 ### Docker / Podman (Podman recommended for rootless execution)
 
 Suggested in issue [#3](https://github.com/AmanCode22/deeperseeker/issues/3)

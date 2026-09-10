@@ -1,4 +1,5 @@
 wasmtime
+playwright
 aiohttp
 uvicorn
 fastapi
