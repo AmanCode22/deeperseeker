@@ -423,24 +423,23 @@ def delete_sessions_for_chat(token_id, session_id):
     conn.close()
 
 
-# Flat peak-hour rates (per 1M tokens) per https://api-docs.deepseek.com/quick_start/pricing
+# DeepSeek now serves a single model (v4.1flash) as the website default. The
+# web API uses the website default when model_type is null, so no explicit
+# value is sent. If DeepSeek ever exposes an explicit model_type enum value
+# for v4.1flash, this constant is the single place to set it.
+DEFAULT_MODEL_TYPE = None
+
+# Flat peak-hour rates (per 1M tokens) for the single default model,
+# per https://api-docs.deepseek.com/quick_start/pricing
 DEEPSEEK_TARIFFS = {
-    "deepseek-v4-flash": {
+    "deepseek-v4.1-flash": {
         "cache_miss_input": 0.44,
         "output_generation": 1.32,
-    },
-    "deepseek-v4-flash-exp": {
-        "cache_miss_input": 0.44,
-        "output_generation": 1.32,
-    },
-    "deepseek-v4-pro": {
-        "cache_miss_input": 1.32,
-        "output_generation": 3.96,
     },
 }
 
 
-def count_tokens(text, model="deepseek-v4-flash"):
+def count_tokens(text, model="deepseek-v4.1-flash"):
     return len(deepseek_tokenizer.ds_token.encode(text))
 
 
@@ -890,51 +889,20 @@ async def create_new_chat(auth_token):
     return data["data"]["biz_data"]["chat_session"]["id"]
 
 
-async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, model_type=None, file_ids_=None):
-    if file_ids_ is None:
-        file_ids_ = []
+async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None):
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
     session = await get_session()
     if parent_message_id == 0:
         parent_message_id = None
-    if model_type == "expert":
-        file_ids = list(file_ids_)
-    elif model_type == "vision" and file_ids_:
-        headers = get_headers(auth_token)
-        file_ids = []
-        for i in file_ids_:
-            async with session.post(
-                "https://chat.deepseek.com/api/v0/file/fork_file_task",
-                headers=headers, json={"file_id": i, "to_model_type": "vision"},
-                # cookies=cookie,  # Backup WAF fallback
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                resp_json = await resp.json()
-            status = resp_json["data"]["biz_data"]["status"]
-            file_id = resp_json["data"]["biz_data"]["id"]
-            deadline = time.time() + 300
-            while status in ["PENDING", "PARSING"] and time.time() < deadline:
-                await asyncio.sleep(0.3)
-                async with session.get(
-                    "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
-                    headers=headers,
-                    # cookies=cookie,  # Backup WAF fallback
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    resp_json = await resp.json()
-                status = resp_json["data"]["biz_data"]["files"][0]["status"]
-            if status == "SUCCESS":
-                file_ids.append(file_id)
-    else:
-        file_ids = file_ids_
+    file_ids = file_ids_ or []
 
     url = "https://chat.deepseek.com/api/v0/chat/completion"
     headers = get_headers(auth_token, await solve_create_pow("/api/v0/chat/completion", auth_token))
     json_data = {
         "chat_session_id": chat_id,
         "parent_message_id": parent_message_id,
-        "model_type": model_type,
+        "model_type": DEFAULT_MODEL_TYPE,
         "prompt": message,
         "ref_file_ids": file_ids,
         "thinking_enabled": thinking,
@@ -1072,7 +1040,7 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         ) as resp:
             js_data = (await resp.json())["data"]["biz_data"]["files"][0]
         status = js_data["status"]
-    if status == "SUCCESS" or (status == "CONTENT_EMPTY" and str(file_content_type).startswith("image/")):
+    if status == "SUCCESS":
         tp_data = datetime.fromtimestamp(js_data["updated_at"], timezone.utc)
         yield ("success", {
             "file_id": file_id,

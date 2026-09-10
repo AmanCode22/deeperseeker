@@ -5,10 +5,8 @@ import ipaddress
 import json
 import mimetypes
 import os
-import random
 import re
 import socket
-import string
 import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -92,6 +90,8 @@ def _b64(data):
 
 
 async def extract_and_upload_files(messages, auth_token, last_user_only=False):
+    # v4.1flash is vision-capable itself, so image parts are uploaded and
+    # referenced directly — no vision file forking (fork_file_task removed).
     result_fileids = []
     scan = messages
     if last_user_only:

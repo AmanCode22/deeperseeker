@@ -9,7 +9,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import API_KEY, convert_anthropic_messages
+from app import API_KEY, SINGLE_MODEL, convert_anthropic_messages, resolve_model
 from functions import parse_tools
 from plugin_helper import build_prompt, generate_signature_sync
 
@@ -60,7 +60,7 @@ def test_signature_matches_server_reconstruction():
         ]},
     ]
     converted = convert_anthropic_messages(client_msgs)
-    assert generate_signature_sync(server_msgs, "expert") == generate_signature_sync(converted, "expert"), \
+    assert generate_signature_sync(server_msgs, "v4.1flash") == generate_signature_sync(converted, "v4.1flash"), \
         "signature cache must hit when the client echoes the assistant tool turn"
 
 
@@ -75,7 +75,7 @@ def test_tool_results_reach_build_prompt():
         ]},
     ]
     converted = convert_anthropic_messages(msgs)
-    prompt = asyncio.run(build_prompt(converted, [], "expert", is_first_message=False))
+    prompt = asyncio.run(build_prompt(converted, [], "v4.1flash", is_first_message=False))
     assert "[TOOL RESULTS]" in prompt, "tool results must appear in the [TOOL RESULTS] section"
     assert "file.txt" in prompt
     assert "[USER]" not in prompt, "the original question must not be re-sent on follow-up turns"
@@ -96,6 +96,13 @@ def test_user_text_after_tool_result_preserved():
     assert out[1]["role"] == "tool"
     assert out[2]["role"] == "user"
     assert out[2]["content"] == "now list the hidden files"
+
+
+def test_single_model_resolution():
+    # DeepSeek now serves only v4.1flash; every requested model name must
+    # normalize to it so legacy clients (instant/expert/vision/claude-*) work.
+    for legacy in ("instant", "expert", "vision", "anthropic/claude-expert", "gpt-4o", "", None):
+        assert resolve_model(legacy) == SINGLE_MODEL == "v4.1flash"
 
 
 def main():
