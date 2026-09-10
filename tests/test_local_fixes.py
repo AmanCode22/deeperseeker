@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import API_KEY, convert_anthropic_messages
-from functions import parse_tools
+from functions import StreamToolParser, parse_tools
 from plugin_helper import build_prompt, generate_signature_sync
 
 
@@ -96,6 +96,75 @@ def test_user_text_after_tool_result_preserved():
     assert out[1]["role"] == "tool"
     assert out[2]["role"] == "user"
     assert out[2]["content"] == "now list the hidden files"
+
+
+def test_dsml_tool_call_extracts_arguments():
+    """DSH/deepseek-harness emits DSML with a space after the ｜ marker, e.g.
+    '<｜｜DSML｜｜ parameter name="command" ...>'. parse_tools must extract the argument."""
+    text = (
+        '<｜｜DSML｜｜calls>'
+        '<｜｜DSML｜｜invoke name="pwsh">'
+        '<｜｜DSML｜｜ parameter name="command" string="true">Get-Location</｜｜DSML｜｜parameter>'
+        '</｜｜DSML｜｜ invoke>'
+        '</｜｜DSML｜｜ calls>'
+    )
+    tools, clean = parse_tools(text)
+    assert len(tools) == 1, f"expected one tool, got {tools}"
+    assert tools[0]["function"]["name"] == "pwsh"
+    args = tools[0]["function"]["arguments"]
+    assert '"Get-Location"' in args, f"arguments lost: {args}"
+    assert clean == "", f"DSML residue left in clean_text: {clean!r}"
+
+
+def test_dsml_multi_tool_arguments():
+    text = (
+        '<｜｜DSML｜｜calls>'
+        '<｜｜DSML｜｜invoke name="pwsh">'
+        '<｜｜DSML｜｜ parameter name="command" string="true">ls</｜｜DSML｜｜ parameter>'
+        '</｜｜DSML｜｜ invoke>'
+        '<｜｜DSML｜｜ invoke name="read">'
+        '<｜｜DSML｜｜ parameter name="file_path" string="true">a.txt</｜｜DSML｜｜ parameter>'
+        '</ invoke>'
+        '</｜｜DSML｜｜ calls>'
+    )
+    tools, clean = parse_tools(text)
+    assert len(tools) == 2
+    assert tools[0]["function"]["name"] == "pwsh"
+    assert '"ls"' in tools[0]["function"]["arguments"]
+    assert tools[1]["function"]["name"] == "read"
+    assert '"a.txt"' in tools[1]["function"]["arguments"]
+    assert clean == ""
+
+
+def test_stream_parser_dsml_across_chunks():
+    """StreamToolParser must recognise DSML entry tags and emit the tool once
+    the outer </｜｜DSML｜｜calls> closes, without leaking tag text."""
+    chunks = [
+        "привет\n\n",
+        "<｜｜DSML｜｜calls>",
+        '<｜｜DSML｜｜invoke name="pwsh">',
+        '<｜｜DSML｜｜ parameter name="command" string="true">ls',
+        '</｜｜DSML｜｜ parameter>',
+        '</ invoke>',
+        '</｜｜DSML｜｜ calls>',
+    ]
+    p = StreamToolParser()
+    text_out = ""
+    tool_calls = []
+    for c in chunks:
+        for item in p.feed(c):
+            if "text" in item:
+                text_out += item["text"]
+            elif "tool" in item:
+                tool_calls.append(item["tool"])
+    for item in p.flush():
+        if "text" in item:
+            text_out += item["text"]
+    assert text_out == "привет\n\n", f"unexpected text residue: {text_out!r}"
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "pwsh"
+    assert '"ls"' in tool_calls[0]["function"]["arguments"]
+    assert "</" not in text_out and "｜｜DSML｜｜" not in text_out
 
 
 def main():

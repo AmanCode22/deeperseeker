@@ -519,7 +519,7 @@ def parse_tools(text):
         return any(s <= pos < e for s, e in fence_spans)
 
     param_names = {"command", "description", "file_path", "content", "path", "prompt", "query", "subject", "old_string", "new_string", "url", "input"}
-    tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_call|invoke|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
+    tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_call|invoke|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
     real_tool_matches = [tm for tm in tool_matches if not fenced(tm.start())]
 
     if real_tool_matches:
@@ -529,7 +529,7 @@ def parse_tools(text):
             end_idx = real_tool_matches[i+1].start() if i + 1 < len(real_tool_matches) else len(text)
             body = text[start_idx:end_idx]
             args = {}
-            p_matches = re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:parameter|tool_call|param|invoke)\s+name=)|$)", body, flags=re.DOTALL | re.IGNORECASE)
+            p_matches = re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)", body, flags=re.DOTALL | re.IGNORECASE)
             for pm in p_matches:
                 p_name = pm.group(1).strip()
                 p_val = pm.group(2).strip()
@@ -554,8 +554,8 @@ def parse_tools(text):
                     tools.append(norm)
 
     if tools:
-        clean_text = re.sub(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_calls?|tool_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_calls?|tool_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
-        clean_text = re.sub(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:invoke|function_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:invoke|function_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        clean_text = re.sub(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|tool_call|calls)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|tool_call|calls)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        clean_text = re.sub(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
     if not tools and "DSML" in text:
         dsml_block_pattern = re.compile(r"<[｜\|]{2}DSML[｜\|]{2}([A-Za-z0-9_]+)>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}\1>|$)", re.DOTALL | re.IGNORECASE)
@@ -699,39 +699,46 @@ def parse_tools(text):
             clean_text = re.sub(json_pattern, "", clean_text, flags=re.DOTALL).strip()
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
-    clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+    clean_text = re.sub(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
     return tools, clean_text
 
 
 class StreamToolParser:
+    _ENTRY_RE = re.compile(
+        r"<[｜\|]{0,2}\s*(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_call|invoke)\b[^>]*>",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _build_end_re(tag_name):
+        return re.compile(
+            r"</[｜\|]{0,2}\s*(?:DSML[｜\|]{0,2})?\s*" + re.escape(tag_name) + r"\s*>",
+            re.IGNORECASE,
+        )
+
     def __init__(self):
         self.buffer = ""
         self.in_tool = False
         self.has_tool = False
         self.json_done = False
+        self._end_re = None
 
     def feed(self, chunk):
         self.buffer += chunk
         results = []
         while True:
             if self.in_tool:
-                end_tags = ["</tool_call>", "</function_call>", "</invoke>", "</tool_calls>"]
-                end_pos = -1
-                end_tag_len = 0
-                for tag in end_tags:
-                    idx = self.buffer.find(tag)
-                    if idx != -1 and (end_pos == -1 or idx < end_pos):
-                        end_pos = idx
-                        end_tag_len = len(tag)
-                if end_pos != -1:
+                m = self._end_re.search(self.buffer)
+                if m:
                     if not self.json_done:
-                        tool_xml = self.buffer[:end_pos + end_tag_len]
-                        parsed, _ = parse_tools(tool_xml)
+                        blob = self.buffer[:m.end()]
+                        parsed, _ = parse_tools(blob)
                         for item in parsed:
                             results.append({"tool": item})
-                    self.buffer = self.buffer[end_pos + end_tag_len:]
+                    self.buffer = self.buffer[m.end():]
                     self.in_tool = False
                     self.json_done = False
+                    self._end_re = None
                     continue
                 brace_idx = self.buffer.find("{")
                 if brace_idx != -1 and not self.json_done:
@@ -748,33 +755,26 @@ class StreamToolParser:
                         pass
                 break
             else:
-                start_tags = ["<tool_call", "<function_call", "<invoke", "<tool_calls"]
-                start_pos = -1
-                for tag in start_tags:
-                    idx = self.buffer.find(tag)
-                    if idx != -1 and (start_pos == -1 or idx < start_pos):
-                        start_pos = idx
-                if start_pos != -1:
-                    if start_pos > 0:
-                        results.append({"text": self.buffer[:start_pos]})
-                    self.buffer = self.buffer[start_pos:]
+                m = self._ENTRY_RE.search(self.buffer)
+                if m:
+                    start = m.start()
+                    if start > 0:
+                        results.append({"text": self.buffer[:start]})
+                    self.buffer = self.buffer[start:]
+                    tag_name = m.group(1).lower()
+                    self._end_re = self._build_end_re(tag_name)
                     self.in_tool = True
                     self.has_tool = True
                     continue
-                hold = 0
-                for tag in start_tags:
-                    for i in range(1, len(tag)):
-                        if self.buffer.endswith(tag[:i]):
-                            hold = max(hold, i)
-                if hold:
-                    text_part = self.buffer[:-hold]
-                    if text_part:
-                        results.append({"text": text_part})
-                    self.buffer = self.buffer[-hold:]
-                else:
-                    if self.buffer:
-                        results.append({"text": self.buffer})
-                    self.buffer = ""
+                last_lt = self.buffer.rfind("<")
+                if last_lt != -1 and ">" not in self.buffer[last_lt:]:
+                    if last_lt > 0:
+                        results.append({"text": self.buffer[:last_lt]})
+                    self.buffer = self.buffer[last_lt:]
+                    break
+                if self.buffer:
+                    results.append({"text": self.buffer})
+                self.buffer = ""
                 break
         return results
 
@@ -783,10 +783,17 @@ class StreamToolParser:
         if self.buffer and not self.in_tool:
             out.append({"text": self.buffer})
         elif self.in_tool:
-            stripped = re.sub(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_call|invoke|function_call|parameter)[^>]*>", "", self.buffer, flags=re.IGNORECASE).strip()
+            stripped = re.sub(
+                r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter)[^>]*>",
+                "",
+                self.buffer,
+                flags=re.IGNORECASE,
+            ).strip()
             if stripped:
                 out.append({"text": stripped})
         self.buffer = ""
+        self.in_tool = False
+        self._end_re = None
         return out
 
 
