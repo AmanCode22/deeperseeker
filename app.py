@@ -1212,7 +1212,9 @@ async def health(request: Request):
         cookies_valid = bool(exp and exp > time.time())
     except Exception:
         cookies_valid = False
-    ok = active > 0 and cookies_valid
+    # WAF cookies are deprecated in favor of Android headers (which do not require cookies).
+    # Token presence determines service readiness; cookie status is kept for backup visibility.
+    ok = active > 0
     data = {"status": "ok" if ok else "degraded"}
     if check_key(request):
         data["active_tokens"] = active

@@ -23,15 +23,11 @@ A kind request: do not spam the server, respect DeepSeek's limits, and use it fo
 python3 -m venv deeperseeker_env
 source deeperseeker_env/bin/activate
 pip install -r requirements.txt
-playwright install chromium
 cp .env.example .env
 python3 app.py
 ```
 
-> **Note:** Cookie generation launches Chromium with `headless=False` (DeepSeek blocks headless browsers). On a server without a display, run through `xvfb`:
-> ```bash
-> xvfb-run -a -s '-screen 0 1280x720x24' python3 app.py
-> ```
+> **Note:** Playwright and Chromium are deprecated and kept as backup (DeepSeek does not enforce AWS WAF on requests using Android client headers). You no longer need to run `playwright install chromium` or `xvfb-run` unless reverting to the backup cookie mechanism.
 
 ### Docker / Podman (Podman recommended for rootless execution)
 
@@ -53,7 +49,7 @@ podman-compose up -d
 # docker compose up -d
 ```
 
-The container runs Chromium under `xvfb-run` automatically. Note: `docker-compose.yml` binds to `127.0.0.1:4000` only (local access) — change the ports mapping if you need to expose it.
+Note: `docker-compose.yml` binds to `127.0.0.1:4000` only (local access) — change the ports mapping if you need to expose it.
 
 Dashboard: `http://localhost:4000/`
 
