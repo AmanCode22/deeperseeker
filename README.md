@@ -88,7 +88,7 @@ cp .env.example .env
   - `POST /v1/messages` (also at `/messages`)
   - `POST /v1/files/upload`
 - **Auth Key**: Configured in `.env` (`DEEPSEEKER_API_KEY`)
-- **Models**: `instant` (flash), `vision` (flash + vision), `expert` (pro) — also exposed as `anthropic/claude-instant`, `anthropic/claude-vision`, `anthropic/claude-expert` aliases for Claude Desktop auto-discovery. If no `model` is sent, requests default to `expert`.
+- **Model**: `v4.1flash` — the single default DeepSeek model (vision-capable: `vision` no longer needs a separate model tier). Every request is served by it, whatever `model` value the client sends (legacy aliases such as `instant`, `expert`, `vision`, and `anthropic/claude-*` are accepted and normalized to `v4.1flash`). Also listed as `anthropic/claude-v4.1flash` for Claude Desktop auto-discovery. If no `model` is sent, requests default to `v4.1flash`.
 
 ## Features
 
@@ -98,21 +98,19 @@ cp .env.example .env
 - **Automatic Rate-Limit Recovery**: Auto-marks tokens `RATE_LIMITED` on HTTP 401/403/429, provisions a new token, transfers full context (including files), and continues seamless chat with a single retry.
 - **Long-Context Resilience**: If the upstream web session fails or returns an empty response (e.g. context overflow), the broken session is discarded and the request is retried once on a fresh session with a compacted, token-capped history injection; unrecoverable upstream errors are returned as proper JSON API errors instead of raw 500s.
 - **Tool Calling & Streaming**: Server-sent events (SSE) streaming with think-tag reassembly across chunk boundaries (no truncation) and multi-format tool-call parsing — DSML XML, `<tool_call>` XML, `<function_call>` blocks, and JSON — into OpenAI/Anthropic tool schemas.
-- **File & Vision Support**: Base64/URL image extraction (with SSRF protection), file upload streaming, and vision-model file forking.
-- **Claude Desktop Compatible**: Rich `/v1/models` capability metadata + `anthropic/claude-*` aliases for automatic client discovery.
+- **File & Vision Support**: Base64/URL image extraction (with SSRF protection) and document upload streaming. Images and documents are referenced directly via `ref_file_ids` — the vision file-forking step (`fork_file_task`) was removed because `v4.1flash` handles vision natively.
+- **Claude Desktop Compatible**: Rich `/v1/models` capability metadata + the `anthropic/claude-v4.1flash` alias for automatic client discovery.
 - **Hardened Dashboard**: Session TTL, brute-force login lockout (5 attempts → 5 min), CSRF origin check.
 
 ## Pricing (per 1M tokens, as of 2026-09-06)
 
-Flat peak-hour rates:
+Flat peak-hour rates for the single default model:
 
 | Model Tier | Input Cost (Cache Miss) | Output Cost |
 |---|---|---|
-| **DeepSeek V4 Flash** (`instant`) | $0.44 | $1.32 |
-| **DeepSeek V4 Flash Exp** (`vision`) | $0.44 | $1.32 |
-| **DeepSeek V4 Pro** (`expert`) | $1.32 | $3.96 |
+| **DeepSeek V4.1 Flash** (`v4.1flash`) | $0.44 | $1.32 |
 
-Model mapping: `instant` → V4 Flash, `vision` → V4 Flash Exp, `expert` → V4 Pro. The `cost` reported in API responses uses these flat rates.
+The `cost` reported in API responses uses these flat rates.
 ## Star History
 
 <a href="https://www.star-history.com/?repos=amancode22%2Fdeeperseeker&type=date&legend=top-left">

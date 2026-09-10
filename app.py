@@ -188,7 +188,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         prompt = await build_prompt(messages, tools or [], model, is_first_message=True)
 
                         file_ids = await extract_and_upload_files(messages, new_tok["token"])
-                        gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, None if model == "instant" else model, file_ids)
+                        gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, file_ids)
                         gen = await _preflight_stream(gen)
                     except Exception as e:
                         logger.exception("Token-rotation recovery failed (chat %s): %s", session_id, e)
@@ -261,7 +261,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
         prompt = await build_prompt(messages, tools or [], model, is_first)
 
-        gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, None if model == "instant" else model, file_ids)
+        gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
         gen = await _preflight_stream(gen)
         if stream:
             if is_anthropic:
@@ -576,8 +576,7 @@ def format_response(text, model, messages, tools=None):
 
     in_tokens = count_tok(_messages_text(messages))
     out_tokens = count_tok(text)
-    tariff_key = "deepseek-v4-pro" if model == "expert" else ("deepseek-v4-flash-exp" if model == "vision" else "deepseek-v4-flash")
-    tariff = DEEPSEEK_TARIFFS[tariff_key]
+    tariff = DEEPSEEK_TARIFFS["deepseek-v4.1-flash"]
     cost = (in_tokens / 1_000_000 * tariff["cache_miss_input"]) + (out_tokens / 1_000_000 * tariff["output_generation"])
 
     msg_dict = {
@@ -779,15 +778,14 @@ def is_thinking_enabled(body, request=None):
     return False
 
 
+# DeepSeek now serves a single model (v4.1flash) as the website default.
+# Every request — whatever model name the client sends, including legacy
+# aliases (instant, expert, vision, anthropic/claude-*) — is served by it.
+SINGLE_MODEL = "v4.1flash"
+
+
 def resolve_model(model_raw):
-    if not model_raw or not isinstance(model_raw, str):
-        return "expert"
-    m = model_raw.lower()
-    if "instant" in m or "haiku" in m or "flash" in m:
-        return "instant"
-    elif "vision" in m:
-        return "vision"
-    return "expert"
+    return SINGLE_MODEL
 
 
 @app.post("/v1/chat/completions")
@@ -796,7 +794,7 @@ async def chat_completions(request: Request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
     body = await request.json()
     messages = body.get("messages", [])
-    model = resolve_model(body.get("model", "expert"))
+    model = resolve_model(body.get("model"))
     thinking = is_thinking_enabled(body, request)
     search = body.get("search", False)
     stream = body.get("stream", False)
@@ -809,7 +807,7 @@ async def openai_responses(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
     body = await request.json()
-    model = resolve_model(body.get("model", "expert"))
+    model = resolve_model(body.get("model"))
     inputs = body.get("input", [])
     if isinstance(inputs, str):
         inputs = [inputs]
@@ -949,7 +947,7 @@ async def anthropic_messages(request: Request):
     system = body.get("system", "")
 
     messages = body.get("messages", [])
-    model = resolve_model(body.get("model", "expert"))
+    model = resolve_model(body.get("model"))
 
     thinking = is_thinking_enabled(body, request)
     stream = body.get("stream", False)
@@ -1011,79 +1009,17 @@ async def list_models(request: Request):
 
     base_models = [
         {
-            "id": "instant",
+            "id": SINGLE_MODEL,
             "object": "model",
             "type": "model",
-            "name": "instant",
-            "display_name": "Instant",
+            "name": SINGLE_MODEL,
+            "display_name": "DeepSeek V4.1 Flash",
             "created": 1785456000,
             "created_at": "2026-07-31T00:00:00Z",
-            "owned_by": "deeperseeker",
-            "capabilities": {
-                "batch": {"supported": True},
-                "structured_outputs": {"supported": True},
-                "thinking": {
-                    "supported": True,
-                    "types": {
-                        "enabled": {"supported": True},
-                        "adaptive": {"supported": True}
-                    }
-                },
-                "effort": {
-                    "supported": True,
-                    "low": {"supported": True},
-                    "medium": {"supported": True}
-                },
-                "context_management": {
-                    "clear_thinking_20251015": {"supported": True},
-                    "compact_20260112": {"supported": True},
-                    "supported": True
-                }
-            }
-        },
-        {
-            "id": "expert",
-            "object": "model",
-            "type": "model",
-            "name": "expert",
-            "display_name": "Expert",
-            "created": 1788134400,
-            "created_at": "2026-08-31T00:00:00Z",
             "owned_by": "deeperseeker",
             "capabilities": {
                 "batch": {"supported": True},
                 "code_execution": {"supported": True},
-                "structured_outputs": {"supported": True},
-                "thinking": {
-                    "supported": True,
-                    "types": {
-                        "enabled": {"supported": True},
-                        "adaptive": {"supported": True}
-                    }
-                },
-                "effort": {
-                    "supported": True,
-                    "low": {"supported": True},
-                    "medium": {"supported": True}
-                },
-                "context_management": {
-                    "clear_thinking_20251015": {"supported": True},
-                    "compact_20260112": {"supported": True},
-                    "supported": True
-                }
-            }
-        },
-        {
-            "id": "vision",
-            "object": "model",
-            "type": "model",
-            "name": "vision",
-            "display_name": "Vision",
-            "created": 1785456000,
-            "created_at": "2026-07-31T00:00:00Z",
-            "owned_by": "deeperseeker",
-            "capabilities": {
-                "batch": {"supported": True},
                 "image_input": {"supported": True},
                 "pdf_input": {"supported": True},
                 "structured_outputs": {"supported": True},
@@ -1108,6 +1044,8 @@ async def list_models(request: Request):
         }
     ]
 
+    # Single model, plus the anthropic/claude-* alias for Claude Desktop
+    # auto-discovery. Both IDs serve the same upstream v4.1flash model.
     claude_aliases = []
     for m in base_models:
         alias = dict(m)
