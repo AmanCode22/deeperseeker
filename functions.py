@@ -696,6 +696,22 @@ def parse_tools(text):
     return tools, clean_text
 
 
+# Family-wide closer pattern for the tool-call wrapper family, including
+# the |/｜-decorated variants that parse_tools accepts. Used by
+# StreamToolParser so a mismatched closer closes the open block instead of
+# hanging until flush(). [FIX 3]
+_TOOL_END_TAG_RE = re.compile(
+    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_calls?|invoke|function_call)>",
+    re.IGNORECASE,
+)
+
+# [FIX 2] Hard bound (chars) on how much text feed() may hold back while the
+# buffer tail still looks like the prefix of a start tag. The longest start
+# tag is 13 chars; 15 leaves headroom so future tag edits cannot reintroduce
+# unbounded buffering on prose like "if x < y".
+_MAX_TAG_HOLD = 15
+
+
 class StreamToolParser:
     def __init__(self):
         self.buffer = ""
@@ -708,21 +724,18 @@ class StreamToolParser:
         results = []
         while True:
             if self.in_tool:
-                end_tags = ["</tool_call>", "</function_call>", "</invoke>", "</tool_calls>"]
-                end_pos = -1
-                end_tag_len = 0
-                for tag in end_tags:
-                    idx = self.buffer.find(tag)
-                    if idx != -1 and (end_pos == -1 or idx < end_pos):
-                        end_pos = idx
-                        end_tag_len = len(tag)
-                if end_pos != -1:
+                # [FIX 3] Family-wide closer fallback: accept ANY wrapper closer
+                # the tool-call family can emit (including |/｜-decorated
+                # variants parse_tools tolerates) instead of hanging an open
+                # block until flush() when the model closes with a wrong tag.
+                end_match = _TOOL_END_TAG_RE.search(self.buffer)
+                if end_match:
                     if not self.json_done:
-                        tool_xml = self.buffer[:end_pos + end_tag_len]
+                        tool_xml = self.buffer[: end_match.end()]
                         parsed, _ = parse_tools(tool_xml)
                         for item in parsed:
                             results.append({"tool": item})
-                    self.buffer = self.buffer[end_pos + end_tag_len:]
+                    self.buffer = self.buffer[end_match.end():]
                     self.in_tool = False
                     self.json_done = False
                     continue
@@ -754,9 +767,13 @@ class StreamToolParser:
                     self.in_tool = True
                     self.has_tool = True
                     continue
+                # [FIX 2] Only hold a tail that is a genuine prefix of a start
+                # tag, and never hold more than _MAX_TAG_HOLD characters, so
+                # prose with a bare '<' (e.g. "if x < y") keeps streaming
+                # instead of buffering until flush().
                 hold = 0
                 for tag in start_tags:
-                    for i in range(1, len(tag)):
+                    for i in range(1, min(len(tag), _MAX_TAG_HOLD + 1)):
                         if self.buffer.endswith(tag[:i]):
                             hold = max(hold, i)
                 if hold:
@@ -776,10 +793,29 @@ class StreamToolParser:
         if self.buffer and not self.in_tool:
             out.append({"text": self.buffer})
         elif self.in_tool:
-            stripped = re.sub(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_call|invoke|function_call|parameter)[^>]*>", "", self.buffer, flags=re.IGNORECASE).strip()
-            if stripped:
-                out.append({"text": stripped})
+            # [FIX 1] Recover the tool before stripping: if the stream was cut
+            # off before the closing tag arrived but the payload itself is
+            # parseable, emit the tool call instead of dumping raw parameter
+            # values into the chat text. Strip only when nothing parses.
+            parsed, _ = parse_tools(self.buffer)
+            if parsed:
+                for item in parsed:
+                    out.append({"tool": item})
+            elif not self.json_done:
+                stripped = re.sub(
+                    r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_call|invoke|function_call|parameter)[^>]*>",
+                    "",
+                    self.buffer,
+                    flags=re.IGNORECASE,
+                ).strip()
+                if stripped:
+                    out.append({"text": stripped})
+            # With json_done set, whatever is left after the consumed JSON
+            # payload is wrapper noise (partial closers / whitespace) and is
+            # dropped instead of leaking into the chat text.
         self.buffer = ""
+        self.in_tool = False
+        self.json_done = False
         return out
 
 
