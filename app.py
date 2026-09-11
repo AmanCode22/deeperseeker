@@ -54,7 +54,19 @@ from functions import (
     upload_file,
     get_file_content,
 )
-from plugin_helper import build_prompt, extract_and_upload_files, generate_signature, generate_signature_sync
+from plugin_helper import (
+    build_prompt,
+    build_summary_request_prompt,
+    build_summary_seed_prompt,
+    context_window_tokens,
+    extract_and_upload_files,
+    generate_signature,
+    generate_signature_sync,
+    max_output_tokens,
+    needs_rollover,
+    strip_summary_tags,
+    MAX_SUMMARY_TOKENS,
+)
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -244,9 +256,30 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                 tok = get_token(token_id)
                 if not tok:
                     return JSONResponse({"error": "Token not found"}, status_code=503)
-                session_id = await create_new_chat(tok["token"])
-                save_session(sig, token_id, session_id, 0)
-                parent_message_id = 0
+
+                # Accumulated-context rollover (issue #22): when the conversation is
+                # nearing the observed remembered-context limit, ask the model for a
+                # handoff summary in the current chat, then continue in a fresh chat
+                # seeded with that summary. A single large first message is untouched
+                # (the first-message path accepts ~1M tokens); this only fires for
+                # accumulated session context.
+                if needs_rollover(messages):
+                    summary_gen = send_message(
+                        session_id, tok["token"], await build_summary_request_prompt(messages), 0, False, False, []
+                    )
+                    summary = strip_summary_tags(await collect_response(summary_gen))
+                    summary = summary[: MAX_SUMMARY_TOKENS * 4]  # ~4 chars/token cap
+                    session_id = await create_new_chat(tok["token"])
+                    logger.info(
+                        "Context rollover: started chat %s seeded with ~%d-token summary",
+                        session_id, count_tok(summary),
+                    )
+                    save_session(sig, token_id, session_id, 0)
+                    parent_message_id = 0
+                else:
+                    session_id = await create_new_chat(tok["token"])
+                    save_session(sig, token_id, session_id, 0)
+                    parent_message_id = 0
             else:
                 token_id = sess["token_id"]
                 session_id = sess["session_id"]
@@ -1007,6 +1040,11 @@ async def list_models(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
 
+    # Declared limits reflect OBSERVED DeepSeek web behavior (issue #22), not
+    # guaranteed upstream API limits: a single first message passes up to ~1M
+    # tokens, remembered in-session context reaches ~393K input tokens before
+    # the bridge summarizes and rolls the conversation into a fresh chat, and
+    # observed per-response output is ~4,000-8,192 tokens.
     base_models = [
         {
             "id": SINGLE_MODEL,
@@ -1017,6 +1055,8 @@ async def list_models(request: Request):
             "created": 1785456000,
             "created_at": "2026-07-31T00:00:00Z",
             "owned_by": "deeperseeker",
+            "context_window": context_window_tokens(),
+            "max_output_tokens": max_output_tokens(),
             "capabilities": {
                 "batch": {"supported": True},
                 "code_execution": {"supported": True},

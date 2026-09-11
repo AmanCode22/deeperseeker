@@ -17,6 +17,141 @@ from functions import get_session, upload_file, count_tokens
 # Token budgets for injected history when (re)building a session prompt.
 MAX_HISTORY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_HISTORY_TOKENS", "24000"))
 MAX_TOOL_RESULTS_TOKENS = int(os.getenv("DEEPSEEKER_MAX_TOOL_RESULT_TOKENS", "12000"))
+# Per-result content cap so one giant tool output cannot eat the whole budget
+# (and so the result header survives tail-trimming).
+PER_TOOL_RESULT_TOKENS = int(os.getenv("DEEPSEEKER_PER_TOOL_RESULT_TOKENS", "2000"))
+
+# Observed v4.1flash limits (measured per issue #22, not upstream guarantees):
+#   - a single first message of ~1M tokens goes through (~974,848 observed)
+#   - remembered in-session context tops out around ~393K input tokens
+#   - output is ~4,000-8,192 tokens per response
+# The rollover trigger and summary budget are derived from these observations
+# and stay configurable so they can be retuned from future measurements.
+OBSERVED_FIRST_MESSAGE_TOKENS = int(os.getenv("DEEPSEEKER_FIRST_MESSAGE_TOKENS", "974848"))
+OBSERVED_MEMORY_LIMIT_TOKENS = int(os.getenv("DEEPSEEKER_MEMORY_LIMIT_TOKENS", "393228"))
+OBSERVED_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEKER_MAX_OUTPUT_TOKENS", "8192"))
+# Headroom subtracted from the remembered-context limit before summarizing
+# (issue author suggested reserving ~1K tokens; we reserve more for the
+# summary reply itself, which lands in the same chat before rollover).
+ROLLOVER_SAFETY_TOKENS = int(os.getenv("DEEPSEEKER_ROLLOVER_SAFETY_TOKENS", "12000"))
+# Token budget for the model-generated handoff summary.
+MAX_SUMMARY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_SUMMARY_TOKENS", "4096"))
+
+
+def context_window_tokens():
+    """Effective remembered-context budget that triggers summarize-and-rollover."""
+    return max(1, OBSERVED_MEMORY_LIMIT_TOKENS - ROLLOVER_SAFETY_TOKENS)
+
+
+def max_output_tokens():
+    return OBSERVED_MAX_OUTPUT_TOKENS
+
+
+def estimate_conversation_tokens(messages):
+    """Estimated token size of the accumulated conversation (text only).
+
+    Attachments are excluded: they are uploaded by reference and never part of
+    the forwarded text, so counting them would trigger rollover too early.
+    """
+    from functions import count_tokens as _count_tokens
+
+    return _count_tokens(_messages_plain_text(messages))
+
+
+def needs_rollover(messages):
+    """Decide keep-current-chat vs summarize-and-roll-over.
+
+    Returns True when the accumulated session context is nearing the observed
+    remembered-context limit. A single large first message is never rolled
+    over (it goes through the first-message path, which the upstream accepts
+    up to ~1M tokens).
+    """
+    first = next((m for m in messages if m.get("role") == "user"), None)
+    if first is not None and messages and messages[0] is first:
+        # Nothing accumulated yet — just the first exchange.
+        if len(messages) <= 2:
+            return False
+    return estimate_conversation_tokens(messages) > context_window_tokens()
+
+
+def _messages_plain_text(messages):
+    parts = []
+    for m in messages:
+        c = m.get("content", "")
+        if isinstance(c, list):
+            txt = " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
+            attachments = _describe_attachments(c)
+            if attachments:
+                txt = (txt + "\n" if txt else "") + attachments
+            parts.append(txt)
+        else:
+            parts.append(str(c))
+    return "\n".join(parts)
+
+
+def _describe_attachments(content):
+    """One-line description of non-text parts; attachments are never forwarded."""
+    if not isinstance(content, list):
+        return ""
+    described = []
+    for c in content:
+        if not isinstance(c, dict):
+            continue
+        t = c.get("type", "")
+        if t in ("image_url", "image"):
+            described.append("[attachment: image shared]")
+        elif t in ("file", "document"):
+            name = c.get("file", {}).get("filename") if isinstance(c.get("file"), dict) else None
+            described.append(f"[attachment: {'file ' + name if name else 'file'} shared]")
+    return "\n".join(described)
+
+
+SUMMARY_INSTRUCTION = (
+    "Summarize this conversation into a compact continuation note. Output ONLY the summary. "
+    "Do not add greetings, explanations, questions, or any other text.\n\n"
+    "Include:\n"
+    "- the current goal or last request,\n"
+    "- what has already been done or decided,\n"
+    "- the most recent user intent,\n"
+    "- any tool calls and their results that matter for continuing, with only the essential part of each result,\n"
+    "- if images, files, or other attachments were shared, describe what they showed and what mattered from them, without including the attachments.\n\n"
+    "Keep the summary compact. Prefer the newest and most relevant information if the conversation is long or was truncated."
+)
+
+
+def build_summary_request_prompt(messages):
+    """Prompt that asks the model for the handoff summary of the conversation."""
+    convo = _messages_plain_text(messages)
+    convo, _ = _cap_parts(convo.split("\n\n"), context_window_tokens())
+    return (
+        "[SYSTEM]\n" + SUMMARY_INSTRUCTION + "\n\n"
+        "[CONVERSATION TO SUMMARIZE]\n" + "\n\n".join(convo) + "\n\n"
+        "[SUMMARY]"
+    )
+
+
+def build_summary_seed_prompt(summary, current_user_message=""):
+    """Seed prompt for the fresh chat created after rollover."""
+    prompt = (
+        "[SYSTEM]\n"
+        "The previous conversation was summarized because it grew too large. "
+        "Continue seamlessly from the summary below; do not mention the summarization.\n\n"
+        "[PREVIOUS CONVERSATION SUMMARY]\n" + summary + "\n\n"
+    )
+    if current_user_message:
+        prompt += f"[USER]\n{current_user_message}\n\n"
+    return prompt
+
+
+def strip_summary_tags(text):
+    """Extract the summary from the model reply, tolerating think tags and prose."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    lower = text.lower()
+    for marker in ("[summary]", "summary:"):
+        idx = lower.rfind(marker)
+        if idx != -1:
+            return text[idx + len(marker):].strip()
+    return text
 
 
 async def extract_system(messages):
@@ -67,6 +202,7 @@ async def extract_tool_results(messages, latest_only=False):
             content = i.get("content", "")
             if isinstance(content, list):
                 content = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+            content = _trim_to_budget(str(content), PER_TOOL_RESULT_TOKENS)
             tools_final.append(f"Tool: {name} (Call ID: {call_id})\nResult: {content}")
     return "\n\n".join(tools_final) if tools_final else None
 
@@ -206,8 +342,26 @@ async def extract_user_msg(messages):
     return ""
 
 
+def _trim_to_budget(text, max_tokens):
+    """Hard-trim text to fit a token budget, keeping the tail (newest content)."""
+    if count_tokens(text) <= max_tokens:
+        return text
+    max_chars = max(max_tokens, 1) * 4  # ~4 chars/token estimate, then shrink
+    candidate = ""
+    while max_chars > 0:
+        candidate = text[-max_chars:].lstrip()
+        if count_tokens(candidate) <= max_tokens:
+            return candidate
+        max_chars //= 2
+    return candidate
+
+
 def _cap_parts(parts, max_tokens):
-    """Drop the oldest parts until the total fits the token budget (always keeps the newest part)."""
+    """Drop the oldest parts until the total fits the token budget (always keeps the newest part).
+
+    If even the newest single part busts the budget, it is hard-trimmed (tail kept)
+    so the cap is enforced on any input.
+    """
     if not parts:
         return parts, False
     sizes = [count_tokens(p) for p in parts]
@@ -218,7 +372,10 @@ def _cap_parts(parts, max_tokens):
     while total > max_tokens and drop < len(parts) - 1:
         total -= sizes[drop]
         drop += 1
-    return parts[drop:], True
+    kept = parts[drop:]
+    if total > max_tokens:
+        kept[0] = _trim_to_budget(kept[0], max_tokens)
+    return kept, True
 
 
 def _capped_text(text, max_tokens, marker):
@@ -307,6 +464,20 @@ async def build_prompt(messages, tools, model, is_first_message=False):
         "<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n"
         "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool."
     )
+    if is_first_message and needs_rollover(messages):
+        # Accumulated context is nearing the observed limit: hand off to a
+        # fresh chat seeded with a model-generated summary instead of blindly
+        # truncating the oldest history. The newest user message and the
+        # relevant tool results are preserved; attachments are described, not
+        # forwarded.
+        relevant_tool_results = await extract_tool_results(messages, latest_only=True)
+        if relevant_tool_results:
+            relevant_tool_results = _capped_text(relevant_tool_results, MAX_TOOL_RESULTS_TOKENS, "[... earlier tool results truncated ...]")
+            final_prompt += f"[TOOL RESULTS]\n{relevant_tool_results}\n\n"
+        user_msg = await extract_user_msg(messages)
+        if user_msg:
+            final_prompt += f"[USER]\n{user_msg}\n\n"
+        return final_prompt.strip() + "\n\n"
     if is_first_message:
         if tools_extract:
             final_prompt += f"[TOOLS]\n{tools_extract}\n\n"
