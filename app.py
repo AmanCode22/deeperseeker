@@ -57,7 +57,6 @@ from functions import (
 from plugin_helper import (
     build_prompt,
     build_summary_request_prompt,
-    build_summary_seed_prompt,
     context_window_tokens,
     extract_and_upload_files,
     generate_signature,
@@ -182,6 +181,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
 
     sig = await generate_signature(messages, model, scope)
     sess = find_session(sig)
+    rollover_summary = None
 
     if sess:
 
@@ -197,7 +197,13 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                     try:
                         delete_sessions_for_chat(token_id, session_id)
                         new_session_id = await create_new_chat(new_tok["token"])
-                        prompt = await build_prompt(messages, tools or [], model, is_first_message=True)
+                        if needs_rollover(messages):
+                            scratch_chat = await create_new_chat(new_tok["token"])
+                            summary_gen = send_message(
+                                scratch_chat, new_tok["token"], build_summary_request_prompt(messages), 0, False, False, []
+                            )
+                            rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
+                        prompt = await build_prompt(messages, tools or [], model, is_first_message=True, rollover_summary=rollover_summary)
 
                         file_ids = await extract_and_upload_files(messages, new_tok["token"])
                         gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, file_ids)
@@ -258,28 +264,28 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                     return JSONResponse({"error": "Token not found"}, status_code=503)
 
                 # Accumulated-context rollover (issue #22): when the conversation is
-                # nearing the observed remembered-context limit, ask the model for a
-                # handoff summary in the current chat, then continue in a fresh chat
-                # seeded with that summary. A single large first message is untouched
-                # (the first-message path accepts ~1M tokens); this only fires for
-                # accumulated session context.
+                # nearing the observed remembered-context limit, first obtain a
+                # model-generated handoff summary via a scratch chat (the request
+                # itself is near the context limit, so it must not be sent into any
+                # chat that has to absorb it), then start the real chat seeded with
+                # that summary via build_prompt(rollover_summary=...). A single large
+                # first exchange is untouched (the first-message path accepts ~1M
+                # tokens); this only fires for accumulated session context.
                 if needs_rollover(messages):
+                    scratch_chat = await create_new_chat(tok["token"])
                     summary_gen = send_message(
-                        session_id, tok["token"], await build_summary_request_prompt(messages), 0, False, False, []
+                        scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
                     )
                     summary = strip_summary_tags(await collect_response(summary_gen))
-                    summary = summary[: MAX_SUMMARY_TOKENS * 4]  # ~4 chars/token cap
-                    session_id = await create_new_chat(tok["token"])
+                    rollover_summary = summary[: MAX_SUMMARY_TOKENS * 4]  # ~4 chars/token cap
                     logger.info(
-                        "Context rollover: started chat %s seeded with ~%d-token summary",
-                        session_id, count_tok(summary),
+                        "Context rollover: handoff summary of ~%d tokens prepared in scratch chat %s",
+                        count_tok(rollover_summary), scratch_chat,
                     )
-                    save_session(sig, token_id, session_id, 0)
-                    parent_message_id = 0
-                else:
-                    session_id = await create_new_chat(tok["token"])
-                    save_session(sig, token_id, session_id, 0)
-                    parent_message_id = 0
+
+                session_id = await create_new_chat(tok["token"])
+                save_session(sig, token_id, session_id, 0)
+                parent_message_id = 0
             else:
                 token_id = sess["token_id"]
                 session_id = sess["session_id"]
@@ -292,7 +298,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     is_first = parent_message_id == 0
     try:
         file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
-        prompt = await build_prompt(messages, tools or [], model, is_first)
+        prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
 
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
         gen = await _preflight_stream(gen)
