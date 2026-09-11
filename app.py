@@ -54,7 +54,18 @@ from functions import (
     upload_file,
     get_file_content,
 )
-from plugin_helper import build_prompt, extract_and_upload_files, generate_signature, generate_signature_sync
+from plugin_helper import (
+    build_prompt,
+    build_summary_request_prompt,
+    context_window_tokens,
+    extract_and_upload_files,
+    generate_signature,
+    generate_signature_sync,
+    max_output_tokens,
+    needs_rollover,
+    strip_summary_tags,
+    MAX_SUMMARY_TOKENS,
+)
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -170,6 +181,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
 
     sig = await generate_signature(messages, model, scope)
     sess = find_session(sig)
+    rollover_summary = None
 
     if sess:
 
@@ -185,7 +197,13 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                     try:
                         delete_sessions_for_chat(token_id, session_id)
                         new_session_id = await create_new_chat(new_tok["token"])
-                        prompt = await build_prompt(messages, tools or [], model, is_first_message=True)
+                        if needs_rollover(messages):
+                            scratch_chat = await create_new_chat(new_tok["token"])
+                            summary_gen = send_message(
+                                scratch_chat, new_tok["token"], build_summary_request_prompt(messages), 0, False, False, []
+                            )
+                            rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
+                        prompt = await build_prompt(messages, tools or [], model, is_first_message=True, rollover_summary=rollover_summary)
 
                         file_ids = await extract_and_upload_files(messages, new_tok["token"])
                         gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, file_ids)
@@ -244,6 +262,27 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                 tok = get_token(token_id)
                 if not tok:
                     return JSONResponse({"error": "Token not found"}, status_code=503)
+
+                # Accumulated-context rollover (issue #22): when the conversation is
+                # nearing the observed remembered-context limit, first obtain a
+                # model-generated handoff summary via a scratch chat (the request
+                # itself is near the context limit, so it must not be sent into any
+                # chat that has to absorb it), then start the real chat seeded with
+                # that summary via build_prompt(rollover_summary=...). A single large
+                # first exchange is untouched (the first-message path accepts ~1M
+                # tokens); this only fires for accumulated session context.
+                if needs_rollover(messages):
+                    scratch_chat = await create_new_chat(tok["token"])
+                    summary_gen = send_message(
+                        scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
+                    )
+                    summary = strip_summary_tags(await collect_response(summary_gen))
+                    rollover_summary = summary[: MAX_SUMMARY_TOKENS * 4]  # ~4 chars/token cap
+                    logger.info(
+                        "Context rollover: handoff summary of ~%d tokens prepared in scratch chat %s",
+                        count_tok(rollover_summary), scratch_chat,
+                    )
+
                 session_id = await create_new_chat(tok["token"])
                 save_session(sig, token_id, session_id, 0)
                 parent_message_id = 0
@@ -259,7 +298,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     is_first = parent_message_id == 0
     try:
         file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
-        prompt = await build_prompt(messages, tools or [], model, is_first)
+        prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
 
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
         gen = await _preflight_stream(gen)
@@ -1007,6 +1046,11 @@ async def list_models(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
 
+    # Declared limits reflect OBSERVED DeepSeek web behavior (issue #22), not
+    # guaranteed upstream API limits: a single first message passes up to ~1M
+    # tokens, remembered in-session context reaches ~393K input tokens before
+    # the bridge summarizes and rolls the conversation into a fresh chat, and
+    # observed per-response output is ~4,000-8,192 tokens.
     base_models = [
         {
             "id": SINGLE_MODEL,
@@ -1017,6 +1061,8 @@ async def list_models(request: Request):
             "created": 1785456000,
             "created_at": "2026-07-31T00:00:00Z",
             "owned_by": "deeperseeker",
+            "context_window": context_window_tokens(),
+            "max_output_tokens": max_output_tokens(),
             "capabilities": {
                 "batch": {"supported": True},
                 "code_execution": {"supported": True},
