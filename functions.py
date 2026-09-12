@@ -134,11 +134,18 @@ UPSTREAM_BASES = _build_upstream_bases()
 
 async def post_with_failover(path, *, headers, session=None, **kwargs):
     """POST to an upstream endpoint with automatic failover across
-    UPSTREAM_BASES. Returns the aiohttp response on success; the caller owns
-    and closes it (async with). Raises the last connection error if every
-    endpoint is unreachable, or returns the final 4xx/5xx response when the
-    last endpoint answers with one (callers keep their existing error paths).
-    `session` is injectable for tests; defaults to the shared ClientSession.
+    UPSTREAM_BASES. This is a plain coroutine that RETURNS an owned response —
+    it is not an async context manager:
+
+        resp = await post_with_failover(...)
+        async with resp:
+            ...
+
+    The caller owns and closes the returned response (async with). Raises the
+    last connection error if every endpoint is unreachable, or returns the
+    final 4xx/5xx response when the last endpoint answers with one (callers
+    keep their existing error paths). `session` is injectable for tests;
+    defaults to the shared ClientSession.
     """
     if session is None:
         session = await get_session()
@@ -154,7 +161,14 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
                 raise
             continue
         if resp.status >= 500 and not is_last:
-            body = await resp.text()
+            try:
+                body = await resp.text()
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                body = ""
+            # PR #26 review fix (Medium): hand the failed connection back to
+            # the pool. Without this, repeated failovers leak responses and
+            # eventually exhaust the connector.
+            resp.release()
             logger.warning(
                 "Upstream POST %s -> HTTP %d on %s; failing over to fallback endpoint",
                 path, resp.status, base,
@@ -961,12 +975,13 @@ async def create_challange_pow(target_path, auth_token):
     headers = get_headers(auth_token)
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
-    async with post_with_failover(
+    response = await post_with_failover(
         "/api/v0/chat/create_pow_challenge",
         headers=headers, json={"target_path": target_path},
         # cookies=cookie,  # Backup WAF fallback
         timeout=aiohttp.ClientTimeout(total=20),
-    ) as response:
+    )
+    async with response:
         data = await response.json()
     return data["data"]["biz_data"]["challenge"]
 
@@ -1004,12 +1019,13 @@ async def create_new_chat(auth_token):
     headers = get_headers(auth_token)
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
-    async with post_with_failover(
+    response = await post_with_failover(
         "/api/v0/chat_session/create",
         headers=headers,
         # cookies=cookie,  # Backup WAF fallback
         timeout=aiohttp.ClientTimeout(total=20),
-    ) as response:
+    )
+    async with response:
         data = await response.json()
     return data["data"]["biz_data"]["chat_session"]["id"]
 
@@ -1142,12 +1158,13 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         "content-type": f"multipart/form-data; boundary={boundary.decode('utf-8')}",
         "x-file-size": str(file_size),
     })
-    async with post_with_failover(
+    response = await post_with_failover(
         "/api/v0/file/upload_file",
         data=reconstructed_body, headers=headers,
         # cookies=cookie,  # Backup WAF fallback
         timeout=aiohttp.ClientTimeout(total=120),
-    ) as response:
+    )
+    async with response:
         resp_json = await response.json()
     file_id = resp_json["data"]["biz_data"]["id"]
     yield ("uploaded", file_id)

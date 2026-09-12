@@ -5,6 +5,7 @@ pytest-compatible; also runnable directly:
     python tests/test_stage0_rails.py
 """
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -304,13 +305,14 @@ def test_release_chat_lock_stream_releases_on_completion():
 
     async def scenario():
         lock = asyncio.Lock()
-        await lock.acquire()
+        token = app_module._OwnedChatLock(lock)
+        await token.acquire()
 
         async def gen():
             yield "a"
             yield "b"
 
-        wrapped = app_module._release_chat_lock_stream(gen(), lock)
+        wrapped = app_module._release_chat_lock_stream(gen(), token)
         out = [chunk async for chunk in wrapped]
         return out, lock
 
@@ -324,13 +326,14 @@ def test_release_chat_lock_stream_releases_on_client_abort():
 
     async def scenario():
         lock = asyncio.Lock()
-        await lock.acquire()
+        token = app_module._OwnedChatLock(lock)
+        await token.acquire()
 
         async def gen():
             yield "a"
             yield "b"  # never consumed
 
-        wrapped = app_module._release_chat_lock_stream(gen(), lock)
+        wrapped = app_module._release_chat_lock_stream(gen(), token)
         it = wrapped.__aiter__()
         await it.__anext__()
         await it.aclose()  # simulates client abort mid-stream (GeneratorExit)
@@ -340,16 +343,178 @@ def test_release_chat_lock_stream_releases_on_client_abort():
     assert not lock.locked(), "lock must be released when the client aborts mid-stream"
 
 
+def test_release_chat_lock_stream_cannot_release_strangers_acquisition():
+    # PR #26 review (Medium): the old `if lock.locked(): lock.release()`
+    # teardown dropped whoever held the lock. A token must only ever release
+    # ITS OWN acquisition — even when it never owned the lock at all.
+    import app as app_module
+
+    async def scenario():
+        lock = asyncio.Lock()
+        await lock.acquire()  # "stranger" (another request) holds the lock
+
+        async def gen():
+            yield "a"
+
+        token = app_module._OwnedChatLock(lock)  # not owned by this holder
+        wrapped = app_module._release_chat_lock_stream(gen(), token)
+        out = [chunk async for chunk in wrapped]  # teardown calls token.release()
+        return out, lock.locked()
+
+    out, still_locked = asyncio.run(scenario())
+    assert out == ["a"]
+    assert still_locked, "stream teardown must not drop another holder's acquisition"
+
+
+def test_owned_chat_lock_release_is_idempotent_and_scoped():
+    import app as app_module
+
+    async def scenario():
+        lock = asyncio.Lock()
+        owner = app_module._OwnedChatLock(lock)
+        assert not owner.owned
+        owner.release()  # releasing before acquiring is a harmless no-op
+        await owner.acquire()
+        assert owner.owned and lock.locked()
+        owner.release()
+        assert not lock.locked()
+        owner.release()  # idempotent — no RuntimeError, no double release
+        # a stale token must not release someone else's later acquisition
+        await lock.acquire()
+        owner.release()
+        return lock.locked()
+
+    assert asyncio.run(scenario()) is True
+
+
+# ------------------------------------------------------------------------------
+# PR #26 review (High) — the lock-registry cap must hold under pressure
+
+def test_chat_lock_cap_holds_when_every_entry_is_locked():
+    import app as app_module
+
+    async def scenario():
+        held = [app_module._chat_lock(f"held-{i}") for i in range(3)]
+        for lk in held:
+            await lk.acquire()
+        # Registry is at cap and EVERY entry is held: a new chat must not
+        # grow it. The old loop broke out and setdefault'ed anyway.
+        overflow = app_module._chat_lock("overflow")
+        assert len(app_module._chat_locks) == 3, "cap must hold even with all entries locked"
+        assert overflow is app_module._chat_locks_fallback[0], "overflow chat gets the shared fallback lock"
+        assert app_module._chat_lock("overflow-2") is overflow, "fallback lock is shared, not per-key"
+        for lk in held:
+            lk.release()
+        # Pressure gone: a fresh chat is registered again (one held entry made
+        # room is not required — an unlocked one is evicted instead).
+        fresh = app_module._chat_lock("fresh-chat")
+        assert fresh is not overflow
+        assert len(app_module._chat_locks) == 3
+
+    _with_chat_lock_registry(3, scenario)
+
+
+def test_chat_lock_eviction_evicts_oldest_unlocked_and_keeps_cap():
+    import app as app_module
+
+    async def scenario():
+        old = app_module._chat_lock("old")
+        await old.acquire()
+        app_module._chat_lock("mid")
+        app_module._chat_lock("newest")  # cap reached
+        app_module._chat_lock("extra")  # over cap -> LRU unlocked ("mid") evicted
+        assert "mid" not in app_module._chat_locks
+        assert "old" in app_module._chat_locks, "locked entry is never evicted"
+        assert "newest" in app_module._chat_locks
+        assert "extra" in app_module._chat_locks
+        assert len(app_module._chat_locks) == 3
+        old.release()
+
+    _with_chat_lock_registry(3, scenario)
+
+
+def test_chat_lock_touch_refreshes_lru_position():
+    import app as app_module
+
+    async def scenario():
+        app_module._chat_lock("a")
+        app_module._chat_lock("b")
+        app_module._chat_lock("c")  # cap reached
+        app_module._chat_lock("a")  # touch -> "a" becomes most-recently-used
+        app_module._chat_lock("d")  # over cap -> must evict "b", not "a"
+        assert "b" not in app_module._chat_locks
+        assert "a" in app_module._chat_locks
+
+    _with_chat_lock_registry(3, scenario)
+
+
+def test_sig_lock_registry_cap_holds_when_all_locked():
+    import app as app_module
+
+    async def scenario():
+        held = [
+            app_module._take_lock(app_module._sig_locks, f"sig-{i}", 2, app_module._sig_locks_fallback)
+            for i in range(2)
+        ]
+        for lk in held:
+            await lk.acquire()
+        lock = app_module._take_lock(app_module._sig_locks, "sig-new", 2, app_module._sig_locks_fallback)
+        assert len(app_module._sig_locks) == 2, "sig registry must refuse to grow when full and held"
+        assert lock is app_module._sig_locks_fallback[0]
+        for lk in held:
+            lk.release()
+
+    orig = list(app_module._sig_locks.items())
+    orig_fb = app_module._sig_locks_fallback[0]
+    try:
+        app_module._sig_locks.clear()
+        app_module._sig_locks_fallback[0] = None
+        asyncio.run(scenario())
+    finally:
+        app_module._sig_locks.clear()
+        app_module._sig_locks.update(orig)
+        app_module._sig_locks_fallback[0] = orig_fb
+
+
+def _with_chat_lock_registry(cap, scenario):
+    """Run a scenario against an empty chat-lock registry of the given cap."""
+    import app as app_module
+
+    orig = list(app_module._chat_locks.items())
+    orig_cap = app_module.CHAT_LOCKS_MAX
+    orig_fb = app_module._chat_locks_fallback[0]
+    try:
+        app_module._chat_locks.clear()
+        app_module._chat_locks_fallback[0] = None
+        app_module.CHAT_LOCKS_MAX = cap
+        asyncio.run(scenario())
+    finally:
+        app_module._chat_locks.clear()
+        app_module._chat_locks.update(orig)
+        app_module.CHAT_LOCKS_MAX = orig_cap
+        app_module._chat_locks_fallback[0] = orig_fb
+
+
 # ------------------------------------------------------------------------------
 # Stage 0.4 — Dual-endpoint failover
 
 class FakeResp:
-    def __init__(self, status, text="err"):
+    def __init__(self, status, text="err", json_data=None):
         self.status = status
         self._text = text
+        self._json = json_data
+        self.released = False
 
     async def text(self):
         return self._text
+
+    async def json(self):
+        if self._json is None:
+            raise ValueError("no json body scripted for this FakeResp")
+        return self._json
+
+    def release(self):
+        self.released = True
 
     async def __aenter__(self):
         return self
@@ -400,10 +565,26 @@ def test_failover_replays_on_connection_error():
 def test_failover_last_5xx_returned_as_is():
     # Both endpoints 5xx: the final response is returned unchanged so callers
     # keep their existing error handling (send_message raises its clean error).
-    s = FakeSession([FakeResp(500, "a"), FakeResp(503, "b")])
+    first = FakeResp(500, "a")
+    last = FakeResp(503, "b")
+    s = FakeSession([first, last])
     resp = asyncio.run(call_failover(s, ["http://primary", "http://backup"]))
     assert resp.status == 503
     assert len(s.urls) == 2
+    assert first.released, "the failed non-last 5xx response must be released"
+    assert not last.released, "the returned response stays owned by the caller"
+
+
+def test_failover_releases_failed_5xx_response_before_failing_over():
+    # PR #26 review (Medium): the 5xx failover path read the body and moved on
+    # without releasing — repeated failovers leaked pool connections.
+    bad = FakeResp(500, "boom")
+    good = FakeResp(200, "{}")
+    s = FakeSession([bad, good])
+    resp = asyncio.run(call_failover(s, ["http://primary", "http://backup"]))
+    assert resp.status == 200
+    assert bad.released, "failed 5xx response must be handed back to the connection pool"
+    assert not good.released, "the success response remains owned by the caller"
 
 
 def test_failover_last_connection_error_raises():
@@ -433,6 +614,185 @@ def test_failover_single_endpoint_mode_unchanged():
     resp = asyncio.run(call_failover(s, ["http://primary"]))
     assert resp.status == 502
     assert len(s.urls) == 1
+
+
+# ------------------------------------------------------------------------------
+# PR #26 review (Blocker 1) — call-site smoke tests
+#
+# post_with_failover is a coroutine returning an owned response. Three of the
+# four call sites still used `async with post_with_failover(...)`, which dies
+# with `AttributeError: __aenter__` — taking down create_new_chat (every new
+# conversation) and create_challange_pow (the PoW header gate). The old suite
+# was blind to this because every failover test awaited post_with_failover
+# directly. These smoke tests drive the REAL function bodies against a stub
+# session.
+
+@contextlib.contextmanager
+def stub_upstream(session, bases=("http://primary",)):
+    import functions
+
+    orig_bases = functions.UPSTREAM_BASES
+    orig_get_session = functions.get_session
+
+    async def _stub_get_session():
+        return session
+
+    functions.UPSTREAM_BASES = list(bases)
+    functions.get_session = _stub_get_session
+    try:
+        yield
+    finally:
+        functions.UPSTREAM_BASES = orig_bases
+        functions.get_session = orig_get_session
+
+
+def test_create_new_chat_awaits_failover_and_returns_session_id():
+    import functions
+
+    async def scenario():
+        s = FakeSession([
+            FakeResp(200, json_data={"data": {"biz_data": {"chat_session": {"id": "chat-new-1"}}}}),
+        ])
+        with stub_upstream(s):
+            return await functions.create_new_chat("tok-1")
+
+    assert asyncio.run(scenario()) == "chat-new-1"
+
+
+def test_create_challange_pow_awaits_failover_and_returns_challenge():
+    import functions
+
+    challenge = {"challenge": "c", "salt": "s", "signature": "sig", "expire_at": 1, "difficulty": 0}
+
+    async def scenario():
+        s = FakeSession([
+            FakeResp(200, json_data={"data": {"biz_data": {"challenge": challenge}}}),
+        ])
+        with stub_upstream(s):
+            return await functions.create_challange_pow("/api/v0/chat/completion", "tok-1")
+
+    assert asyncio.run(scenario()) == challenge
+
+
+def test_upload_file_awaits_failover_and_yields_file_id():
+    import functions
+
+    async def scenario():
+        s = FakeSession([
+            FakeResp(200, json_data={"data": {"biz_data": {
+                "id": "file-9", "status": "SUCCESS", "updated_at": 1726000000,
+                "file_size": 3, "file_name": "a.txt",
+            }}}),
+        ])
+        orig_pow = functions.solve_create_pow
+
+        async def fake_pow(target_path, auth_token):
+            return "pow-stub"
+
+        functions.solve_create_pow = fake_pow
+        try:
+            with stub_upstream(s):
+                events = [ev async for ev in functions.upload_file(b"abc", "a.txt", "text/plain", "tok-1")]
+        finally:
+            functions.solve_create_pow = orig_pow
+        return events
+
+    events = asyncio.run(scenario())
+    assert events[0] == ("uploaded", "file-9")
+    assert events[-1][0] == "success"
+
+
+# ------------------------------------------------------------------------------
+# PR #26 review (Blocker 2) — retry path must not self-deadlock on the chat lock
+
+def test_handle_chat_retry_surrenders_lock_before_recursing():
+    """The retry re-resolves the SAME upstream chat (the delete before the
+    retry is simulated to miss the row — the divergence the old structure
+    deadlocked on): the recursive handle_chat re-acquired the per-chat lock
+    while the failing outer frame still owned it, so the request hung until
+    the client gave up. handle_chat must complete instead of hanging, and the
+    lock must be free afterwards."""
+    import app as app_module
+
+    async def scenario():
+        app_module._chat_locks.clear()
+        sig = "sig-retry-deadlock"
+        session = {"token_id": "t1", "session_id": "chat-retry-1", "parent_message_id": 4}
+        calls = {"send": 0}
+
+        async def fake_sig(messages, model, scope=""):
+            return sig
+
+        def fake_find(s):
+            return dict(session)  # SAME chat on every attempt — the deadlock shape
+
+        def fake_get_token(tid):
+            return {"token": "tok", "status": "ACTIVE"}
+
+        def fake_send(chat_id, auth_token, message, parent, thinking=False, search=False, file_ids_=None):
+            # send_message is an async-generator function: called un-awaited,
+            # its body starts at the first __anext__ (inside _preflight_stream)
+            calls["send"] += 1
+            if calls["send"] == 1:
+                raise Exception("HTTP 503: upstream down")
+
+            async def gen():
+                yield "hello "
+                yield "world"
+
+            return gen()
+
+        async def fake_files(messages, token, last_user_only=False):
+            return []
+
+        async def fake_prompt(messages, tools, model, is_first, rollover_summary=None):
+            return "prompt"
+
+        def fake_delete(tid, sid):
+            pass  # delete misses the row -> the retry resolves to the same chat
+
+        def fake_save(sig_, tid, sid, parent):
+            pass
+
+        patches = [
+            ("get_auth_token", lambda: "tok"),
+            ("generate_signature", fake_sig),
+            ("find_session", fake_find),
+            ("get_token", fake_get_token),
+            ("send_message", fake_send),
+            ("extract_and_upload_files", fake_files),
+            ("build_prompt", fake_prompt),
+            ("mark_limited", lambda tid: None),
+            ("mark_active", lambda tid: None),
+            ("delete_sessions_for_chat", fake_delete),
+            ("save_session", fake_save),
+            ("parse_tools", lambda t: ([], t)),
+            ("format_response", lambda text, model, messages, tools=None: "FORMATTED"),
+        ]
+        saved = [(name, getattr(app_module, name)) for name, _ in patches]
+        for name, fn in patches:
+            setattr(app_module, name, fn)
+        try:
+            result = await asyncio.wait_for(
+                app_module.handle_chat([{"role": "user", "content": "hi"}], "test-model"),
+                timeout=10,
+            )
+        finally:
+            for name, fn in saved:
+                setattr(app_module, name, fn)
+        assert calls["send"] == 2, "the retry must actually run a second upstream attempt"
+        lock = app_module._chat_lock("chat-retry-1")
+        assert not lock.locked(), "no acquisition may survive the request"
+        return result
+
+    try:
+        assert asyncio.run(scenario()) == "FORMATTED"
+    except asyncio.TimeoutError:
+        raise AssertionError("handle_chat retry deadlocked on the per-chat lock (Blocker 2)")
+    finally:
+        import app as app_module
+
+        app_module._chat_locks.clear()
 
 
 def _main():
