@@ -83,27 +83,44 @@ if not logging.getLogger().handlers:
     )
 
 # The token used for this request, logged as "key: <alias>".
-# Must stay a dict so the value survives BaseHTTPMiddleware's separate task.
+# Must stay a dict: BaseHTTPMiddleware runs the endpoint in a child task, and
+# only in place mutation of the same object reaches the access log context.
 _key_holder = ContextVar("deeperseeker_key", default=None)
+_ALIAS_MAX_LEN = 64
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+def _sanitize_alias(name):
+    if not name:
+        return None
+    name = _CONTROL_CHARS_RE.sub("", str(name)).strip()
+    return name[:_ALIAS_MAX_LEN] or None
 
 
 def _set_key_name(name):
     holder = _key_holder.get()
     if holder is not None:
-        holder["name"] = name
+        holder["name"] = _sanitize_alias(name)
 
 
-# AccessFormatter ignores record.msg, so append the alias here.
-_original_access_format = AccessFormatter.formatMessage
+class KeyAccessFormatter(AccessFormatter):
+    def formatMessage(self, record):
+        line = super().formatMessage(record)
+        name = (_key_holder.get() or {}).get("name")
+        return f"{line} key: {name}" if name else line
 
 
-def _access_format_with_key(self, record):
-    line = _original_access_format(self, record)
-    name = (_key_holder.get() or {}).get("name")
-    return f"{line} key: {name}" if name else line
-
-
-AccessFormatter.formatMessage = _access_format_with_key
+def _install_key_access_formatter():
+    for handler in logging.getLogger("uvicorn.access").handlers:
+        formatter = handler.formatter
+        if not isinstance(formatter, AccessFormatter) or isinstance(formatter, KeyAccessFormatter):
+            continue
+        handler.setFormatter(
+            KeyAccessFormatter(
+                fmt=formatter._fmt,
+                datefmt=formatter.datefmt,
+                use_colors=getattr(formatter, "use_colors", None),
+            )
+        )
 
 
 def count_tok(text):
@@ -113,6 +130,7 @@ def count_tok(text):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    _install_key_access_formatter()
     yield
 
 
