@@ -124,10 +124,11 @@ SESSION_TTL = 7 * 24 * 3600
 # this dict grows FOREVER — after many chats it becomes a serious memory leak.
 # _take_lock() enforces the cap as a true LRU (the old evict-half loop broke
 # out when its whole chunk was locked and then inserted the new key anyway,
-# so the cap never held under load — PR #26 review, High).
+# so the cap never held under load — PR #26 review, High). Under pressure it
+# registers over cap rather than aliasing chats onto a shared lock — see
+# _take_lock for why that trade is required for correctness.
 _sig_locks = OrderedDict()
 SIG_LOCKS_MAX = int(os.getenv("DEEPSEEKER_MAX_SIG_LOCKS", "4096"))
-_sig_locks_fallback = [None]  # shared lock handed out only when the registry is full
 _login_fails = {"count": 0, "locked_until": 0}
 
 # Stage 0.3 — Per-chat locks (session-collision fix).
@@ -145,10 +146,9 @@ _login_fails = {"count": 0, "locked_until": 0}
 # replaced the old evict-half loop, which could not actually cap).
 _chat_locks = OrderedDict()
 CHAT_LOCKS_MAX = int(os.getenv("DEEPSEEKER_MAX_CHAT_LOCKS", "4096"))
-_chat_locks_fallback = [None]  # shared lock handed out only when the registry is full
 
 
-def _take_lock(registry, key, max_entries, fallback):
+def _take_lock(label, registry, key, max_entries):
     """Return the lock for `key` from an LRU-capped registry, creating it on
     first use.
 
@@ -161,9 +161,22 @@ def _take_lock(registry, key, max_entries, fallback):
       - over cap, the least-recently-used UNLOCKED entry is evicted (a locked
         entry is never evicted — that would fork a chat's critical section;
         worst case stays one benign re-creation race, as before);
-      - if EVERY entry is locked, the registry refuses to grow and a single
-        shared fallback lock is returned: unrelated chats briefly serialize,
-        but mutual exclusion and the memory bound always hold.
+      - if EVERY entry is held, the new key is STILL registered, growing the
+        registry over cap. Addendum: an earlier draft returned a shared
+        fallback lock WITHOUT registering the key — that traded the memory
+        bound for a correctness one. If pressure dropped while that request
+        was still in flight, the next request for the same chat found room,
+        created a fresh per-key lock, and two live holders sat in one chat's
+        critical section — reopening the exact parent_message_id race Stage
+        0.3 exists to close, precisely under the load the branch was designed
+        for. Registering over cap keeps same chat -> same lock object
+        unconditionally. The cost stays bounded: over-cap entries appear only
+        when every existing lock is held (in-flight pressure), so depth
+        tracks request concurrency during pressure windows — never total chat
+        history — and drained entries are inert until recycled by LRU churn.
+        Each over-cap registration logs a warning with the live depth: the
+        ops signal for sustained pressure (raise the cap if it fires
+        continuously).
     """
     lock = registry.get(key)
     if lock is not None:
@@ -174,17 +187,22 @@ def _take_lock(registry, key, max_entries, fallback):
             if not held.locked():
                 del registry[old_key]
                 break
-        else:
-            if fallback[0] is None:
-                fallback[0] = asyncio.Lock()
-            return fallback[0]
+        # nothing unlocked? fall through and register over cap — refusing to
+        # register (or aliasing to a shared lock) would break same-chat
+        # identity, which is the invariant this registry exists to guarantee
     lock = asyncio.Lock()
     registry[key] = lock
+    if len(registry) > max_entries:
+        logger.warning(
+            "%s lock registry over cap: %d entries (cap %d) — every existing lock is "
+            "held; depth tracks in-flight requests, not chat history",
+            label, len(registry), max_entries,
+        )
     return lock
 
 
 def _chat_lock(session_id):
-    return _take_lock(_chat_locks, str(session_id), CHAT_LOCKS_MAX, _chat_locks_fallback)
+    return _take_lock("chat", _chat_locks, str(session_id), CHAT_LOCKS_MAX)
 
 
 class _OwnedChatLock:
@@ -393,7 +411,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             return JSONResponse({"error": {"message": "No active tokens available (all rate limited). Try again later.", "type": "rate_limit_error"}}, status_code=429)
     else:
 
-        create_lock = _take_lock(_sig_locks, sig, SIG_LOCKS_MAX, _sig_locks_fallback)
+        create_lock = _take_lock("sig", _sig_locks, sig, SIG_LOCKS_MAX)
         async with create_lock:
             sess = find_session(sig)
             if not sess:

@@ -388,30 +388,143 @@ def test_owned_chat_lock_release_is_idempotent_and_scoped():
 
 
 # ------------------------------------------------------------------------------
-# PR #26 review (High) — the lock-registry cap must hold under pressure
+# PR #26 review (High), plus post-review addendum — the lock registry must
+# preserve same-chat identity under pressure AND stay bounded.
 
-def test_chat_lock_cap_holds_when_every_entry_is_locked():
+def test_chat_lock_over_cap_preserves_same_chat_identity_across_pressure_drop():
+    """The addendum's core scenario. With the registry full and every entry
+    held, chat-x registers over cap. If pressure then DROPS while that
+    request is still in flight, the next request for chat-x must resolve to
+    the SAME lock object and wait — a fresh per-key lock beside the still-held
+    one would put two live holders in one chat's critical section (the
+    parent_message_id race Stage 0.3 exists to close). The earlier
+    shared-fallback draft failed exactly here: it never registered the key,
+    so the post-drop request created a new lock."""
     import app as app_module
 
     async def scenario():
-        held = [app_module._chat_lock(f"held-{i}") for i in range(3)]
+        held = [app_module._chat_lock(f"held-{i}") for i in range(2)]
         for lk in held:
             await lk.acquire()
-        # Registry is at cap and EVERY entry is held: a new chat must not
-        # grow it. The old loop broke out and setdefault'ed anyway.
-        overflow = app_module._chat_lock("overflow")
-        assert len(app_module._chat_locks) == 3, "cap must hold even with all entries locked"
-        assert overflow is app_module._chat_locks_fallback[0], "overflow chat gets the shared fallback lock"
-        assert app_module._chat_lock("overflow-2") is overflow, "fallback lock is shared, not per-key"
+        a = app_module._chat_lock("chat-x")  # registered over cap (everything held)
+        await a.acquire()
+        held[1].release()  # pressure drops while chat-x's request is still in flight
+        b = app_module._chat_lock("chat-x")
+        assert b is a, "same chat must resolve to the same lock object across a pressure drop"
+        entered = []
+
+        async def second_holder():
+            async with b:
+                entered.append("in")
+
+        task = asyncio.create_task(second_holder())
+        await asyncio.sleep(0.05)
+        assert entered == [], "no second concurrent holder for the same chat, even over cap"
+        a.release()
+        await task
+        assert entered == ["in"]
+        held[0].release()  # held-1 was already released to simulate the pressure drop
+
+    _with_chat_lock_registry(2, scenario)
+
+
+def test_chat_lock_over_cap_depth_is_bounded_and_stable():
+    """Over-cap depth tracks in-flight pressure, not chat history: entries
+    are added only while every existing lock is held; distinct unheld chats
+    recycle unlocked slots instead of growing the registry; and drained
+    over-cap entries stay inert (capped at the pressure peak) until churned
+    out. The 23-entries-with-cap-4 leak shape must not return."""
+    import app as app_module
+
+    async def scenario():
+        held = [app_module._chat_lock(f"held-{i}") for i in range(2)]
+        for lk in held:
+            await lk.acquire()
+        burst = []
+        for i in range(4):
+            lk = app_module._chat_lock(f"burst-{i}")  # over cap: everything held
+            await lk.acquire()
+            burst.append(lk)
+        assert len(app_module._chat_locks) == 6, "depth == registry at cap + the four in-flight registrations"
+        held[1].release()  # one recycle slot opens
+        for i in range(10):
+            app_module._chat_lock(f"churn-{i}")  # distinct unheld chats
+        assert len(app_module._chat_locks) == 6, "churn must recycle slots, not grow the registry"
+        for lk in burst:
+            lk.release()
+        held[0].release()  # held-1 was already released to open the recycle slot
+
+    _with_chat_lock_registry(2, scenario)
+
+
+def test_chat_lock_over_cap_registration_logs_warning_with_depth():
+    import app as app_module
+
+    async def scenario():
+        records = []
+
+        class _Rec:
+            def warning(self, msg, *args):
+                records.append(msg % args if args else msg)
+
+        orig_logger = app_module.logger
+        app_module.logger = _Rec()
+        try:
+            held = [app_module._chat_lock(f"held-{i}") for i in range(2)]
+            for lk in held:
+                await lk.acquire()
+            app_module._chat_lock("chat-x")  # over cap -> one warning with depth
+            app_module._chat_lock("held-0")  # hit: no log, no growth
+            for lk in held:
+                lk.release()
+        finally:
+            app_module.logger = orig_logger
+        assert len(records) == 1, "only the over-cap registration logs"
+        assert "over cap: 3 entries (cap 2)" in records[0]
+
+    _with_chat_lock_registry(2, scenario)
+
+
+def test_sig_lock_registry_over_cap_registration_keeps_identity():
+    import app as app_module
+
+    async def scenario():
+        held = [
+            app_module._take_lock("sig", app_module._sig_locks, f"sig-{i}", 2)
+            for i in range(2)
+        ]
+        for lk in held:
+            await lk.acquire()
+        lock = app_module._take_lock("sig", app_module._sig_locks, "sig-new", 2)  # over cap
+        again = app_module._take_lock("sig", app_module._sig_locks, "sig-new", 2)  # hit
+        assert lock is again, "same signature must resolve to the same lock object over cap"
+        assert len(app_module._sig_locks) == 3
         for lk in held:
             lk.release()
-        # Pressure gone: a fresh chat is registered again (one held entry made
-        # room is not required — an unlocked one is evicted instead).
-        fresh = app_module._chat_lock("fresh-chat")
-        assert fresh is not overflow
-        assert len(app_module._chat_locks) == 3
 
-    _with_chat_lock_registry(3, scenario)
+    orig = list(app_module._sig_locks.items())
+    try:
+        app_module._sig_locks.clear()
+        asyncio.run(scenario())
+    finally:
+        app_module._sig_locks.clear()
+        app_module._sig_locks.update(orig)
+
+
+def _with_chat_lock_registry(cap, scenario):
+    """Run a scenario against an empty chat-lock registry of the given cap."""
+    import app as app_module
+
+    orig = list(app_module._chat_locks.items())
+    orig_cap = app_module.CHAT_LOCKS_MAX
+    try:
+        app_module._chat_locks.clear()
+        app_module.CHAT_LOCKS_MAX = cap
+        asyncio.run(scenario())
+    finally:
+        app_module._chat_locks.clear()
+        app_module._chat_locks.update(orig)
+        app_module.CHAT_LOCKS_MAX = orig_cap
 
 
 def test_chat_lock_eviction_evicts_oldest_unlocked_and_keeps_cap():
@@ -446,53 +559,6 @@ def test_chat_lock_touch_refreshes_lru_position():
         assert "a" in app_module._chat_locks
 
     _with_chat_lock_registry(3, scenario)
-
-
-def test_sig_lock_registry_cap_holds_when_all_locked():
-    import app as app_module
-
-    async def scenario():
-        held = [
-            app_module._take_lock(app_module._sig_locks, f"sig-{i}", 2, app_module._sig_locks_fallback)
-            for i in range(2)
-        ]
-        for lk in held:
-            await lk.acquire()
-        lock = app_module._take_lock(app_module._sig_locks, "sig-new", 2, app_module._sig_locks_fallback)
-        assert len(app_module._sig_locks) == 2, "sig registry must refuse to grow when full and held"
-        assert lock is app_module._sig_locks_fallback[0]
-        for lk in held:
-            lk.release()
-
-    orig = list(app_module._sig_locks.items())
-    orig_fb = app_module._sig_locks_fallback[0]
-    try:
-        app_module._sig_locks.clear()
-        app_module._sig_locks_fallback[0] = None
-        asyncio.run(scenario())
-    finally:
-        app_module._sig_locks.clear()
-        app_module._sig_locks.update(orig)
-        app_module._sig_locks_fallback[0] = orig_fb
-
-
-def _with_chat_lock_registry(cap, scenario):
-    """Run a scenario against an empty chat-lock registry of the given cap."""
-    import app as app_module
-
-    orig = list(app_module._chat_locks.items())
-    orig_cap = app_module.CHAT_LOCKS_MAX
-    orig_fb = app_module._chat_locks_fallback[0]
-    try:
-        app_module._chat_locks.clear()
-        app_module._chat_locks_fallback[0] = None
-        app_module.CHAT_LOCKS_MAX = cap
-        asyncio.run(scenario())
-    finally:
-        app_module._chat_locks.clear()
-        app_module._chat_locks.update(orig)
-        app_module.CHAT_LOCKS_MAX = orig_cap
-        app_module._chat_locks_fallback[0] = orig_fb
 
 
 # ------------------------------------------------------------------------------
