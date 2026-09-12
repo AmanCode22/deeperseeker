@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
 import httpx
 import pytest
 import uvicorn
@@ -59,11 +60,54 @@ class TestSanitizeAlias:
         assert "\r" not in cleaned
 
     def test_strips_other_control_chars(self):
-        # NUL, ESC, DEL
-        assert _sanitize_alias("a\x00b\x1bc\x7fd") == "abcd"
+        # NUL, ESC, DEL, NEL, CSI, U+2028, U+2029
+        assert _sanitize_alias("a\x00b\x1bc\x7fd\x85e\x9bf\u2028g\u2029h") == "abcdefgh"
 
     def test_all_control_chars_collapses_to_none(self):
         assert _sanitize_alias("\r\n\x00\x1b") is None
+
+    def test_strips_every_forging_code_point(self):
+        # Cc: U+0000 to U+001F, U+007F, U+0080 to U+009F; Zl/Zp: U+2028, U+2029.
+        # 67 code points; the UAX #14 mandatory breaks are a subset.
+        forging = (
+            [chr(cp) for cp in range(0x00, 0x20)]
+            + [chr(0x7F)]
+            + [chr(cp) for cp in range(0x80, 0xA0)]
+            + [chr(0x2028), chr(0x2029)]
+        )
+        assert len(forging) == 67
+        for ch in forging:
+            assert _sanitize_alias(f"a{ch}b") == "ab", hex(ord(ch))
+        assert _sanitize_alias("".join(forging)) is None
+
+    def test_strips_every_hidden_spoofing_code_point(self):
+        # Second tier: Cf (bidi overrides, zero width joiners, tag characters,
+        # soft hyphen) plus the non Cf default ignorables and the noncharacters.
+        spoofing = (
+            [cp for cp in range(0x110000) if unicodedata.category(chr(cp)) == "Cf"]
+            + [0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D,
+               0x2800, 0x3164, 0xFFA0]
+            + list(range(0xFE00, 0xFE10))
+            + list(range(0xE0100, 0xE01F0))
+            + list(range(0xFDD0, 0xFDF0))
+            + [plane << 16 | low for plane in range(0x11) for low in (0xFFFE, 0xFFFF)]
+        )
+        for cp in spoofing:
+            assert _sanitize_alias(f"a{chr(cp)}b") == "ab", hex(cp)
+        assert _sanitize_alias("".join(chr(cp) for cp in spoofing)) is None
+
+    def test_strips_bidi_overrides_and_joiners(self):
+        # RLO, LRO, PDF, LRM, RLM, ZWSP, ZWNJ, ZWJ, word joiner, BOM, soft hyphen.
+        hidden = "\u202e\u202d\u202c\u200e\u200f\u200b\u200c\u200d\u2060\ufeff\u00ad"
+        assert _sanitize_alias(f"key{hidden}:value") == "key:value"
+
+    def test_flattens_compound_emoji(self):
+        # Documented tradeoff: ZWJ is Cf, so a family emoji loses its joiners.
+        family = "\U0001f468\u200d\U0001f469\u200d\U0001f467"
+        assert _sanitize_alias(family) == "\U0001f468\U0001f469\U0001f467"
+
+    def test_strips_noncharacters(self):
+        assert _sanitize_alias("a\ufdd0b\ufffec\U0001ffff") == "abc"
 
     def test_caps_length(self):
         long_alias = "a" * 500
@@ -100,9 +144,12 @@ class TestSetKeyName:
     def test_sanitizes_before_storing(self):
         token = _key_holder.set({})
         try:
-            _set_key_name("evil\r\nINFO: forged")
+            _set_key_name("evil\r\n\u0085\u2028\u2029\u202e\u200dINFO: forged")
             stored = _key_holder.get()["name"]
             assert "\n" not in stored and "\r" not in stored
+            assert "\u0085" not in stored and "\u2028" not in stored and "\u2029" not in stored
+            assert "\u202e" not in stored and "\u200d" not in stored
+            assert stored == "evilINFO: forged"
         finally:
             _key_holder.reset(token)
 
@@ -161,11 +208,17 @@ class TestKeyAccessFormatter:
             _key_holder.reset(token)
 
     def test_output_is_single_line_even_if_sanitization_were_bypassed(self):
-        # Defense in depth: a forged second line would double the "INFO" prefix.
-        token = _key_holder.set({"name": "personal"})
+        # Raw forged name written straight into the holder, bypassing
+        # _set_key_name: the formatter must still emit one clean line.
+        forged = "evil\r\n\u0085\u2028\u2029\u202e\u2066\u200dINFO: forged"
+        token = _key_holder.set({"name": forged})
         try:
             line = self.formatter.format(_make_access_record())
             assert line.count("\n") == 0
+            assert "\r" not in line
+            assert "\u0085" not in line and "\u2028" not in line and "\u2029" not in line
+            assert "\u202e" not in line and "\u2066" not in line and "\u200d" not in line
+            assert line.endswith("key: evilINFO: forged")
         finally:
             _key_holder.reset(token)
 
@@ -320,24 +373,29 @@ async def test_end_to_end_real_access_log_shows_alias():
             await client.get(f"http://127.0.0.1:{port}/_test/alias-echo",
                               params={"alias": "personal"})
             await client.get(f"http://127.0.0.1:{port}/_test/no-alias")
-            # Injection attempt: the alias tries to forge a second log line.
+            # Injection attempt: CRLF plus NEL/U+2028/U+2029 try to forge a
+            # second log line.
             await client.get(
                 f"http://127.0.0.1:{port}/_test/alias-echo",
-                params={"alias": "evil\r\n127.0.0.1:1 - \"GET /admin HTTP/1.1\" 200 OK"},
+                params={"alias": "evil\r\n\u0085\u2028\u2029\u202e\u200d\u2066\u00ad127.0.0.1:1 - \"GET /admin HTTP/1.1\" 200 OK"},
             )
     finally:
         server.should_exit = True
         await server_task
         access_logger.removeHandler(handler)
 
-    # One record per request. The CRLF must not survive into the rendered
-    # line, or it forges a second log line downstream.
+    # One record per request. None of the separators may survive into the
+    # rendered line, or they forge a second log line downstream.
     assert len(handler.lines) == 3
     assert handler.lines[0].endswith("key: personal")
     assert "key:" not in handler.lines[1]
     assert "\n" not in handler.lines[2]
     assert "\r" not in handler.lines[2]
-    # Only control chars are stripped; the rest of the alias passes through.
+    assert "\u0085" not in handler.lines[2]
+    assert "\u2028" not in handler.lines[2] and "\u2029" not in handler.lines[2]
+    assert "\u202e" not in handler.lines[2] and "\u200d" not in handler.lines[2]
+    assert "\u2066" not in handler.lines[2] and "\u00ad" not in handler.lines[2]
+    # Only the stripped code points are removed; the rest passes through.
     assert handler.lines[2].endswith(
         'key: evil127.0.0.1:1 - "GET /admin HTTP/1.1" 200 OK'
     )
@@ -398,3 +456,33 @@ def test_cli_entrypoint_shows_alias(tmp_path):
     assert "key: cli-probe" in output, (
         f"alias missing from the CLI access log:\n{output}"
     )
+
+
+class _FakeRequest:
+    def __init__(self, headers):
+        self.headers = headers
+
+
+class TestFilesRoutesStaleToken:
+    """A token deleted between pick_token() and get_token() must yield a clean
+    503 on the files routes, not an AttributeError that becomes a 500."""
+
+    @pytest.mark.asyncio
+    async def test_files_upload_stale_token_returns_503(self, monkeypatch):
+        import app as app_module
+        monkeypatch.setattr(app_module, "pick_token", lambda: 1)
+        monkeypatch.setattr(app_module, "get_token", lambda tid: None)
+        request = _FakeRequest({"authorization": f"Bearer {app_module.API_KEY}"})
+        resp = await app_module.files_upload(request)
+        assert resp.status_code == 503
+        assert b"Token not found" in resp.body
+
+    @pytest.mark.asyncio
+    async def test_files_content_stale_token_returns_503(self, monkeypatch):
+        import app as app_module
+        monkeypatch.setattr(app_module, "pick_token", lambda: 1)
+        monkeypatch.setattr(app_module, "get_token", lambda tid: None)
+        request = _FakeRequest({"authorization": f"Bearer {app_module.API_KEY}"})
+        resp = await app_module.files_content("file-1", request)
+        assert resp.status_code == 503
+        assert b"Token not found" in resp.body
