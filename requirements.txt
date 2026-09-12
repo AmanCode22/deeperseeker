@@ -7,3 +7,4 @@ python-multipart
 jinja2
 deepseek-tokenizer
 python-dotenv
+cryptography

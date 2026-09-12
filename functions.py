@@ -19,6 +19,9 @@ try:
 except ImportError:
     async_playwright = None
 
+import crypto as crypto_mod
+from crypto import decrypt_value, encrypt_value
+
 logger = logging.getLogger("deeperseeker.functions")
 
 wasm_path = "wasm/deepseek_pow_solver.wasm"
@@ -68,12 +71,24 @@ def get_db():
 
 def init_db():
     conn = get_db()
+    # Stage 1: v2 schema for fresh installs. Existing v1 databases are brought
+    # up to v2 (columns + at-rest encryption, with a <db>.bak snapshot) by
+    # migrate_credentials_at_rest() right below — idempotent on every boot.
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             alias TEXT,
             token TEXT,
-            status TEXT DEFAULT 'ACTIVE'
+            status TEXT DEFAULT 'ACTIVE',
+            email TEXT,
+            mobile TEXT,
+            area_code TEXT,
+            password_enc TEXT,
+            kind TEXT DEFAULT 'manual',
+            error_count INTEGER DEFAULT 0,
+            last_probe_at TEXT,
+            last_login_at TEXT,
+            last_error TEXT
         );
         CREATE TABLE IF NOT EXISTS sessions (
             signature TEXT PRIMARY KEY,
@@ -90,6 +105,12 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+    # Stage 1.6: bring v1 databases up to v2 (adds columns, encrypts legacy
+    # plaintext token values, snapshots <db>.bak first). Idempotent.
+    try:
+        crypto_mod.migrate_credentials_at_rest()
+    except Exception:
+        logger.exception("Credential-at-rest migration failed (non-fatal)")
     try:
         prune_sessions()
     except Exception:
@@ -340,32 +361,222 @@ def get_auth_token():
     row = conn.execute("SELECT token FROM tokens LIMIT 1").fetchone()
     conn.close()
     if row:
-        return row[0]
+        return decrypt_value(row[0])
     return None
+
+
+def _next_token_id(conn):
+    """Smallest free id (gap-filling insert order kept from v1)."""
+    if not conn.execute("SELECT 1 FROM tokens WHERE id = 1").fetchone():
+        return 1
+    row = conn.execute("""
+        SELECT min(t1.id + 1)
+        FROM tokens t1
+        LEFT JOIN tokens t2 ON t1.id + 1 = t2.id
+        WHERE t2.id IS NULL
+    """).fetchone()
+    return row[0] if row and row[0] else 1
 
 
 def add_token(token, alias=None):
     conn = get_db()
-    if not conn.execute("SELECT 1 FROM tokens WHERE id = 1").fetchone():
-        next_id = 1
-    else:
-        row = conn.execute("""
-            SELECT min(t1.id + 1)
-            FROM tokens t1
-            LEFT JOIN tokens t2 ON t1.id + 1 = t2.id
-            WHERE t2.id IS NULL
-        """).fetchone()
-        next_id = row[0] if row and row[0] else 1
-    conn.execute("INSERT INTO tokens (id, alias, token, status) VALUES (?, ?, ?, 'ACTIVE')", (next_id, alias, token))
+    next_id = _next_token_id(conn)
+    # Stage 1.6: credentials are encrypted at rest; reads decrypt transparently.
+    conn.execute(
+        "INSERT INTO tokens (id, alias, token, status) VALUES (?, ?, ?, 'ACTIVE')",
+        (next_id, alias, encrypt_value(token)),
+    )
     conn.commit()
     conn.close()
+    return next_id
+
+
+# ==============================================================================
+# Stage 1 — Account lifecycle storage helpers (login, refresh, probe, heal)
+# ==============================================================================
+
+def normalize_mobile(raw, area_code=None):
+    """Normalize a mobile number to bare subscriber digits (ds2api
+    client_auth_mobile_test.go semantics): '+86 138-0013-8000' ->
+    '13800138000'. Strips non-digits, leading zeros (local '0' trunk prefix),
+    and — when the area code is known and the digits still carry it — the
+    country-code prefix. Raises ValueError when nothing digit-like remains."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    digits = digits.lstrip("0")
+    if area_code:
+        area = normalize_area_code(area_code)
+        if area and digits.startswith(area) and len(digits) > len(area):
+            digits = digits[len(area):]
+    if not digits:
+        raise ValueError("mobile number has no digits")
+    return digits
+
+
+def normalize_area_code(raw):
+    """Normalize an area code to bare digits, defaulting to '86'."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    return digits or "86"
+
+
+def add_account(token, *, password, email=None, mobile=None, area_code=None, alias=None):
+    """Store a logged-in account: the bearer token it produced plus the
+    password (Fernet-encrypted at rest) needed to re-login when it dies."""
+    if not email and not mobile:
+        raise ValueError("add_account requires email or mobile")
+    if email and mobile:
+        raise ValueError("add_account takes exactly one of email / mobile")
+    if mobile:
+        area_code = normalize_area_code(area_code)
+        mobile = normalize_mobile(mobile, area_code)
+    conn = get_db()
+    try:
+        next_id = _next_token_id(conn)
+        conn.execute(
+            "INSERT INTO tokens (id, alias, token, status, email, mobile, area_code,"
+            " password_enc, kind) VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?, ?, 'login')",
+            (next_id, alias, encrypt_value(token), email, mobile, area_code,
+             encrypt_value(password)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return next_id
+
+
+def get_account_credentials(token_id):
+    """Full account row for refresh/heal paths, secrets decrypted.
+    Returns None when the id is unknown; 'password' is None for manual tokens."""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT id, alias, token, status, email, mobile, area_code,"
+            " password_enc, kind, error_count, last_probe_at, last_login_at,"
+            " last_error FROM tokens WHERE id = ?", (token_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0], "alias": row[1], "token": decrypt_value(row[2]),
+        "status": row[3], "email": row[4], "mobile": row[5], "area_code": row[6],
+        "password": decrypt_value(row[7]), "kind": row[8] or "manual",
+        "error_count": row[9] or 0, "last_probe_at": row[10],
+        "last_login_at": row[11], "last_error": row[12],
+    }
+
+
+def find_account_by_identifier(identifier):
+    """Locate an account row by email, or by mobile in any accepted format
+    ('+86 138-0013-8000', '13800138000', ...). Returns the raw sqlite row or
+    None. Used by re_login_single / the dashboard heal button."""
+    ident = str(identifier or "").strip()
+    if not ident:
+        return None
+    conn = get_db()
+    try:
+        if "@" in ident:
+            return conn.execute(
+                "SELECT id FROM tokens WHERE email = ?", (ident,)
+            ).fetchone()
+        try:
+            digits = normalize_mobile(ident)
+        except ValueError:
+            return None
+        return conn.execute(
+            "SELECT id FROM tokens WHERE mobile = ?", (digits,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def update_token_value(token_id, new_token):
+    """Persist a re-login result: new bearer token (encrypted at rest),
+    status back to ACTIVE, error tally cleared, last_login stamped."""
+    conn = get_db()
+    try:
+        conn.execute(
+            "UPDATE tokens SET token = ?, status = 'ACTIVE', error_count = 0,"
+            " last_login_at = ?, last_error = NULL WHERE id = ?",
+            (encrypt_value(new_token), datetime.now(timezone.utc).isoformat(), token_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_probe_ok(token_id):
+    conn = get_db()
+    try:
+        conn.execute(
+            "UPDATE tokens SET status = 'ACTIVE', error_count = 0, last_probe_at = ?,"
+            " last_error = NULL WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), token_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_probe_fail(token_id, error_text):
+    """Accrue one probe error. Returns the new error_count."""
+    conn = get_db()
+    try:
+        conn.execute(
+            "UPDATE tokens SET error_count = error_count + 1, last_probe_at = ?,"
+            " last_error = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), str(error_text)[:500], token_id),
+        )
+        row = conn.execute(
+            "SELECT error_count FROM tokens WHERE id = ?", (token_id,)
+        ).fetchone()
+        conn.commit()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+def get_probe_candidates(older_than_iso):
+    """Accounts due for a health probe: every live-ish token not probed within
+    the interval (NULL last_probe_at = never probed = due)."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id FROM tokens WHERE status IN ('ACTIVE', 'RATE_LIMITED')"
+            " AND (last_probe_at IS NULL OR last_probe_at < ?)"
+            " ORDER BY last_probe_at IS NOT NULL, id",
+            (older_than_iso,),
+        ).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
 
 
 def get_tokens():
+    # password_enc is deliberately NOT selected — never leaves the DB layer.
     conn = get_db()
-    rows = conn.execute("SELECT id, alias, token, status FROM tokens").fetchall()
+    rows = conn.execute(
+        "SELECT id, alias, token, status, email, mobile, area_code, kind,"
+        " error_count, last_probe_at, last_login_at, last_error FROM tokens"
+    ).fetchall()
     conn.close()
-    return [{"id": r[0], "alias": r[1], "token": r[2], "status": r[3]} for r in rows]
+    out = []
+    for r in rows:
+        email, mobile, area_code = r[4], r[5], r[6]
+        if email:
+            identifier = email
+        elif mobile:
+            identifier = f"+{area_code or '86'} {mobile}"
+        else:
+            identifier = None
+        out.append({
+            "id": r[0], "alias": r[1], "token": decrypt_value(r[2]), "status": r[3],
+            "email": email, "mobile": mobile, "area_code": area_code,
+            "kind": r[7] or "manual", "identifier": identifier,
+            "error_count": r[8] or 0, "last_probe_at": r[9],
+            "last_login_at": r[10], "last_error": r[11],
+        })
+    return out
 
 
 def get_token(token_id):
@@ -373,7 +584,7 @@ def get_token(token_id):
     row = conn.execute("SELECT id, alias, token, status FROM tokens WHERE id = ?", (token_id,)).fetchone()
     conn.close()
     if row:
-        return {"id": row[0], "alias": row[1], "token": row[2], "status": row[3]}
+        return {"id": row[0], "alias": row[1], "token": decrypt_value(row[2]), "status": row[3]}
     return None
 
 

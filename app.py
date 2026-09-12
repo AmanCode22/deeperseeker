@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from urllib.parse import urlparse
 
+import aiohttp
 import deepseek_tokenizer
 import uvicorn
 from dotenv import load_dotenv
@@ -37,12 +39,14 @@ security = HTTPBasic()
 from functions import (
     CookieGenerationError,
     cookie_file_path,
+    add_account,
     add_token,
     count_tokens,
     create_new_chat,
     delete_token,
     delete_sessions_for_chat,
     find_session,
+    get_account_credentials,
     get_auth_token,
     get_token,
     get_tokens,
@@ -57,6 +61,18 @@ from functions import (
     StreamToolParser,
     upload_file,
     get_file_content,
+)
+# Stage 1 — account lifecycle (login, refresh, heal)
+from accounts import (
+    LoginError,
+    auto_heal_loop,
+    build_login_payload,
+    identifier_for,
+    login_limiter,
+    login_user,
+    probe_account,
+    re_login_single,
+    refresh_account_token,
 )
 from middleware import RecovererMiddleware, RealIPMiddleware, RequestIDMiddleware
 from plugin_helper import (
@@ -151,7 +167,16 @@ def count_tok(text):
 async def lifespan(app: FastAPI):
     init_db()
     _install_key_access_formatter()
-    yield
+    # Stage 1.5 — background health probes: real create_session attempts with
+    # error accrual and auto-re-login at the threshold. Cancelled cleanly on
+    # shutdown; a sweep failure is logged inside the loop and never fatal.
+    heal_task = asyncio.create_task(auto_heal_loop())
+    try:
+        yield
+    finally:
+        heal_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heal_task
 
 
 app = FastAPI(title="DeeperSeeker", lifespan=lifespan)
@@ -561,6 +586,13 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
         m = re.match(r"HTTP (\d{3}):", str(e))
         code = int(m.group(1)) if m else None
+        # Stage 1.2 — upstream 401: the bearer token died, not necessarily the
+        # account. If this token row knows its credentials, re-login exactly
+        # once and retry with the refreshed token BEFORE falling back to
+        # mark_limited + rotation (which is for rate limits, not dead auth).
+        if code == 401 and not _retried and await refresh_account_token(token_id):
+            lock_owner.release()
+            return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
         if code in (401, 403, 429):
             mark_limited(token_id)
         delete_sessions_for_chat(token_id, session_id)
@@ -667,7 +699,12 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         m = re.match(r"HTTP (\d{3}):", str(e))
         code = int(m.group(1)) if m else None
         if code in (401, 403, 429):
-            mark_limited(token_id)
+            # Stage 1.2: a stream cannot retry (headers are already out), but a
+            # 401 still heals the token for the NEXT request when credentials
+            # are stored; only park it as RATE_LIMITED when healing is off/failed.
+            refreshed = code == 401 and await refresh_account_token(token_id)
+            if not refreshed:
+                mark_limited(token_id)
         logger.exception("stream_response failed")
         try:
             yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
@@ -778,7 +815,9 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         m = re.match(r"HTTP (\d{3}):", str(e))
         code = int(m.group(1)) if m else None
         if code in (401, 403, 429):
-            mark_limited(token_id)
+            refreshed = code == 401 and await refresh_account_token(token_id)
+            if not refreshed:
+                mark_limited(token_id)
         logger.exception("stream_anthropic_response failed")
         try:
             yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)[:300]}})}\n\n"
@@ -1404,7 +1443,12 @@ async def dashboard(request: Request):
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     tokens = get_tokens()
-    return templates.TemplateResponse(request, "dashboard.html", {"tokens": tokens})
+    # Stage 1.7: heal-button result banner (?heal=<id>&result=<outcome>)
+    heal = request.query_params.get("heal")
+    heal_result = request.query_params.get("result")
+    return templates.TemplateResponse(request, "dashboard.html", {
+        "tokens": tokens, "heal": heal, "heal_result": heal_result,
+    })
 
 
 @app.post("/tokens/add")
@@ -1429,6 +1473,136 @@ async def tokens_delete(token_id: int, request: Request):
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     delete_token(token_id)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+
+
+# ==============================================================================
+# Stage 1 — Account lifecycle endpoints (roadmap #1)
+#
+# Adding an account by email/mobile logs in over pure HTTP — no manual token
+# extraction anywhere. The limiter (accounts.login_limiter) backs off per
+# identifier and caps a pool-wide login flood. All of these accept JSON (API
+# clients) or form bodies (dashboard), and all require the admin cookie.
+# ==============================================================================
+
+_LOGIN_ERROR_STATUS = {
+    "bad_credentials": 401,
+    "cooldown": 429,
+    "not_found": 404,
+    "no_credentials": 409,
+    "upstream_error": 502,
+    "invalid_response": 502,
+}
+
+
+def _login_error_response(e: LoginError):
+    status_code = _LOGIN_ERROR_STATUS.get(e.code, 502)
+    payload = {"error": {"code": e.code, "message": str(e)}}
+    if e.retry_after is not None:
+        payload["error"]["retry_after"] = round(e.retry_after, 1)
+    headers = {"Retry-After": str(max(1, int(e.retry_after)))} if e.retry_after else None
+    return JSONResponse(payload, status_code=status_code, headers=headers)
+
+
+def _admin_guard(request: Request):
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    return None
+
+
+async def _read_body_fields(request: Request):
+    """Accept JSON (API clients) or form-encoded (dashboard) bodies alike."""
+    if "application/json" in request.headers.get("content-type", ""):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        return data if isinstance(data, dict) else {}
+    form = await request.form()
+    return {key: form.get(key, "") for key in form.keys()}
+
+
+@app.post("/accounts/add")
+async def accounts_add(request: Request):
+    """Add an account by email OR mobile(+area_code) + password. Logs in over
+    pure HTTP, stores the bearer token plus the Fernet-encrypted password so
+    the account can self-heal later (Stage 1.2/1.5)."""
+    guard = _admin_guard(request)
+    if guard:
+        return guard
+    fields = await _read_body_fields(request)
+    email = str(fields.get("email") or "").strip() or None
+    mobile = str(fields.get("mobile") or "").strip() or None
+    area_code = str(fields.get("area_code") or "").strip() or None
+    password = str(fields.get("password") or "")
+    alias = str(fields.get("alias") or "").strip() or None
+    try:
+        payload = build_login_payload(password, email, mobile, area_code)
+    except ValueError as e:
+        return JSONResponse({"error": {"code": "validation", "message": str(e)}}, status_code=422)
+    ident = payload.get("email") or payload["mobile"]
+    try:
+        login_limiter.acquire(ident)
+    except LoginError as e:
+        return _login_error_response(e)
+    try:
+        result = await login_user(password, email=email, mobile=mobile, area_code=area_code)
+    except LoginError as e:
+        if e.code != "cooldown":
+            login_limiter.report_failure(ident)
+        return _login_error_response(e)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        login_limiter.report_failure(ident)
+        return _login_error_response(LoginError("upstream_error", f"Login network failure: {e}"))
+    login_limiter.report_success(ident)
+    token_id = add_account(
+        result["token"], password=password, email=email,
+        mobile=mobile, area_code=area_code, alias=alias,
+    )
+    return JSONResponse({"ok": True, "token_id": token_id}, status_code=201)
+
+
+@app.post("/accounts/relogin")
+async def accounts_relogin(request: Request):
+    """Re-login ONE account by identifier (email or mobile in any format) —
+    the API behind the dashboard heal button (Stage 1.4)."""
+    guard = _admin_guard(request)
+    if guard:
+        return guard
+    fields = await _read_body_fields(request)
+    identifier = str(fields.get("identifier") or "").strip()
+    if not identifier:
+        return JSONResponse({"error": {"code": "validation", "message": "identifier is required"}}, status_code=422)
+    try:
+        result = await re_login_single(identifier)
+    except LoginError as e:
+        return _login_error_response(e)
+    return JSONResponse({"ok": True, "token_id": result.get("token_id")})
+
+
+@app.post("/tokens/{token_id}/heal")
+async def tokens_heal(token_id: int, request: Request):
+    """Dashboard heal button: accounts with stored credentials re-login; bare
+    pasted tokens get an on-demand health probe instead. Redirects back to the
+    dashboard with ?heal=<id>&result=<outcome> for the banner."""
+    guard = _admin_guard(request)
+    if guard:
+        return guard
+    account = get_account_credentials(token_id)
+    if not account:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+    if account.get("password"):
+        try:
+            await re_login_single(identifier_for(account))
+            outcome = "ok"
+        except LoginError as e:
+            outcome = f"error-{e.code}"
+    else:
+        outcome = await probe_account(token_id)
+    return HTMLResponse(
+        f"<meta http-equiv='refresh' content='0;url=/dashboard?heal={token_id}&result={outcome}'>"
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
