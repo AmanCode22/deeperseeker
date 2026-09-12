@@ -6,6 +6,7 @@ import re
 import secrets
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
@@ -54,6 +55,7 @@ from functions import (
     upload_file,
     get_file_content,
 )
+from middleware import RecovererMiddleware, RealIPMiddleware, RequestIDMiddleware
 from plugin_helper import (
     build_prompt,
     build_summary_request_prompt,
@@ -102,16 +104,168 @@ async def limit_body_size(request: Request, call_next):
     return await call_next(request)
 
 
+# Stage 0.1 + 0.2 — core rails: fail-closed real-client-IP resolution behind
+# proxies (TRUSTED_PROXIES), per-request correlation ids with access logging,
+# and a last-resort exception barrier that turns handler crashes into logged
+# JSON 500s. Starlette runs the LAST-registered middleware FIRST (outermost),
+# so registration order RealIP -> RequestID -> Recoverer yields the execution
+# order Recoverer -> RequestID -> RealIP -> limit_body_size -> routes: the
+# recoverer sees every error below it, and every response (including its own
+# 500s) carries the request id.
+app.add_middleware(RealIPMiddleware)
+app.add_middleware(RequestIDMiddleware)
+app.add_middleware(RecovererMiddleware)
+
+
 SESSIONS = {}
 SESSION_TTL = 7 * 24 * 3600
 # One asyncio.Lock per conversation signature, used to serialize first-time
 # session creation. Signatures are unique per message prefix, so without a cap
 # this dict grows FOREVER — after many chats it becomes a serious memory leak.
-# When the cap is hit, the oldest half of currently-unlocked entries is
-# evicted (worst case: an extra benign session re-creation).
-_sig_locks = {}
+# _take_lock() enforces the cap as a true LRU (the old evict-half loop broke
+# out when its whole chunk was locked and then inserted the new key anyway,
+# so the cap never held under load — PR #26 review, High). Under pressure it
+# registers over cap rather than aliasing chats onto a shared lock — see
+# _take_lock for why that trade is required for correctness.
+_sig_locks = OrderedDict()
 SIG_LOCKS_MAX = int(os.getenv("DEEPSEEKER_MAX_SIG_LOCKS", "4096"))
 _login_fails = {"count": 0, "locked_until": 0}
+
+# Stage 0.3 — Per-chat locks (session-collision fix).
+# One asyncio.Lock per UPSTREAM chat session id. _sig_locks above only
+# serializes first-time session CREATION for one signature; it does nothing
+# for two concurrent requests that already share (or race to use) the same
+# upstream DeepSeek chat: both would send with the same parent_message_id,
+# fork the upstream conversation, and the last save_session() would corrupt
+# the stored parent counter. The chat lock serializes the send -> save
+# critical section per upstream session, so same-chat requests queue instead
+# of colliding (different chats remain fully parallel). Keyed by upstream
+# session id rather than signature, because each completed turn derives a new
+# signature while the upstream chat stays the same. The registry is capped by
+# _take_lock() (true LRU; see its docstring for the PR #26 review fix that
+# replaced the old evict-half loop, which could not actually cap).
+_chat_locks = OrderedDict()
+CHAT_LOCKS_MAX = int(os.getenv("DEEPSEEKER_MAX_CHAT_LOCKS", "4096"))
+
+
+def _take_lock(label, registry, key, max_entries):
+    """Return the lock for `key` from an LRU-capped registry, creating it on
+    first use.
+
+    Review fix (PR #26, High): the previous eviction loop shared by
+    _sig_locks/_chat_locks scanned the oldest MAX//2+1 entries, broke out when
+    ALL of them were locked, and then setdefault'ed the new key anyway — so
+    under sustained load with many live chats the dict grew without bound; the
+    "memory-leak guard" was the leak. Semantics now:
+      - a hit moves the key to the most-recently-used end;
+      - over cap, the least-recently-used UNLOCKED entry is evicted (a locked
+        entry is never evicted — that would fork a chat's critical section;
+        worst case stays one benign re-creation race, as before);
+      - if EVERY entry is held, the new key is STILL registered, growing the
+        registry over cap. Addendum: an earlier draft returned a shared
+        fallback lock WITHOUT registering the key — that traded the memory
+        bound for a correctness one. If pressure dropped while that request
+        was still in flight, the next request for the same chat found room,
+        created a fresh per-key lock, and two live holders sat in one chat's
+        critical section — reopening the exact parent_message_id race Stage
+        0.3 exists to close, precisely under the load the branch was designed
+        for. Registering over cap keeps same chat -> same lock object
+        unconditionally. The cost stays bounded: over-cap entries appear only
+        when every existing lock is held (in-flight pressure), so depth
+        tracks request concurrency during pressure windows — never total chat
+        history — and drained entries are inert until recycled by LRU churn.
+        Each over-cap registration logs a warning with the live depth: the
+        ops signal for sustained pressure (raise the cap if it fires
+        continuously).
+    """
+    lock = registry.get(key)
+    if lock is not None:
+        registry.move_to_end(key)
+        return lock
+    if len(registry) >= max_entries:
+        for old_key, held in registry.items():
+            if not held.locked():
+                del registry[old_key]
+                break
+        # nothing unlocked? fall through and register over cap — refusing to
+        # register (or aliasing to a shared lock) would break same-chat
+        # identity, which is the invariant this registry exists to guarantee
+    lock = asyncio.Lock()
+    registry[key] = lock
+    if len(registry) > max_entries:
+        logger.warning(
+            "%s lock registry over cap: %d entries (cap %d) — every existing lock is "
+            "held; depth tracks in-flight requests, not chat history",
+            label, len(registry), max_entries,
+        )
+    return lock
+
+
+def _chat_lock(session_id):
+    return _take_lock("chat", _chat_locks, str(session_id), CHAT_LOCKS_MAX)
+
+
+class _OwnedChatLock:
+    """Ownership token for one acquisition of a per-chat lock.
+
+    Review fix (PR #26, Medium): release sites used `if lock.locked():
+    lock.release()`, but locked() reports whether ANYONE holds the lock —
+    after an early release and another request's acquisition, a late release
+    dropped the OTHER request's lock and put two requests inside the critical
+    section the lock exists to prevent. A token tracks only its own
+    acquisition: release() is idempotent and can never release a stranger's
+    hold, which also makes ownership transfer to a stream generator and
+    release-before-retry safe by construction. `owned` says whether THIS
+    token still holds the lock (the question locked() could not answer)."""
+
+    __slots__ = ("lock", "_owned")
+
+    def __init__(self, lock):
+        self.lock = lock
+        self._owned = False
+
+    async def acquire(self):
+        await self.lock.acquire()
+        self._owned = True
+
+    def release(self):
+        if not self._owned:
+            return
+        self._owned = False
+        try:
+            self.lock.release()
+        except RuntimeError:
+            pass  # defensive: releasing an already-released lock must never kill a request
+
+    @property
+    def owned(self):
+        return self._owned
+
+
+async def _own_chat_lock(session_id):
+    """Acquire this chat's lock and return its ownership token."""
+    token = _OwnedChatLock(_chat_lock(session_id))
+    await token.acquire()
+    return token
+
+
+def _release_chat_lock_stream(gen, owner):
+    """Wrap a streaming generator so the per-chat lock stays held until the
+    stream completes (or the client aborts), then is released exactly once.
+
+    The lock is acquired in handle_chat before the upstream POST; for streaming
+    responses the final save_session() happens inside the stream generator, so
+    ownership of the lock must transfer from handle_chat to the generator —
+    releasing any earlier would reopen the parent_message_id race the lock
+    exists to prevent. `owner` is a _OwnedChatLock token: its release() drops
+    ONLY this holder's acquisition, never a stranger's (PR #26 review, Medium)."""
+    async def _wrapped():
+        try:
+            async for chunk in gen:
+                yield chunk
+        finally:
+            owner.release()
+    return _wrapped()
 
 
 def get_current_admin(request: Request):
@@ -194,9 +348,14 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             if new_token_id and (not tok or new_token_id != token_id):
                 new_tok = get_token(new_token_id)
                 if new_tok:
+                    # Stage 0.3: rotation re-creates the upstream chat; hold the
+                    # new chat's lock across its send -> save section so a
+                    # concurrent same-signature request cannot race the swap.
+                    rot_owner = None
                     try:
                         delete_sessions_for_chat(token_id, session_id)
                         new_session_id = await create_new_chat(new_tok["token"])
+                        rot_owner = await _own_chat_lock(new_session_id)
                         if needs_rollover(messages):
                             scratch_chat = await create_new_chat(new_tok["token"])
                             summary_gen = send_message(
@@ -209,11 +368,14 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, file_ids)
                         gen = await _preflight_stream(gen)
                     except Exception as e:
+                        if rot_owner is not None:
+                            rot_owner.release()
                         logger.exception("Token-rotation recovery failed (chat %s): %s", session_id, e)
                         if _retried:
                             return _api_error_response(e, is_anthropic)
                         return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
                     if stream:
+                        gen = _release_chat_lock_stream(gen, rot_owner)
                         if is_anthropic:
                             return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0, scope), media_type="text/event-stream")
                         return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0, scope), media_type="text/event-stream")
@@ -222,6 +384,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                             resp_text = await collect_response(gen)
                         except Exception as e:
                             logger.exception("Upstream failed during token-rotation request: %s", e)
+                            if rot_owner is not None:
+                                rot_owner.release()
                             if _retried:
                                 return _api_error_response(e, is_anthropic)
                             return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
@@ -241,18 +405,13 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
 
                         save_session(sig, new_token_id, new_session_id, next_parent(0))
                         save_session(next_sig, new_token_id, new_session_id, next_parent(0))
+                        if rot_owner is not None:
+                            rot_owner.release()
                         return format_response(resp_text, model, messages, tools)
             return JSONResponse({"error": {"message": "No active tokens available (all rate limited). Try again later.", "type": "rate_limit_error"}}, status_code=429)
     else:
 
-        while len(_sig_locks) >= SIG_LOCKS_MAX:
-            chunk = list(_sig_locks.items())[: SIG_LOCKS_MAX // 2 + 1]
-            evictable = [k for k, v in chunk if not v.locked()]
-            if not evictable:
-                break  # everything in the chunk is in use; retry on a later request
-            for k in evictable:
-                _sig_locks.pop(k, None)
-        create_lock = _sig_locks.setdefault(sig, asyncio.Lock())
+        create_lock = _take_lock("sig", _sig_locks, sig, SIG_LOCKS_MAX)
         async with create_lock:
             sess = find_session(sig)
             if not sess:
@@ -296,6 +455,11 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         return JSONResponse({"error": "Token expired"}, status_code=503)
 
     is_first = parent_message_id == 0
+    # Stage 0.3: hold this chat's lock across the whole send -> save critical
+    # section; for streams, ownership transfers to the response generator via
+    # _release_chat_lock_stream (the final save_session happens there).
+    lock_owner = await _own_chat_lock(session_id)
+    lock_transferred = False
     try:
         file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
         prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
@@ -303,6 +467,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
         gen = await _preflight_stream(gen)
         if stream:
+            gen = _release_chat_lock_stream(gen, lock_owner)
+            lock_transferred = True
             if is_anthropic:
                 return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id, scope), media_type="text/event-stream")
             return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope), media_type="text/event-stream")
@@ -336,7 +502,20 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             return _api_error_response(e, is_anthropic)
         if code not in (401, 403, 429) and parent_message_id == 0:
             return _api_error_response(e, is_anthropic)
+        # PR #26 review fix (Blocker 2 — retry self-deadlock): the recursive
+        # call can resolve to the SAME chat (the retry re-derives the session
+        # from whatever the persistence layer still returns). Recursing while
+        # this frame still owns the lock made the retry wait on a lock its own
+        # caller held — the request hung until the client gave up, on exactly
+        # the errors the retry exists for. Surrender the lock first: release()
+        # is scoped to this holder and idempotent, so the finally below becomes
+        # a no-op, the retry re-acquires cleanly, and queued same-chat requests
+        # are no longer starved for the entire retry either.
+        lock_owner.release()
         return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
+    finally:
+        if not lock_transferred:
+            lock_owner.release()
 
 
 async def collect_response(gen):

@@ -109,6 +109,78 @@ async def get_session():
     return _session
 
 
+# ==============================================================================
+# Stage 0.4 — Dual-endpoint failover
+#
+# Every upstream POST goes through post_with_failover(): if the primary host
+# fails at the connection level (ClientError / timeout) or answers HTTP 5xx,
+# the identical request is replayed against the fallback endpoint. 4xx
+# responses are returned as-is — a bad token or permission error will not
+# improve on a different endpoint, so we fail fast instead of retrying.
+#
+# Endpoints (env, both optional to override):
+#   DEEPSEEKER_UPSTREAM_BASE     primary   (default https://chat.deepseek.com)
+#   DEEPSEEKER_UPSTREAM_FALLBACK fallback  (default: none; single-endpoint mode)
+# ==============================================================================
+
+def _build_upstream_bases():
+    primary = (os.getenv("DEEPSEEKER_UPSTREAM_BASE") or "https://chat.deepseek.com").strip().rstrip("/")
+    fallback = (os.getenv("DEEPSEEKER_UPSTREAM_FALLBACK") or "").strip().rstrip("/")
+    return [primary] + ([fallback] if fallback else [])
+
+
+UPSTREAM_BASES = _build_upstream_bases()
+
+
+async def post_with_failover(path, *, headers, session=None, **kwargs):
+    """POST to an upstream endpoint with automatic failover across
+    UPSTREAM_BASES. This is a plain coroutine that RETURNS an owned response —
+    it is not an async context manager:
+
+        resp = await post_with_failover(...)
+        async with resp:
+            ...
+
+    The caller owns and closes the returned response (async with). Raises the
+    last connection error if every endpoint is unreachable, or returns the
+    final 4xx/5xx response when the last endpoint answers with one (callers
+    keep their existing error paths). `session` is injectable for tests;
+    defaults to the shared ClientSession.
+    """
+    if session is None:
+        session = await get_session()
+    last_exc = None
+    for attempt, base in enumerate(UPSTREAM_BASES):
+        is_last = attempt == len(UPSTREAM_BASES) - 1
+        try:
+            resp = await session.post(base + path, headers=headers, **kwargs)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning("Upstream POST %s failed on %s: %s", path, base, e)
+            last_exc = e
+            if is_last:
+                raise
+            continue
+        if resp.status >= 500 and not is_last:
+            try:
+                body = await resp.text()
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                body = ""
+            # PR #26 review fix (Medium): hand the failed connection back to
+            # the pool. Without this, repeated failovers leak responses and
+            # eventually exhaust the connector.
+            resp.release()
+            logger.warning(
+                "Upstream POST %s -> HTTP %d on %s; failing over to fallback endpoint",
+                path, resp.status, base,
+            )
+            last_exc = Exception(f"HTTP {resp.status}: {body[:200]}")
+            continue
+        if attempt > 0:
+            logger.info("Upstream POST %s succeeded on fallback endpoint %s", path, base)
+        return resp
+    raise last_exc if last_exc is not None else RuntimeError("post_with_failover: no endpoints configured")
+
+
 def get_headers(auth_token, pow=None):
     headers = {
         "accept": "*/*",
@@ -903,13 +975,13 @@ async def create_challange_pow(target_path, auth_token):
     headers = get_headers(auth_token)
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
-    session = await get_session()
-    async with session.post(
-        "https://chat.deepseek.com/api/v0/chat/create_pow_challenge",
+    response = await post_with_failover(
+        "/api/v0/chat/create_pow_challenge",
         headers=headers, json={"target_path": target_path},
         # cookies=cookie,  # Backup WAF fallback
         timeout=aiohttp.ClientTimeout(total=20),
-    ) as response:
+    )
+    async with response:
         data = await response.json()
     return data["data"]["biz_data"]["challenge"]
 
@@ -947,13 +1019,13 @@ async def create_new_chat(auth_token):
     headers = get_headers(auth_token)
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
-    session = await get_session()
-    url = "https://chat.deepseek.com/api/v0/chat_session/create"
-    async with session.post(
-        url, headers=headers,
+    response = await post_with_failover(
+        "/api/v0/chat_session/create",
+        headers=headers,
         # cookies=cookie,  # Backup WAF fallback
         timeout=aiohttp.ClientTimeout(total=20),
-    ) as response:
+    )
+    async with response:
         data = await response.json()
     return data["data"]["biz_data"]["chat_session"]["id"]
 
@@ -961,12 +1033,10 @@ async def create_new_chat(auth_token):
 async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None):
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
-    session = await get_session()
     if parent_message_id == 0:
         parent_message_id = None
     file_ids = file_ids_ or []
 
-    url = "https://chat.deepseek.com/api/v0/chat/completion"
     headers = get_headers(auth_token, await solve_create_pow("/api/v0/chat/completion", auth_token))
     json_data = {
         "chat_session_id": chat_id,
@@ -982,16 +1052,18 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
 
     think_open = False
     got_output = False
-    async with session.post(
-        url, headers=headers, json=json_data,
+    resp = await post_with_failover(
+        "/api/v0/chat/completion",
+        headers=headers, json=json_data,
         # cookies=cookie,  # Backup WAF fallback
-    ) as r:
-        if r.status != 200:
-            error_text = await r.text()
-            logger.warning("DeepSeek completion HTTP %d for chat %s: %s", r.status, chat_id, error_text[:300])
-            raise Exception(f"HTTP {r.status}: {error_text}")
+    )
+    async with resp:
+        if resp.status != 200:
+            error_text = await resp.text()
+            logger.warning("DeepSeek completion HTTP %d for chat %s: %s", resp.status, chat_id, error_text[:300])
+            raise Exception(f"HTTP {resp.status}: {error_text}")
 
-        async for line in r.content:
+        async for line in resp.content:
             if not line:
                 continue
             decoded_line = line.decode("utf-8").strip()
@@ -1086,11 +1158,13 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         "content-type": f"multipart/form-data; boundary={boundary.decode('utf-8')}",
         "x-file-size": str(file_size),
     })
-    async with session.post(
-        url, data=reconstructed_body, headers=headers,
+    response = await post_with_failover(
+        "/api/v0/file/upload_file",
+        data=reconstructed_body, headers=headers,
         # cookies=cookie,  # Backup WAF fallback
         timeout=aiohttp.ClientTimeout(total=120),
-    ) as response:
+    )
+    async with response:
         resp_json = await response.json()
     file_id = resp_json["data"]["biz_data"]["id"]
     yield ("uploaded", file_id)
