@@ -794,16 +794,46 @@ _ORPHAN_CLOSER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Decorated openers run up to ~23 chars (<｜｜DSML｜｜ function_call); the
-# plain-tag hold bound (_MAX_TAG_HOLD) stays 15 for prose safety, so hold
-# detection uses a trailing unclosed-'<" segment with its own bound.
-_MAX_DSML_HOLD = 24
+# Tag names _STREAM_ENTRY_RE can open on.
+_STREAM_ENTRY_TAGS = ("tool_calls", "tool_call", "function_call", "invoke", "calls")
 
-# [FIX 2] Hard bound (chars) on how much text feed() may hold back while the
-# buffer tail still looks like the prefix of a start tag. The longest start
-# tag is 13 chars; 15 leaves headroom so future tag edits cannot reintroduce
-# unbounded buffering on prose like "if x < y".
-_MAX_TAG_HOLD = 15
+def _skip_bars(text, pos):
+    for _ in range(2):
+        if pos < len(text) and text[pos] in "|｜":
+            pos += 1
+    return pos
+
+def _is_plausible_stream_entry_prefix(segment: str) -> bool:
+    if not segment.startswith("<") or ">" in segment:
+        return False
+    body = segment[1:]
+    pos = _skip_bars(body, 0)
+    length = len(body)
+    if pos < length and body[pos] in "Dd":
+        matched = 0
+        while matched < 4 and pos < length and body[pos].upper() == "DSML"[matched]:
+            pos += 1
+            matched += 1
+        if matched < 4:
+            return pos == length
+        pos = _skip_bars(body, pos)
+    while pos < length and body[pos].isspace():
+        pos += 1
+    if pos == length:
+        return True
+    remainder = body[pos:]
+    remainder_lower = remainder.lower()
+    for tag in _STREAM_ENTRY_TAGS:
+        if tag.startswith(remainder_lower):
+            return True
+        if remainder_lower.startswith(tag):
+            suffix = remainder[len(tag):]
+            if not suffix or not (suffix[0].isalnum() or suffix[0] == "_"):
+                return True
+    return False
+
+def _is_plausible_stream_closer_prefix(segment: str) -> bool:
+    return segment.startswith("</") and _is_plausible_stream_entry_prefix("<" + segment[2:])
 
 
 class StreamToolParser:
@@ -872,19 +902,19 @@ class StreamToolParser:
                     self.in_tool = True
                     self.has_tool = True
                     continue
-                # [FIX 2] Only hold a tail that is a genuinely unclosed '<'
-                # segment (a split tag still arriving), and never hold more
-                # than _MAX_DSML_HOLD characters, so prose with a bare '<'
-                # (e.g. "if x < y") keeps streaming instead of buffering.
+                # [FIX 2] Hold an unclosed '<' tail only while it remains a
+                # plausible partial match of _STREAM_ENTRY_RE or of a wrapper
+                # closer ("</..."), so a split closer is never dumped as prose.
                 last_lt = self.buffer.rfind("<")
-                if (
-                    last_lt != -1
-                    and ">" not in self.buffer[last_lt:]
-                    and len(self.buffer) - last_lt <= _MAX_DSML_HOLD
-                ):
+                tail = self.buffer[last_lt:] if last_lt != -1 else ""
+                hold = ">" not in tail and (
+                    _is_plausible_stream_entry_prefix(tail)
+                    or _is_plausible_stream_closer_prefix(tail)
+                )
+                if last_lt != -1 and hold:
                     if last_lt > 0:
                         results.append({"text": _ORPHAN_CLOSER_RE.sub("", self.buffer[:last_lt])})
-                    self.buffer = self.buffer[last_lt:]
+                    self.buffer = tail
                     break
                 if self.buffer:
                     results.append({"text": _ORPHAN_CLOSER_RE.sub("", self.buffer)})

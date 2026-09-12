@@ -1,13 +1,16 @@
-"""Regression tests for the streaming edge-case fixes (FIX 1/2/3).
+"""Regression tests for the streaming edge-case fixes (FIX 1/2/3 + DSML hold).
 
-Covers the three review items on StreamToolParser:
+Covers the review items on StreamToolParser:
 
   FIX 1: flush() falls back to parse_tools(self.buffer) before stripping tags,
          so a stream cut off before the closing tag still yields the tool.
-  FIX 2: the tag-prefix hold is explicitly bounded (_MAX_TAG_HOLD) and bare '<'
-         prose keeps streaming instead of buffering until flush().
+  FIX 2: feed() holds a trailing '<' only while it is a plausible partial match
+         of _STREAM_ENTRY_RE (or a partial wrapper closer), so bare '<' prose
+         keeps streaming.
   FIX 3: family-wide closer fallback (regex) accepts mismatched and |/｜-decorated
          closers during feed() instead of hanging until flush().
+  FIX 4: the plausibility check keeps split DSML openers (any length, any
+         bars/marker/spacing shape) buffered instead of leaking them as prose.
 
 Run:  python tests/test_stream_edge_cases.py   (pytest-compatible)
 """
@@ -16,45 +19,46 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from functions import StreamToolParser, _MAX_TAG_HOLD  # noqa: E402
+from functions import StreamToolParser, _is_plausible_stream_entry_prefix  # noqa: E402
+from functions import _is_plausible_stream_closer_prefix  # noqa: E402
 
 OPEN = "<"  # guard against editor/tooling eating angle-bracket literals
 CLOSE = ">"
 
 
-def xml(s):
-    return s.replace("[LT]", "<").replace("[GT]", ">")
+def xml(text):
+    return text.replace("[LT]", "<").replace("[GT]", ">")
 
 
-def feed_all(parser, text, size):
-    text_out, tools_out = [], []
-    for i in range(0, len(text), size):
-        for r in parser.feed(text[i : i + size]):
-            if "text" in r:
-                text_out.append(r["text"])
+def feed_all(parser, text, chunk_size):
+    emitted_text, emitted_tools = [], []
+    for i in range(0, len(text), chunk_size):
+        for result in parser.feed(text[i : i + chunk_size]):
+            if "text" in result:
+                emitted_text.append(result["text"])
             else:
-                tools_out.append(r["tool"])
-    return "".join(text_out), tools_out
+                emitted_tools.append(result["tool"])
+    return "".join(emitted_text), emitted_tools
 
 
 def flush_all(parser):
-    text_out, tools_out = [], []
-    for r in parser.flush():
-        if "text" in r:
-            text_out.append(r["text"])
+    emitted_text, emitted_tools = [], []
+    for result in parser.flush():
+        if "text" in result:
+            emitted_text.append(result["text"])
         else:
-            tools_out.append(r["tool"])
-    return "".join(text_out), tools_out
+            emitted_tools.append(result["tool"])
+    return "".join(emitted_text), emitted_tools
 
 
 def names(tools):
     return [t["function"]["name"] for t in tools]
 
 
-def args_of(tools, i=0):
+def args_of(tools, index=0):
     import json
 
-    return json.loads(tools[i]["function"]["arguments"])
+    return json.loads(tools[index]["function"]["arguments"])
 
 
 def test_fix1_flush_salvages_attribute_style_tool():
@@ -103,33 +107,78 @@ def test_fix1_flush_unparseable_still_strips_to_text():
     assert f_text == "not a tool body", repr(f_text)
 
 
-def test_fix2_prose_with_bare_lt_streams_immediately():
-    corpus = "if x < y then a > b"
-    p = StreamToolParser()
-    text, tools = feed_all(p, corpus, 2)
-    assert tools == []
-    assert text == corpus, f"bare '<' must not buffer prose, got {text!r}"
-    f_text, _ = flush_all(p)
-    assert f_text == ""
+def test_fix2_hold_and_flush_edge_cases():
+    cases = [
+        ("bare_lt", "if x < y then a > b", 2, 8),
+        ("long_bare_lt", "if a < b and then c is larger than d " + "x" * 120, 3, 9),
+        ("prefix_b", "1 < b and more prose", 1, 6),
+        ("prefix_c", "1 < c and more prose", 1, 6),
+        ("prefix_th", "1 < th and more prose", 1, 7),
+        ("prefix_cat", "1 < cat and more prose", 1, 8),
+        ("prefix_callsi", "1 < callsi and more prose", 1, 11),
+        ("prefix_tool_", "use <tool_ in prose", 3, 12),
+    ]
+    for label, corpus, chunk_size, cutoff in cases:
+        parser = StreamToolParser()
+        streamed, tools = feed_all(parser, corpus, chunk_size)
+        assert tools == [] and streamed == corpus and parser.buffer == "", label
+        flush_text, flush_tools = flush_all(parser)
+        assert flush_tools == [] and flush_text == "", label
+        prefix_parser = StreamToolParser()
+        head, head_tools = feed_all(prefix_parser, corpus[:cutoff], chunk_size)
+        assert head_tools == [] and head == corpus[:cutoff] and prefix_parser.buffer == "", label
+    eof_parser = StreamToolParser()
+    before_eof, before_tools = feed_all(eof_parser, "1 < c", 1)
+    assert before_tools == [] and before_eof == "1 " and eof_parser.buffer == "< c"
+    tail_text, tail_tools = flush_all(eof_parser)
+    assert tail_tools == [] and before_eof + tail_text == "1 < c"
+    closer_parser = StreamToolParser()
+    streamed_before, before_closer_tools = feed_all(closer_parser, "a</tool", 1)
+    assert before_closer_tools == [] and streamed_before == "a" and closer_parser.buffer == "</tool"
+    streamed_after, after_closer_tools = feed_all(closer_parser, "_x", 1)
+    assert after_closer_tools == [] and streamed_after == "</tool_x" and closer_parser.buffer == ""
+    closer_flush_text, closer_flush_tools = flush_all(closer_parser)
+    assert closer_flush_tools == [] and closer_flush_text == ""
+    empty_parser = StreamToolParser()
+    assert empty_parser.feed("") == []
+    held_text, held_tools = feed_all(empty_parser, "hi < ", 4)
+    assert held_tools == [] and held_text == "hi " and empty_parser.buffer == "< "
+    assert empty_parser.feed("") == []
+    assert empty_parser.buffer == "< "
+    empty_flush_text, empty_flush_tools = flush_all(empty_parser)
+    assert empty_flush_tools == [] and held_text + empty_flush_text == "hi < "
 
 
-def test_fix2_hold_is_bounded():
-    """A tail that keeps looking like a tag prefix can never buffer more than
-    _MAX_TAG_HOLD characters."""
-    assert _MAX_TAG_HOLD <= 15, "review asked for a ~15-char bound"
-    corpus = "a <" + "z" * 200
-    p = StreamToolParser()
-    text, _ = feed_all(p, corpus, 3)
-    f_text, _ = flush_all(p)
-    assert text + f_text == corpus
-
-
-def test_fix2_partial_prefix_released_as_prose():
-    corpus = xml("use [LT]tool_ in prose")
-    p = StreamToolParser()
-    text, _ = feed_all(p, corpus, 3)
-    f_text, _ = flush_all(p)
-    assert text + f_text == corpus
+def test_plausibility_helpers_track_entry_and_closer_grammar():
+    entry_true = [
+        "<", "< ", "<|", "<||", "<||D", "<||DS", "<||DSM", "<||DSML",
+        "<||DSML|", "<||DSML||", "<||DSML|| ",
+        "<||DSML|| i", "<||DSML|| invo", "<||DSML|| invoke",
+        "<||DSML|| invoke ", "<||DSML|| invoke n", "<||DSML|| invoke na",
+        "<||DSML|| invoke name=", '<||DSML|| invoke name="',
+        '<||DSML|| invoke name="abc', '<||DSML|| invoke name="abc"',
+        "< c", "< ca", "< calls", "< t", "< to", "< too",
+        "<|invo", "<||dsml|| c", "<invoke ",
+    ]
+    entry_false = [
+        "", "x", "<b", "< b", "< cat", "< callsign", "< callsi", "< th",
+        "< invx", "< D", "< DSML", "<| D", "<|y|", "</", "</b", "</invoke",
+        "<||DSML|||", '<||DSML|| invoke name="abc">',
+    ]
+    closer_true = [
+        "</", "</ ", "</i", "</inv", "</invo", "</invoke", "</invoke ",
+        "</tool", "</tool_", "</|", "</||DSML|| c", "</||DSML|| calls",
+    ]
+    closer_false = ["", "</b", "</ cat", "</tool_x", "</||DSML|| calr", "</x"]
+    checks = (
+        (_is_plausible_stream_entry_prefix, entry_true, True),
+        (_is_plausible_stream_entry_prefix, entry_false, False),
+        (_is_plausible_stream_closer_prefix, closer_true, True),
+        (_is_plausible_stream_closer_prefix, closer_false, False),
+    )
+    for walker, segments, expected in checks:
+        for segment in segments:
+            assert walker(segment) is expected, segment
 
 
 def test_fix3_mismatched_plain_closer():
@@ -189,20 +238,78 @@ def test_complete_blocks_unchanged():
     assert f_tools == []
 
 
+def _build_block(decor, spacing, tool_name, params, nested=False):
+    opener = "<" + decor + spacing + 'invoke name="' + tool_name + '">'
+    body = "".join(
+        "<" + decor + spacing + 'parameter name="' + name + '" string="true">' + value
+        + "</" + decor + spacing + "parameter>"
+        for name, value in params.items()
+    )
+    closer = "</" + decor + spacing + "invoke>"
+    if nested:
+        opener = "<" + decor + spacing + "calls>" + opener
+        closer = closer + "</" + decor + spacing + "calls>"
+    return opener, opener + body + closer
+
+
+def test_dsml_openers_parse_when_split_across_chunks():
+    fullwidth_bar = "\uff5c"
+    marker = fullwidth_bar * 2 + "DSML" + fullwidth_bar * 2
+    mcp_tool = "mcp_pylance_mcp_s_pylanceCheckSignatureCompatibility"
+    file_uri = {"fileUri": "functions.py"}
+    dialect_shapes = [
+        ("plain", marker, "", False),
+        ("spaced", marker, " ", False),
+        ("halfwidth_bars", "||DSML||", " ", False),
+        ("no_decoration", "", "", False),
+        ("single_bar", "|", "", False),
+        ("mixed_bars", "|" + fullwidth_bar + "DSML" + fullwidth_bar + "|", "", False),
+        ("lowercase_marker", "||dsml||", " ", False),
+        ("nested_calls", marker, "", True),
+    ]
+    cases = []
+    for label, decor, spacing, nested in dialect_shapes:
+        opener, corpus = _build_block(decor, spacing, mcp_tool, file_uri, nested)
+        cases.append((label, corpus, (1, max(len(opener) - 1, 1), len(opener)), mcp_tool, file_uri))
+    long_tool = "mcp_" + "x" * 5000
+    long_param = "p" * 300
+    long_value = "v" * 5000
+    opener, corpus = _build_block(marker, "", long_tool, {long_param: long_value})
+    assert len(opener) > 5000
+    cases.append(("unbounded_opener", corpus, (1, 7, len(opener) - 1, len(opener)), long_tool, {long_param: long_value}))
+    cases.append((
+        "json_body",
+        "<" + marker + 'tool_call>{"name": "Bash", "arguments": {"command": "ls -la"}}</' + marker + "tool_call>",
+        (1, 5, 11),
+        "Bash",
+        {"command": "ls -la"},
+    ))
+    for label, corpus, chunk_sizes, tool_name, tool_args in cases:
+        for chunk_size in chunk_sizes:
+            where = f"{label} chunk={chunk_size}"
+            parser = StreamToolParser()
+            streamed, tools = feed_all(parser, corpus, chunk_size)
+            assert parser.buffer == "" and not parser.in_tool, where
+            assert names(tools) == [tool_name], f"{where} {tools}"
+            assert args_of(tools) == tool_args, where
+            flush_text, flush_tools = flush_all(parser)
+            assert flush_tools == [] and streamed + flush_text == "", where
+
+
 TESTS = [
     test_fix1_flush_salvages_attribute_style_tool,
     test_fix1_flush_salvages_truncated_json_tool,
     test_fix1_flush_drops_wrapper_noise_after_json,
     test_fix1_flush_unparseable_still_strips_to_text,
-    test_fix2_prose_with_bare_lt_streams_immediately,
-    test_fix2_hold_is_bounded,
-    test_fix2_partial_prefix_released_as_prose,
+    test_fix2_hold_and_flush_edge_cases,
+    test_plausibility_helpers_track_entry_and_closer_grammar,
     test_fix3_mismatched_plain_closer,
     test_fix3_decorated_closer_halfwidth,
     test_fix3_decorated_closer_fullwidth,
     test_fix3_cross_family_closer,
     test_flush_is_terminal_and_resets_state,
     test_complete_blocks_unchanged,
+    test_dsml_openers_parse_when_split_across_chunks,
 ]
 
 
