@@ -5,14 +5,17 @@ import os
 import re
 import secrets
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from urllib.parse import urlparse
 
 import deepseek_tokenizer
 import uvicorn
 from dotenv import load_dotenv
+from uvicorn.logging import AccessFormatter
 from fastapi import FastAPI, Request, Depends, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -80,6 +83,65 @@ if not logging.getLogger().handlers:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+# The token used for this request, logged as "key: <alias>".
+# Must stay a dict: BaseHTTPMiddleware runs the endpoint in a child task, and
+# only in place mutation of the same object reaches the access log context.
+_key_holder = ContextVar("deeperseeker_key", default=None)
+_ALIAS_MAX_LEN = 64
+# Strip characters that forge log lines, drive the cursor, or render invisibly.
+_ALIAS_STRIP_CATS = frozenset({"Cc", "Cf", "Zl", "Zp"})
+_ALIAS_INVISIBLE = frozenset(
+    [0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D,
+     0x2800, 0x3164, 0xFFA0]
+    + list(range(0xFE00, 0xFE10))
+    + list(range(0xE0100, 0xE01F0))
+)
+# Noncharacters are illegal in interchange; some log processors reject them.
+_ALIAS_NONCHARACTERS = frozenset(
+    list(range(0xFDD0, 0xFDF0))
+    + [plane << 16 | low for plane in range(0x11) for low in (0xFFFE, 0xFFFF)]
+)
+
+
+def _sanitize_alias(name):
+    if not name:
+        return None
+    cleaned = "".join(
+        ch for ch in str(name)
+        if ord(ch) not in _ALIAS_INVISIBLE
+        and ord(ch) not in _ALIAS_NONCHARACTERS
+        and unicodedata.category(ch) not in _ALIAS_STRIP_CATS
+    ).strip()
+    return cleaned[:_ALIAS_MAX_LEN] or None
+
+
+def _set_key_name(name):
+    holder = _key_holder.get()
+    if holder is not None:
+        holder["name"] = _sanitize_alias(name)
+
+
+class KeyAccessFormatter(AccessFormatter):
+    def formatMessage(self, record):
+        line = super().formatMessage(record)
+        # Sanitize again at emit time so no raw value reaches the log line.
+        name = _sanitize_alias((_key_holder.get() or {}).get("name"))
+        return f"{line} key: {name}" if name else line
+
+
+def _install_key_access_formatter():
+    for handler in logging.getLogger("uvicorn.access").handlers:
+        formatter = handler.formatter
+        if not isinstance(formatter, AccessFormatter) or isinstance(formatter, KeyAccessFormatter):
+            continue
+        handler.setFormatter(
+            KeyAccessFormatter(
+                fmt=formatter._fmt,
+                datefmt=formatter.datefmt,
+                use_colors=getattr(formatter, "use_colors", None),
+            )
+        )
+
 
 def count_tok(text):
     return len(deepseek_tokenizer.ds_token.encode(text))
@@ -88,6 +150,7 @@ def count_tok(text):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    _install_key_access_formatter()
     yield
 
 
@@ -98,6 +161,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.middleware("http")
 async def limit_body_size(request: Request, call_next):
+    _key_holder.set({})
     cl = request.headers.get("content-length", "")
     if cl.isdigit() and int(cl) > 32 * 1024 * 1024:
         return JSONResponse({"error": "Request body too large"}, status_code=413)
@@ -348,6 +412,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             if new_token_id and (not tok or new_token_id != token_id):
                 new_tok = get_token(new_token_id)
                 if new_tok:
+                    _set_key_name(new_tok.get("alias"))
                     # Stage 0.3: rotation re-creates the upstream chat; hold the
                     # new chat's lock across its send -> save section so a
                     # concurrent same-signature request cannot race the swap.
@@ -453,6 +518,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     tok = get_token(token_id)
     if not tok:
         return JSONResponse({"error": "Token expired"}, status_code=503)
+    _set_key_name(tok.get("alias"))
 
     is_first = parent_message_id == 0
     # Stage 0.3: hold this chat's lock across the whole send -> save critical
@@ -877,6 +943,9 @@ async def files_upload(request: Request):
     if not tok_id:
         return JSONResponse({"error": "No tokens available"}, status_code=503)
     tok = get_token(tok_id)
+    if not tok:
+        return JSONResponse({"error": "Token not found"}, status_code=503)
+    _set_key_name(tok.get("alias"))
     form = await request.form()
     file_obj = form.get("file")
     if not file_obj:
@@ -921,6 +990,9 @@ async def files_content(file_id: str, request: Request):
     if not tok_id:
         return JSONResponse({"error": "No tokens available"}, status_code=503)
     tok = get_token(tok_id)
+    if not tok:
+        return JSONResponse({"error": "Token not found"}, status_code=503)
+    _set_key_name(tok.get("alias"))
     gen = get_file_content(tok["token"], file_id)
     try:
         mime = await gen.__anext__()
