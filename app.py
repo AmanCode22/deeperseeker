@@ -54,6 +54,7 @@ from functions import (
     upload_file,
     get_file_content,
 )
+from middleware import RecovererMiddleware, RealIPMiddleware, RequestIDMiddleware
 from plugin_helper import (
     build_prompt,
     build_summary_request_prompt,
@@ -102,6 +103,19 @@ async def limit_body_size(request: Request, call_next):
     return await call_next(request)
 
 
+# Stage 0.1 + 0.2 — core rails: fail-closed real-client-IP resolution behind
+# proxies (TRUSTED_PROXIES), per-request correlation ids with access logging,
+# and a last-resort exception barrier that turns handler crashes into logged
+# JSON 500s. Starlette runs the LAST-registered middleware FIRST (outermost),
+# so registration order RealIP -> RequestID -> Recoverer yields the execution
+# order Recoverer -> RequestID -> RealIP -> limit_body_size -> routes: the
+# recoverer sees every error below it, and every response (including its own
+# 500s) carries the request id.
+app.add_middleware(RealIPMiddleware)
+app.add_middleware(RequestIDMiddleware)
+app.add_middleware(RecovererMiddleware)
+
+
 SESSIONS = {}
 SESSION_TTL = 7 * 24 * 3600
 # One asyncio.Lock per conversation signature, used to serialize first-time
@@ -112,6 +126,53 @@ SESSION_TTL = 7 * 24 * 3600
 _sig_locks = {}
 SIG_LOCKS_MAX = int(os.getenv("DEEPSEEKER_MAX_SIG_LOCKS", "4096"))
 _login_fails = {"count": 0, "locked_until": 0}
+
+# Stage 0.3 — Per-chat locks (session-collision fix).
+# One asyncio.Lock per UPSTREAM chat session id. _sig_locks above only
+# serializes first-time session CREATION for one signature; it does nothing
+# for two concurrent requests that already share (or race to use) the same
+# upstream DeepSeek chat: both would send with the same parent_message_id,
+# fork the upstream conversation, and the last save_session() would corrupt
+# the stored parent counter. The chat lock serializes the send -> save
+# critical section per upstream session, so same-chat requests queue instead
+# of colliding (different chats remain fully parallel). Keyed by upstream
+# session id rather than signature, because each completed turn derives a new
+# signature while the upstream chat stays the same. Eviction mirrors
+# _sig_locks: when the cap is hit, the oldest half of currently-unlocked
+# entries is dropped (worst case: one benign unserialized request).
+_chat_locks = {}
+CHAT_LOCKS_MAX = int(os.getenv("DEEPSEEKER_MAX_CHAT_LOCKS", "4096"))
+
+
+def _chat_lock(session_id):
+    key = str(session_id)
+    while len(_chat_locks) >= CHAT_LOCKS_MAX:
+        chunk = list(_chat_locks.items())[: CHAT_LOCKS_MAX // 2 + 1]
+        evictable = [k for k, v in chunk if not v.locked()]
+        if not evictable:
+            break  # everything in the chunk is in use; retry on a later request
+        for k in evictable:
+            _chat_locks.pop(k, None)
+    return _chat_locks.setdefault(key, asyncio.Lock())
+
+
+def _release_chat_lock_stream(gen, lock):
+    """Wrap a streaming generator so the per-chat lock stays held until the
+    stream completes (or the client aborts), then is released exactly once.
+
+    The lock is acquired in handle_chat before the upstream POST; for streaming
+    responses the final save_session() happens inside the stream generator, so
+    ownership of the lock must transfer from handle_chat to the generator —
+    releasing any earlier would reopen the parent_message_id race the lock
+    exists to prevent."""
+    async def _wrapped():
+        try:
+            async for chunk in gen:
+                yield chunk
+        finally:
+            if lock.locked():
+                lock.release()
+    return _wrapped()
 
 
 def get_current_admin(request: Request):
@@ -194,9 +255,15 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             if new_token_id and (not tok or new_token_id != token_id):
                 new_tok = get_token(new_token_id)
                 if new_tok:
+                    # Stage 0.3: rotation re-creates the upstream chat; hold the
+                    # new chat's lock across its send -> save section so a
+                    # concurrent same-signature request cannot race the swap.
+                    rot_lock = None
                     try:
                         delete_sessions_for_chat(token_id, session_id)
                         new_session_id = await create_new_chat(new_tok["token"])
+                        rot_lock = _chat_lock(new_session_id)
+                        await rot_lock.acquire()
                         if needs_rollover(messages):
                             scratch_chat = await create_new_chat(new_tok["token"])
                             summary_gen = send_message(
@@ -209,11 +276,14 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, file_ids)
                         gen = await _preflight_stream(gen)
                     except Exception as e:
+                        if rot_lock is not None and rot_lock.locked():
+                            rot_lock.release()
                         logger.exception("Token-rotation recovery failed (chat %s): %s", session_id, e)
                         if _retried:
                             return _api_error_response(e, is_anthropic)
                         return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
                     if stream:
+                        gen = _release_chat_lock_stream(gen, rot_lock)
                         if is_anthropic:
                             return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0, scope), media_type="text/event-stream")
                         return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0, scope), media_type="text/event-stream")
@@ -222,6 +292,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                             resp_text = await collect_response(gen)
                         except Exception as e:
                             logger.exception("Upstream failed during token-rotation request: %s", e)
+                            if rot_lock is not None and rot_lock.locked():
+                                rot_lock.release()
                             if _retried:
                                 return _api_error_response(e, is_anthropic)
                             return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
@@ -241,6 +313,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
 
                         save_session(sig, new_token_id, new_session_id, next_parent(0))
                         save_session(next_sig, new_token_id, new_session_id, next_parent(0))
+                        if rot_lock is not None and rot_lock.locked():
+                            rot_lock.release()
                         return format_response(resp_text, model, messages, tools)
             return JSONResponse({"error": {"message": "No active tokens available (all rate limited). Try again later.", "type": "rate_limit_error"}}, status_code=429)
     else:
@@ -296,6 +370,12 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         return JSONResponse({"error": "Token expired"}, status_code=503)
 
     is_first = parent_message_id == 0
+    # Stage 0.3: hold this chat's lock across the whole send -> save critical
+    # section; for streams, ownership transfers to the response generator via
+    # _release_chat_lock_stream (the final save_session happens there).
+    chat_lock = _chat_lock(session_id)
+    await chat_lock.acquire()
+    lock_owned = True
     try:
         file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
         prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
@@ -303,6 +383,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
         gen = await _preflight_stream(gen)
         if stream:
+            gen = _release_chat_lock_stream(gen, chat_lock)
+            lock_owned = False
             if is_anthropic:
                 return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id, scope), media_type="text/event-stream")
             return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope), media_type="text/event-stream")
@@ -337,6 +419,9 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         if code not in (401, 403, 429) and parent_message_id == 0:
             return _api_error_response(e, is_anthropic)
         return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
+    finally:
+        if lock_owned:
+            chat_lock.release()
 
 
 async def collect_response(gen):
