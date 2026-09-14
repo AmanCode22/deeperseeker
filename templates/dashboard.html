@@ -3,8 +3,40 @@
 {% block content %}
 <h1>Dashboard</h1>
 
+{% if heal %}
+<div class="{% if heal_result and heal_result.startswith('error') or heal_result == 'dead' %}warning{% else %}steps{% endif %}">
+    {% if not heal_result %}
+    <p>Heal result: unknown.</p>
+    {% elif heal_result == 'ok' %}
+    <p><strong>Token #{{ heal }} healed:</strong> re-login succeeded, fresh token stored.</p>
+    {% elif heal_result == 'recovered' %}
+    <p><strong>Token #{{ heal }} recovered:</strong> health probe failed, auto re-login brought it back.</p>
+    {% elif heal_result == 'ok_probe' or heal_result == 'degraded' %}
+    <p>Token #{{ heal }} probe finished: {{ heal_result }} (transient errors are retried automatically).</p>
+    {% elif heal_result == 'dead' %}
+    <p><strong>Token #{{ heal }} looks dead:</strong> repeated probes failed and it was parked as RATE_LIMITED.</p>
+    {% else %}
+    <p><strong>Token #{{ heal }} heal failed:</strong> {{ heal_result.removeprefix('error-') }}.</p>
+    {% endif %}
+</div>
+{% endif %}
+
 <section>
-    <h2>Add Auth Token</h2>
+    <h2>Add Account (email or mobile + password)</h2>
+    <p>Logs in over pure HTTP and stores the password encrypted (Fernet) so the
+    account can re-login itself when the token dies — no manual token extraction.</p>
+    <form method="post" action="/accounts/add">
+        <input type="text" name="alias" placeholder="Alias (optional)" style="width:150px">
+        <input type="text" name="email" placeholder="Email (or fill mobile below)" style="width:220px">
+        <input type="text" name="mobile" placeholder="Mobile (or fill email above)" style="width:160px">
+        <input type="text" name="area_code" placeholder="Area code (default 86)" style="width:110px">
+        <input type="password" name="password" placeholder="DeepSeek password" style="width:180px">
+        <button type="submit">Add Account</button>
+    </form>
+</section>
+
+<section>
+    <h2>Add Auth Token (manual paste)</h2>
     <div class="steps">
         <p><strong>Steps:</strong></p>
         <ol>
@@ -21,6 +53,7 @@
     </div>
     <div class="warning">
         If you logout from DeepSeek in browser, this token stops working.
+        Manual tokens cannot self-heal — prefer adding an account above.
     </div>
     <form method="post" action="/tokens/add">
         <input type="text" name="alias" placeholder="Alias (optional, e.g. personal, work)" style="width:200px">
@@ -36,9 +69,13 @@
         <thead>
             <tr>
                 <th>ID</th>
+                <th>Kind</th>
                 <th>Alias</th>
+                <th>Account</th>
                 <th>Token</th>
                 <th>Status</th>
+                <th>Errors</th>
+                <th>Last login</th>
                 <th>Actions</th>
             </tr>
         </thead>
@@ -46,14 +83,21 @@
             {% for tok in tokens %}
             <tr>
                 <td>{{ tok['id'] }}</td>
+                <td>{{ tok['kind'] }}</td>
                 <td>{{ tok['alias'] or '—' }}</td>
+                <td>{{ tok['identifier'] or '—' }}</td>
                 <td><code>{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
                 <td>
                     <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] == 'RATE_LIMITED' %}warn{% else %}err{% endif %}">
                         {{ tok['status'] }}
                     </span>
                 </td>
+                <td>{{ tok['error_count'] }}</td>
+                <td>{{ tok['last_login_at'] or '—' }}</td>
                 <td>
+                    <form method="post" action="/tokens/{{ tok['id'] }}/heal" style="display:inline">
+                        <button type="submit" class="btn-sm">{% if tok['kind'] == 'login' %}Re-login{% else %}Probe{% endif %}</button>
+                    </form>
                     <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
                           onsubmit="return confirm('Delete?')">
                         <button type="submit" class="btn-sm btn-danger">Delete</button>
@@ -73,5 +117,6 @@
     <p>OpenAI: <code>http://localhost:4000/v1</code></p>
     <p>Anthropic: <code>http://localhost:4000</code></p>
     <p>Model: <code>v4.1flash</code> (single default DeepSeek model)</p>
+    <p>Accounts: <code>POST /accounts/add</code> · <code>POST /accounts/relogin</code> (admin cookie, JSON or form)</p>
 </section>
 {% endblock %}

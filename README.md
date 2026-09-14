@@ -80,11 +80,34 @@ cp .env.example .env
 | `DEEPSEEKER_MAX_SUMMARY_TOKENS` | Budget for the model-generated handoff summary | `4096` |
 | `DEEPSEEKER_PER_TOOL_RESULT_TOKENS` | Per-result tool-output cap (so one giant output can't eat the budget) | `2000` |
 
-## Auth Token Setup
+## Account Setup
+
+### Preferred: add a real account (self-healing)
+
+1. Dashboard (`/dashboard`) -> **Add Account** -> email *or* mobile (+ area code, default 86) + DeepSeek password
+2. Or via API (admin cookie): `POST /accounts/add` with JSON `{"email": "...", "password": "..."}` (or `{"mobile": "...", "area_code": "86", "password": "..."}`)
+
+No manual token extraction anywhere. The password is stored Fernet-encrypted
+(`enc:v1:...`; key from `DEEPSEEKER_FERNET_KEY` or an auto-generated
+`<db>.key`), and the account maintains itself:
+
+- **401 refresh** - a dead bearer token triggers exactly one re-login, then the request is retried with the fresh token
+- **Health probes** - a background loop does a real create-session probe per account; failures accrue and at the threshold the account auto-recovers (or is parked when it cannot heal)
+- **Login cooldown** - logins are rate-limited with per-identifier exponential backoff plus a global sliding window
+
+Heal one account on demand: dashboard **Re-login** button, or
+`POST /accounts/relogin` with `{"identifier": "<email or mobile>"}`.
+
+### Manual token paste (legacy, cannot self-heal)
 
 1. Open incognito window -> `chat.deepseek.com` -> Login
 2. Console (F12): `JSON.parse(localStorage.getItem("userToken")).value`
-3. Paste raw token string into Dashboard (`/dashboard`). Close incognito window.
+3. Paste raw token string into Dashboard. Close incognito window.
+
+**Upgrading a pre-Stage-1 database**: the first boot migrates the `tokens`
+table in place (new columns, legacy plaintext tokens encrypted) and snapshots
+the untouched database to `<db>.bak` - stop the process and copy the `.bak`
+back to roll back.
 
 ## API Endpoints & Usage
 
