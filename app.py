@@ -686,6 +686,15 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
     # carries id/object/created/model so strict clients accept the stream.
     chunk_id = f"chatcmpl-{uuid.uuid4()}"
     created = int(time.time())
+    # OpenAI convention: the first delta carries "role": "assistant".
+    # Strict client accumulators ignore content deltas until they see a
+    # role, which surfaces as replies cut short from the beginning.
+    _role_sent = [False]
+
+    def _chunk(delta, finish_reason=None):
+        if delta and not _role_sent[0]:
+            delta = {"role": "assistant", **delta}
+            _role_sent[0] = True
 
     def _chunk(delta, finish_reason=None):
         return (
