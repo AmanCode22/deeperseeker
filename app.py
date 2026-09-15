@@ -705,6 +705,15 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                     yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]})}\n\n"
                 else:
                     yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                # OpenAI-compatible gateways (New API, sub2api, ...) read billing
+                # usage from the trailing usage chunk. Always emit it here so
+                # clients that omit stream_options.include_usage still get counted:
+                # the empty choices array is what gateways expect, and official
+                # SDKs simply ignore it. Skipped on aborted/failed streams so a
+                # partial response never pollutes billing.
+                in_tokens = count_tok(_messages_text(messages))
+                out_tokens = count_tok(full_text)
+                yield f"data: {json.dumps({'choices': [], 'usage': {'prompt_tokens': in_tokens, 'completion_tokens': out_tokens, 'total_tokens': in_tokens + out_tokens}})}\n\n"
                 yield "data: [DONE]\n\n"
             except asyncio.CancelledError:
                 pass
