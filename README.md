@@ -38,23 +38,36 @@ Suggested in issue [#3](https://github.com/AmanCode22/deeperseeker/issues/3)
 
 ```bash
 cp .env.example .env
+# then edit .env (API key, admin password, ...)
 
 # Using Podman (Recommended - Rootless)
 podman build -t deeperseeker .
-podman run -d --name deeperseeker -p 4000:4000 --env-file .env deeperseeker
+# --env-file loads .env into the container; -e HOST wins over .env's
+# bare-metal default (127.0.0.1 would be unreachable from the host).
+podman run -d --name deeperseeker -p 4000:4000 --env-file .env -e HOST=0.0.0.0 deeperseeker
 
 # Using Docker
 docker build -t deeperseeker .
-docker run -d --name deeperseeker -p 4000:4000 --env-file .env deeperseeker
+docker run -d --name deeperseeker -p 4000:4000 --env-file .env -e HOST=0.0.0.0 deeperseeker
 
-# Or using Podman Compose / Docker Compose
-podman-compose up -d
-# docker compose up -d
+# Or using Podman Compose / Docker Compose (loads .env automatically)
+podman-compose up -d --build
+# docker compose up -d --build
 ```
 
-Note: `docker-compose.yml` binds to `127.0.0.1:4000` only (local access) — change the ports mapping if you need to expose it.
+Note: `docker-compose.yml` binds to `127.0.0.1:${PORT}` only (local access) — change the ports mapping if you need to expose it. `PORT` from `.env` is respected for both the mapping and the in-container server.
 
 Dashboard: `http://localhost:4000/`
+
+> **Sessions:** dashboard logins are stored in SQLite (`admin_sessions`, 7-day
+> sliding expiry), so they survive restarts and work across workers as long
+> as `DB_PATH` is shared (Docker volume `/app/data` by default).
+
+## Health
+
+- `GET /health` — liveness, always 200 when the process is up (Docker
+  `HEALTHCHECK` / k8s livenessProbe target).
+- `GET /ready` — readiness, 200 only with ≥1 `ACTIVE` token, else 503.
 
 ## Configuration (`.env`)
 

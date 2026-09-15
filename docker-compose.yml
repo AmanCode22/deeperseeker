@@ -3,10 +3,16 @@ services:
     build: .
     container_name: deeperseeker
     ports:
-      - "127.0.0.1:4000:4000"
+      # Host port follows ${PORT} from .env / shell (defaults to 4000);
+      # container port is the same $PORT the app listens on.
+      - "127.0.0.1:${PORT:-4000}:${PORT:-4000}"
     environment:
+      # Must win over .env (which defaults to 127.0.0.1 for bare-metal):
+      # inside a container localhost means "container only".
       - HOST=0.0.0.0
     env_file:
+      # Auto-loads .env into the container (all DEEPSEEKER_*, PORT, etc.).
+      # Missing file is fine — image defaults apply.
       - path: .env
         required: false
     volumes:

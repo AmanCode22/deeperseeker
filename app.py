@@ -23,9 +23,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-os.chdir(BASE_DIR)
 
-load_dotenv()
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 API_KEY = os.getenv("DEEPSEEKER_API_KEY") or "dseeker"
 ADMIN_USER = os.getenv("DEEPSEEKER_ADMIN_USER", "admin")
@@ -39,7 +38,9 @@ from functions import (
     cookie_file_path,
     add_token,
     count_tokens,
+    create_admin_session,
     create_new_chat,
+    delete_admin_session,
     delete_token,
     delete_sessions_for_chat,
     find_session,
@@ -55,6 +56,7 @@ from functions import (
     save_session,
     send_message,
     StreamToolParser,
+    touch_admin_session,
     upload_file,
     get_file_content,
 )
@@ -149,22 +151,49 @@ def count_tok(text):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    # DB (sqlite, blocking) must not run on the event loop.
+    await asyncio.to_thread(init_db)
     _install_key_access_formatter()
     yield
 
 
 app = FastAPI(title="DeeperSeeker", lifespan=lifespan)
-templates = Jinja2Templates(directory="templates")
-app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+
+# Cap on inbound HTTP bodies. Content-Length is checked first for a fast
+# reject; the body is then buffered and measured so chunked requests (or a
+# lying Content-Length) cannot bypass the cap.
+MAX_BODY_BYTES = 32 * 1024 * 1024
+
+
+async def _db_call(func, *args, **kwargs):
+    """Run a blocking sqlite helper in a worker thread.
+
+    Keeps sync DB helpers (and test doubles patched onto app globals) working
+    while keeping the event loop free. Resolves `func` at call time so tests
+    patching app.find_session etc. still take effect.
+    """
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 @app.middleware("http")
 async def limit_body_size(request: Request, call_next):
     _key_holder.set({})
     cl = request.headers.get("content-length", "")
-    if cl.isdigit() and int(cl) > 32 * 1024 * 1024:
+    if cl.isdigit() and int(cl) > MAX_BODY_BYTES:
         return JSONResponse({"error": "Request body too large"}, status_code=413)
+    body = await request.body()
+    if len(body) > MAX_BODY_BYTES:
+        return JSONResponse({"error": "Request body too large"}, status_code=413)
+    # Starlette caches request.body(); replay receive for parsers that read
+    # from the stream (e.g. form/multipart) across Starlette versions.
+    async def _replay_receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+    try:
+        request._receive = _replay_receive  # type: ignore[attr-defined]
+    except Exception:
+        pass
     return await call_next(request)
 
 
@@ -181,7 +210,9 @@ app.add_middleware(RequestIDMiddleware)
 app.add_middleware(RecovererMiddleware)
 
 
-SESSIONS = {}
+# Admin dashboard sessions are DB-backed (admin_sessions table) so logins
+# survive restarts and work across workers as long as DB_PATH is shared
+# (Docker volume /app/data by default). Sliding expiry of SESSION_TTL.
 SESSION_TTL = 7 * 24 * 3600
 # One asyncio.Lock per conversation signature, used to serialize first-time
 # session creation. Signatures are unique per message prefix, so without a cap
@@ -332,11 +363,10 @@ def _release_chat_lock_stream(gen, owner):
     return _wrapped()
 
 
-def get_current_admin(request: Request):
+async def get_current_admin(request: Request):
     sid = request.cookies.get("session_id")
-    if not sid or sid not in SESSIONS or time.time() - SESSIONS[sid] > SESSION_TTL:
+    if not sid or not await _db_call(touch_admin_session, sid, time.time(), SESSION_TTL):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
-    SESSIONS[sid] = time.time()
     origin = request.headers.get("origin", "")
     if origin:
         parsed = urlparse(origin).netloc
@@ -392,13 +422,51 @@ async def _preflight_stream(gen):
     return _replay_stream(gen, first)
 
 
+def _clean_text(text):
+    """Single place for tool-parse + think/tag stripping (was copy-pasted 5x)."""
+    parsed_tools, clean_text = parse_tools(text)
+    clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
+    clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+    return parsed_tools, clean_text
+
+
+def _assistant_msg(messages, parsed_tools, clean_text):
+    """Append the assistant turn (tool_calls or content) to a message copy."""
+    next_messages = messages.copy()
+    ast_msg = {"role": "assistant"}
+    if parsed_tools:
+        ast_msg["tool_calls"] = parsed_tools
+    else:
+        ast_msg["content"] = clean_text
+    next_messages.append(ast_msg)
+    return next_messages
+
+
+async def _save_turn(sig, next_messages, model, scope, token_id, session_id, parent_message_id):
+    """Persist current + next signature rows for one completed turn."""
+    next_sig = await generate_signature(next_messages, model, scope)
+    nxt = next_parent(parent_message_id)
+    await _db_call(save_session, sig, token_id, session_id, nxt)
+    await _db_call(save_session, next_sig, token_id, session_id, nxt)
+    return next_sig
+
+
+def _save_turn_sync(sig, next_messages, model, scope, token_id, session_id, parent_message_id):
+    """Sync variant for streaming generators' finally blocks (sync helpers)."""
+    next_sig = generate_signature_sync(next_messages, model, scope)
+    nxt = next_parent(parent_message_id)
+    save_session(sig, token_id, session_id, nxt)
+    save_session(next_sig, token_id, session_id, nxt)
+    return next_sig
+
+
 async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, scope="", _retried=False):
-    auth_token = get_auth_token()
+    auth_token = await _db_call(get_auth_token)
     if not auth_token:
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
 
     sig = await generate_signature(messages, model, scope)
-    sess = find_session(sig)
+    sess = await _db_call(find_session, sig)
     rollover_summary = None
 
     if sess:
@@ -406,11 +474,11 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         token_id = sess["token_id"]
         session_id = sess["session_id"]
         parent_message_id = sess["parent_message_id"]
-        tok = get_token(token_id)
+        tok = await _db_call(get_token, token_id)
         if not tok or tok["status"] == "RATE_LIMITED":
-            new_token_id = pick_token()
+            new_token_id = await _db_call(pick_token)
             if new_token_id and (not tok or new_token_id != token_id):
-                new_tok = get_token(new_token_id)
+                new_tok = await _db_call(get_token, new_token_id)
                 if new_tok:
                     _set_key_name(new_tok.get("alias"))
                     # Stage 0.3: rotation re-creates the upstream chat; hold the
@@ -418,7 +486,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                     # concurrent same-signature request cannot race the swap.
                     rot_owner = None
                     try:
-                        delete_sessions_for_chat(token_id, session_id)
+                        await _db_call(delete_sessions_for_chat, token_id, session_id)
                         new_session_id = await create_new_chat(new_tok["token"])
                         rot_owner = await _own_chat_lock(new_session_id)
                         if needs_rollover(messages):
@@ -454,22 +522,12 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                             if _retried:
                                 return _api_error_response(e, is_anthropic)
                             return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
-                        mark_active(new_token_id)
+                        await _db_call(mark_active, new_token_id)
 
-                        parsed_tools, clean_text = parse_tools(resp_text)
-                        clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-                        clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
-                        next_messages = messages.copy()
-                        ast_msg = {"role": "assistant"}
-                        if parsed_tools:
-                            ast_msg["tool_calls"] = parsed_tools
-                        else:
-                            ast_msg["content"] = clean_text
-                        next_messages.append(ast_msg)
-                        next_sig = await generate_signature(next_messages, model, scope)
+                        parsed_tools, clean_text = _clean_text(resp_text)
+                        next_messages = _assistant_msg(messages, parsed_tools, clean_text)
 
-                        save_session(sig, new_token_id, new_session_id, next_parent(0))
-                        save_session(next_sig, new_token_id, new_session_id, next_parent(0))
+                        await _save_turn(sig, next_messages, model, scope, new_token_id, new_session_id, 0)
                         if rot_owner is not None:
                             rot_owner.release()
                         return format_response(resp_text, model, messages, tools)
@@ -478,12 +536,12 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
 
         create_lock = _take_lock("sig", _sig_locks, sig, SIG_LOCKS_MAX)
         async with create_lock:
-            sess = find_session(sig)
+            sess = await _db_call(find_session, sig)
             if not sess:
-                token_id = pick_token()
+                token_id = await _db_call(pick_token)
                 if not token_id:
                     return JSONResponse({"error": "No tokens available"}, status_code=503)
-                tok = get_token(token_id)
+                tok = await _db_call(get_token, token_id)
                 if not tok:
                     return JSONResponse({"error": "Token not found"}, status_code=503)
 
@@ -508,14 +566,14 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                     )
 
                 session_id = await create_new_chat(tok["token"])
-                save_session(sig, token_id, session_id, 0)
+                await _db_call(save_session, sig, token_id, session_id, 0)
                 parent_message_id = 0
             else:
                 token_id = sess["token_id"]
                 session_id = sess["session_id"]
                 parent_message_id = sess["parent_message_id"]
 
-    tok = get_token(token_id)
+    tok = await _db_call(get_token, token_id)
     if not tok:
         return JSONResponse({"error": "Token expired"}, status_code=503)
     _set_key_name(tok.get("alias"))
@@ -540,30 +598,20 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope), media_type="text/event-stream")
         else:
             resp_text = await collect_response(gen)
-            mark_active(token_id)
+            await _db_call(mark_active, token_id)
 
-            parsed_tools, clean_text = parse_tools(resp_text)
-            clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-            clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
-            next_messages = messages.copy()
-            ast_msg = {"role": "assistant"}
-            if parsed_tools:
-                ast_msg["tool_calls"] = parsed_tools
-            else:
-                ast_msg["content"] = clean_text
-            next_messages.append(ast_msg)
-            next_sig = await generate_signature(next_messages, model, scope)
+            parsed_tools, clean_text = _clean_text(resp_text)
+            next_messages = _assistant_msg(messages, parsed_tools, clean_text)
 
-            save_session(sig, token_id, session_id, next_parent(parent_message_id))
-            save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
+            await _save_turn(sig, next_messages, model, scope, token_id, session_id, parent_message_id)
             return format_response(resp_text, model, messages, tools)
     except Exception as e:
         logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
         m = re.match(r"HTTP (\d{3}):", str(e))
         code = int(m.group(1)) if m else None
         if code in (401, 403, 429):
-            mark_limited(token_id)
-        delete_sessions_for_chat(token_id, session_id)
+            await _db_call(mark_limited, token_id)
+        await _db_call(delete_sessions_for_chat, token_id, session_id)
         if _retried:
             return _api_error_response(e, is_anthropic)
         if code not in (401, 403, 429) and parent_message_id == 0:
@@ -657,7 +705,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
             for r in parser.feed(chunk):
                 if "text" in r:
                     yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
-        mark_active(token_id)
+        await _db_call(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
         failed = True
@@ -667,28 +715,21 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         m = re.match(r"HTTP (\d{3}):", str(e))
         code = int(m.group(1)) if m else None
         if code in (401, 403, 429):
-            mark_limited(token_id)
+            await _db_call(mark_limited, token_id)
         logger.exception("stream_response failed")
         try:
             yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
         except Exception:
             pass
     finally:
-        parsed_tools, clean_text = parse_tools(full_text)
-        clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-        clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+        parsed_tools, clean_text = _clean_text(full_text)
 
         if not failed:
-            next_messages = messages.copy()
-            ast_msg = {"role": "assistant"}
-            if parsed_tools:
-                ast_msg["tool_calls"] = parsed_tools
-            else:
-                ast_msg["content"] = clean_text
-            next_messages.append(ast_msg)
+            next_messages = _assistant_msg(messages, parsed_tools, clean_text)
             next_sig = generate_signature_sync(next_messages, model, scope)
-            save_session(sig, token_id, session_id, next_parent(parent_message_id))
-            save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
+            nxt = next_parent(parent_message_id)
+            await _db_call(save_session, sig, token_id, session_id, nxt)
+            await _db_call(save_session, next_sig, token_id, session_id, nxt)
 
         if not aborted and not failed:
             try:
@@ -768,7 +809,7 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                         text_block_started = True
                     delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': r['text']}})}\n\n"
                     yield delta_evt
-        mark_active(token_id)
+        await _db_call(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
         failed = True
@@ -778,30 +819,22 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         m = re.match(r"HTTP (\d{3}):", str(e))
         code = int(m.group(1)) if m else None
         if code in (401, 403, 429):
-            mark_limited(token_id)
+            await _db_call(mark_limited, token_id)
         logger.exception("stream_anthropic_response failed")
         try:
             yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)[:300]}})}\n\n"
         except Exception:
             pass
     finally:
-        parsed_tools, clean_text = parse_tools(full_text)
+        parsed_tools, clean_text = _clean_text(full_text)
         out_tokens = count_tok(full_text)
 
-        clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-        clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
-
         if not failed:
-            next_messages = messages.copy()
-            ast_msg = {"role": "assistant"}
-            if parsed_tools:
-                ast_msg["tool_calls"] = parsed_tools
-            else:
-                ast_msg["content"] = clean_text
-            next_messages.append(ast_msg)
+            next_messages = _assistant_msg(messages, parsed_tools, clean_text)
             next_sig = generate_signature_sync(next_messages, model, scope)
-            save_session(sig, token_id, session_id, next_parent(parent_message_id))
-            save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
+            nxt = next_parent(parent_message_id)
+            await _db_call(save_session, sig, token_id, session_id, nxt)
+            await _db_call(save_session, next_sig, token_id, session_id, nxt)
 
         def _tb(text):
             return (f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'text', 'text': ''}})}\n\n"
@@ -849,14 +882,12 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
 
 def format_response(text, model, messages, tools=None):
     from functions import DEEPSEEK_TARIFFS
-    parsed_tools, clean_text = parse_tools(text)
+    parsed_tools, clean_text = _clean_text(text)
 
     reasoning = None
     match = re.search(r"<think>\s*(.*?)\s*</think>\s*", text, flags=re.DOTALL)
     if match:
         reasoning = match.group(1).strip()
-    clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-    clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
 
     in_tokens = count_tok(_messages_text(messages))
     out_tokens = count_tok(text)
@@ -939,10 +970,10 @@ def format_anthropic_response(result, model):
 async def files_upload(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
-    tok_id = pick_token()
+    tok_id = await _db_call(pick_token)
     if not tok_id:
         return JSONResponse({"error": "No tokens available"}, status_code=503)
-    tok = get_token(tok_id)
+    tok = await _db_call(get_token, tok_id)
     if not tok:
         return JSONResponse({"error": "Token not found"}, status_code=503)
     _set_key_name(tok.get("alias"))
@@ -986,10 +1017,10 @@ async def files_upload(request: Request):
 async def files_content(file_id: str, request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
-    tok_id = pick_token()
+    tok_id = await _db_call(pick_token)
     if not tok_id:
         return JSONResponse({"error": "No tokens available"}, status_code=503)
-    tok = get_token(tok_id)
+    tok = await _db_call(get_token, tok_id)
     if not tok:
         return JSONResponse({"error": "Token not found"}, status_code=503)
     _set_key_name(tok.get("alias"))
@@ -1377,9 +1408,9 @@ async def login_submit(request: Request):
     if secrets.compare_digest(username.encode("utf-8"), ADMIN_USER.encode("utf-8")) and secrets.compare_digest(password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
         _login_fails["count"] = 0
         sid = str(uuid.uuid4())
-        SESSIONS[sid] = time.time()
+        await _db_call(create_admin_session, sid, time.time())
         resp = HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
-        resp.set_cookie("session_id", sid, httponly=True, samesite="lax")
+        resp.set_cookie("session_id", sid, httponly=True, samesite="lax", path="/", max_age=SESSION_TTL)
         return resp
     _login_fails["count"] += 1
     if _login_fails["count"] >= 5:
@@ -1391,7 +1422,7 @@ async def login_submit(request: Request):
 @app.get("/logout")
 async def logout(request: Request):
     sid = request.cookies.get("session_id")
-    SESSIONS.pop(sid, None)
+    await _db_call(delete_admin_session, sid)
     resp = HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     resp.delete_cookie("session_id")
     return resp
@@ -1400,34 +1431,34 @@ async def logout(request: Request):
 @app.get("/dashboard")
 async def dashboard(request: Request):
     try:
-        get_current_admin(request)
+        await get_current_admin(request)
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
-    tokens = get_tokens()
+    tokens = await _db_call(get_tokens)
     return templates.TemplateResponse(request, "dashboard.html", {"tokens": tokens})
 
 
 @app.post("/tokens/add")
 async def tokens_add(request: Request):
     try:
-        get_current_admin(request)
+        await get_current_admin(request)
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     form = await request.form()
     auth_token = form.get("auth_token", "").strip().strip("'\"")
     alias = form.get("alias", "").strip() or None
     if auth_token:
-        add_token(auth_token, alias)
+        await _db_call(add_token, auth_token, alias)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 
 @app.post("/tokens/{token_id}/delete")
 async def tokens_delete(token_id: int, request: Request):
     try:
-        get_current_admin(request)
+        await get_current_admin(request)
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
-    delete_token(token_id)
+    await _db_call(delete_token, token_id)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 
@@ -1437,8 +1468,18 @@ async def root(request: Request):
 
 
 @app.get("/health")
-async def health(request: Request):
-    active = sum(1 for t in get_tokens() if t["status"] == "ACTIVE")
+async def health():
+    # Liveness: the process is up. Always 200 so orchestrators (Docker
+    # HEALTHCHECK, k8s livenessProbe) don't kill a fresh install that simply
+    # has no tokens configured yet. See /ready for readiness.
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/ready")
+async def ready(request: Request):
+    # Readiness: can this instance serve traffic (at least one ACTIVE token)?
+    tokens = await _db_call(get_tokens)
+    active = sum(1 for t in tokens if t["status"] == "ACTIVE")
     cookies_valid = False
     try:
         with open(cookie_file_path()) as f:

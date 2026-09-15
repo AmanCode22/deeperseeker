@@ -21,9 +21,21 @@ except ImportError:
 
 logger = logging.getLogger("deeperseeker.functions")
 
-wasm_path = "wasm/deepseek_pow_solver.wasm"
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_data_path(p):
+    # Absolute paths (e.g. Docker volume /app/data/...) pass through;
+    # bare relative paths resolve next to this file, not the process CWD
+    # (app.py no longer os.chdir()es, so CWD cannot be trusted).
+    if os.path.isabs(p):
+        return p
+    return os.path.join(_BASE_DIR, p)
+
+
+wasm_path = _resolve_data_path(os.getenv("DEEPSEEKER_WASM_PATH", os.path.join("wasm", "deepseek_pow_solver.wasm")))
 _session = None
-_db = os.getenv("DB_PATH", "deeperseeker.db")
+_db = _resolve_data_path(os.getenv("DB_PATH", "deeperseeker.db"))
 
 
 def cookie_file_path():
@@ -37,18 +49,19 @@ def cookie_file_path():
     p = os.getenv("DEEPSEEKER_COOKIE_PATH")
     if p:
         return p
-    p = "aws_cookies_deepseek.json"
-    try:
-        if os.path.islink(p):
-            target = os.path.realpath(p)
-            if target:
-                return target
-    except Exception:
-        pass
+    default_name = "aws_cookies_deepseek.json"
+    for candidate in (os.path.join(os.getcwd(), default_name), os.path.join(_BASE_DIR, default_name)):
+        try:
+            if os.path.islink(candidate):
+                target = os.path.realpath(candidate)
+                if target:
+                    return target
+        except Exception:
+            pass
     d = os.path.dirname(os.path.abspath(_db))
-    if d and os.path.abspath(d) != os.path.abspath(os.getcwd()):
+    if d:
         return os.path.join(d, "aws_cookies_deepseek.json")
-    return p
+    return os.path.join(_BASE_DIR, "aws_cookies_deepseek.json")
 
 try:
     _TZ_OFFSET = str(int(datetime.now().astimezone().utcoffset().total_seconds()))
@@ -87,6 +100,11 @@ def init_db():
             token_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS admin_sessions (
+            sid TEXT PRIMARY KEY,
+            created_at REAL NOT NULL,
+            last_seen REAL NOT NULL
+        );
     """)
     conn.commit()
     conn.close()
@@ -94,6 +112,77 @@ def init_db():
         prune_sessions()
     except Exception:
         logger.exception("Startup session pruning failed (non-fatal)")
+    try:
+        prune_admin_sessions()
+    except Exception:
+        logger.exception("Startup admin-session pruning failed (non-fatal)")
+
+
+def create_admin_session(sid, now=None):
+    """Persist a new dashboard login. Opportunistically prunes expired rows."""
+    now = time.time() if now is None else now
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO admin_sessions (sid, created_at, last_seen) VALUES (?, ?, ?)",
+            (sid, now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    try:
+        prune_admin_sessions(now=now)
+    except Exception:
+        logger.exception("Admin-session pruning failed (non-fatal)")
+
+
+def touch_admin_session(sid, now=None, ttl=7 * 24 * 3600):
+    """Sliding-window auth check: True (+bump last_seen) if valid, else False.
+
+    Expired rows are deleted so the table cannot grow unbounded.
+    """
+    if not sid or not isinstance(sid, str) or len(sid) > 128:
+        return False
+    now = time.time() if now is None else now
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT last_seen FROM admin_sessions WHERE sid = ?", (sid,)).fetchone()
+        if row is None:
+            return False
+        if now - float(row[0]) > ttl:
+            conn.execute("DELETE FROM admin_sessions WHERE sid = ?", (sid,))
+            conn.commit()
+            return False
+        conn.execute("UPDATE admin_sessions SET last_seen = ? WHERE sid = ?", (now, sid))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def delete_admin_session(sid):
+    if not sid:
+        return
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM admin_sessions WHERE sid = ?", (sid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def prune_admin_sessions(ttl=7 * 24 * 3600, now=None):
+    now = time.time() if now is None else now
+    conn = get_db()
+    try:
+        deleted = conn.execute(
+            "DELETE FROM admin_sessions WHERE ? - last_seen > ?", (now, ttl)
+        ).rowcount
+        conn.commit()
+        if deleted:
+            logger.info("Pruned %d expired admin session(s)", deleted)
+    finally:
+        conn.close()
 
 
 _session_lock = asyncio.Lock()

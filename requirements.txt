@@ -1,9 +1,13 @@
-wasmtime
-playwright
-aiohttp
-uvicorn
-fastapi
-python-multipart
-jinja2
-deepseek-tokenizer
-python-dotenv
+# Pinned for reproducible builds (floor versions verified with Python 3.12).
+# For an exact lock, maintainers run: pip freeze > requirements.lock
+# playwright is kept (backup WAF cookie generation), even though the default
+# Android-header path does not need it.
+wasmtime>=30.0.0,<31
+playwright>=1.40.0,<2
+aiohttp>=3.9.0,<4
+uvicorn>=0.30.0,<1
+fastapi>=0.115.0,<1
+python-multipart>=0.0.18,<1
+jinja2>=3.1.4,<4
+deepseek-tokenizer>=0.3.0,<1
+python-dotenv>=1.0.1,<2
