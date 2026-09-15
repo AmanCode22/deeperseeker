@@ -430,6 +430,28 @@ def _clean_text(text):
     return parsed_tools, clean_text
 
 
+def _log_tool_shapes(parsed_tools, where):
+    """Log tool name + top-level argument types (never values).
+
+    Distinguishes "model emitted a string where the schema wants a list"
+    from "the bridge mangled a list into a string" when hermes rejects a
+    call's shape. One line per tool call; safe for default log levels.
+    """
+    for tc in parsed_tools:
+        try:
+            fn = tc["function"]
+            args = json.loads(fn["arguments"]) if isinstance(fn["arguments"], str) else fn["arguments"]
+            shape = (
+                {k: type(v).__name__ for k, v in args.items()}
+                if isinstance(args, dict)
+                else type(args).__name__
+            )
+        except Exception:
+            shape = "unparseable"
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+        logger.info("%s tool=%s arg_shapes=%s", where, fn.get("name"), shape)
+
+
 def _assistant_msg(messages, parsed_tools, clean_text):
     """Append the assistant turn (tool_calls or content) to a message copy."""
     next_messages = messages.copy()
@@ -525,6 +547,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         await _db_call(mark_active, new_token_id)
 
                         parsed_tools, clean_text = _clean_text(resp_text)
+                        if parsed_tools:
+                            _log_tool_shapes(parsed_tools, "chat(rotation)")
                         next_messages = _assistant_msg(messages, parsed_tools, clean_text)
 
                         await _save_turn(sig, next_messages, model, scope, new_token_id, new_session_id, 0)
@@ -601,6 +625,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             await _db_call(mark_active, token_id)
 
             parsed_tools, clean_text = _clean_text(resp_text)
+            if parsed_tools:
+                _log_tool_shapes(parsed_tools, "chat")
             next_messages = _assistant_msg(messages, parsed_tools, clean_text)
 
             await _save_turn(sig, next_messages, model, scope, token_id, session_id, parent_message_id)
@@ -767,6 +793,8 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
             pass
     finally:
         parsed_tools, clean_text = _clean_text(full_text)
+        if parsed_tools:
+            _log_tool_shapes(parsed_tools, "stream")
 
         if not failed:
             # Persistence must never kill the SSE terminator below: if the
@@ -900,6 +928,8 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
     finally:
         parsed_tools, clean_text = _clean_text(full_text)
         out_tokens = count_tok(full_text)
+        if parsed_tools:
+            _log_tool_shapes(parsed_tools, "stream-anthropic")
 
         if not failed:
             # Same guarantee as stream_response: a failing DB write must not
