@@ -188,8 +188,15 @@ async def limit_body_size(request: Request, call_next):
         return JSONResponse({"error": "Request body too large"}, status_code=413)
     # Starlette caches request.body(); replay receive for parsers that read
     # from the stream (e.g. form/multipart) across Starlette versions.
+    # One-shot: serve the buffered body once, then empty chunks, so a second
+    # stream read can never duplicate the body.
+    _replay_state = {"sent": False}
+
     async def _replay_receive():
-        return {"type": "http.request", "body": body, "more_body": False}
+        if not _replay_state["sent"]:
+            _replay_state["sent"] = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.request", "body": b"", "more_body": False}
     try:
         request._receive = _replay_receive  # type: ignore[attr-defined]
     except Exception:
@@ -675,6 +682,39 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
     is_thinking = False
     aborted = False
     failed = False
+    # Tools the streaming parser already completed mid-stream. Previously these
+    # {"tool": ...} results were silently dropped (only "text" was yielded),
+    # so a tool call detected during feed() but missed by the end-of-stream
+    # parse_tools(full_text) never reached the client: the client saw
+    # near-empty content with no tool_calls and declared the stream truncated.
+    streamed_tools = []
+    # One envelope per response, per the OpenAI chat.completion.chunk shape:
+    # finish_reason lives on the choice (not inside delta), and every chunk
+    # carries id/object/created/model so strict clients accept the stream.
+    chunk_id = f"chatcmpl-{uuid.uuid4()}"
+    created = int(time.time())
+
+    def _chunk(delta, finish_reason=None):
+        return (
+            "data: "
+            + json.dumps(
+                {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": delta,
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                }
+            )
+            + "\n\n"
+        )
+
     try:
         async for chunk in _hold_think_tags(gen):
             if not chunk:
@@ -693,10 +733,10 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 think_part = parts[0]
                 chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
                 if think_part:
-                    yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': think_part}}]})}\n\n"
+                    yield _chunk({"reasoning_content": think_part})
 
             if is_thinking and chunk:
-                yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': chunk}}]})}\n\n"
+                yield _chunk({"reasoning_content": chunk})
                 continue
 
             if end_thinking and not chunk:
@@ -704,7 +744,9 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
 
             for r in parser.feed(chunk):
                 if "text" in r:
-                    yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
+                    yield _chunk({"content": r["text"]})
+                elif "tool" in r:
+                    streamed_tools.append(r["tool"])
         await _db_call(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
@@ -731,21 +773,34 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
             await _db_call(save_session, sig, token_id, session_id, nxt)
             await _db_call(save_session, next_sig, token_id, session_id, nxt)
 
-        if not aborted and not failed:
+        if not aborted:
             try:
-                if not parsed_tools:
-                    for r in parser.flush():
-                        if "text" in r:
-                            yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
+                # Merge order: end-of-stream parse wins (it sees the whole
+                # text); fall back to tools the streaming parser completed
+                # mid-stream or salvaged at flush() so none are dropped.
+                flush_text_parts = []
+                flush_tools = []
+                for r in parser.flush():
+                    if "text" in r:
+                        flush_text_parts.append(r["text"])
+                    elif "tool" in r:
+                        flush_tools.append(r["tool"])
+                effective_tools = parsed_tools or streamed_tools or flush_tools
+                if not effective_tools:
+                    for part in flush_text_parts:
+                        yield _chunk({"content": part})
 
-                if parsed_tools:
-                    for i, tc in enumerate(parsed_tools):
+                if effective_tools:
+                    for i, tc in enumerate(effective_tools):
                         delta_tc = {"index": i, "id": tc["id"], "type": "function",
                                     "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
-                        yield f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [delta_tc]}}]})}\n\n"
-                    yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]})}\n\n"
-                else:
-                    yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                        yield _chunk({"tool_calls": [delta_tc]})
+                    yield _chunk({}, "tool_calls")
+                elif not failed:
+                    yield _chunk({}, "stop")
+                # Always terminate the SSE stream, even after an error chunk:
+                # without [DONE] strict OpenAI clients treat the disconnect
+                # as truncation and spin into continuation retries.
                 yield "data: [DONE]\n\n"
             except asyncio.CancelledError:
                 pass
@@ -764,6 +819,10 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
     block_index = 0
     aborted = False
     failed = False
+    # Same drop bug as the OpenAI path had: {"tool": ...} results from
+    # parser.feed()/flush() were ignored, so a tool call the streaming parser
+    # completed could vanish when parse_tools(full_text) missed it.
+    streamed_tools = []
 
     try:
         is_thinking = False
@@ -809,6 +868,8 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                         text_block_started = True
                     delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': r['text']}})}\n\n"
                     yield delta_evt
+                elif "tool" in r:
+                    streamed_tools.append(r["tool"])
         await _db_call(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
@@ -848,18 +909,21 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
             block_index_local[0] += 1
 
         flushed_text = ""
-        if not parsed_tools:
-            for r in parser.flush():
-                if "text" in r:
-                    flushed_text += r["text"]
+        flush_tools = []
+        for r in parser.flush():
+            if "text" in r:
+                flushed_text += r["text"]
+            elif "tool" in r:
+                flush_tools.append(r["tool"])
+        effective_tools = parsed_tools or streamed_tools or flush_tools
 
-        if not text_block_started and not parsed_tools and (clean_text or flushed_text):
+        if not text_block_started and not effective_tools and (clean_text or flushed_text):
             tail_events += _tb(clean_text or flushed_text)
-        elif text_block_started and not parsed_tools:
+        elif text_block_started and not effective_tools:
             tail_events += f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
 
-        if parsed_tools:
-            for tc in parsed_tools:
+        if effective_tools:
+            for tc in effective_tools:
                 tool_input = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"]
                 json_str = json.dumps(tool_input)
                 tail_events += f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'tool_use', 'id': tc['id'], 'name': tc['function']['name'], 'input': {}}})}\n\n"
@@ -871,7 +935,11 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
             tail_events += f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': out_tokens}})}\n\n"
         tail_events += f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
-        if not aborted and not failed:
+        # message_stop is the Anthropic stream terminator: send it whenever
+        # the client is still connected, even after an upstream failure (the
+        # error event was already yielded above). Withholding it makes
+        # clients hang or declare the stream truncated.
+        if not aborted:
             try:
                 for evt in tail_events.split("\n\n"):
                     if evt.strip():
