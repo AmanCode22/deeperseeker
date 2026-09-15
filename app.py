@@ -186,21 +186,14 @@ async def limit_body_size(request: Request, call_next):
     body = await request.body()
     if len(body) > MAX_BODY_BYTES:
         return JSONResponse({"error": "Request body too large"}, status_code=413)
-    # Starlette caches request.body(); replay receive for parsers that read
-    # from the stream (e.g. form/multipart) across Starlette versions.
-    # One-shot: serve the buffered body once, then empty chunks, so a second
-    # stream read can never duplicate the body.
-    _replay_state = {"sent": False}
-
-    async def _replay_receive():
-        if not _replay_state["sent"]:
-            _replay_state["sent"] = True
-            return {"type": "http.request", "body": body, "more_body": False}
-        return {"type": "http.request", "body": b"", "more_body": False}
-    try:
-        request._receive = _replay_receive  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    # NOTE: do NOT override request._receive here. Starlette caches the body
+    # above in request._body, so downstream json()/form()/body() readers are
+    # unaffected. A fake receive channel breaks StreamingResponse, which
+    # polls receive() to detect client disconnects: replaying
+    # {"type": "http.request"} there raises
+    # "RuntimeError: Unexpected message received: http.request", killing the
+    # response mid-stream — every streaming chat reply arrived truncated
+    # (first chunk only, no finish_reason, no [DONE]).
     return await call_next(request)
 
 
@@ -767,11 +760,20 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         parsed_tools, clean_text = _clean_text(full_text)
 
         if not failed:
-            next_messages = _assistant_msg(messages, parsed_tools, clean_text)
-            next_sig = generate_signature_sync(next_messages, model, scope)
-            nxt = next_parent(parent_message_id)
-            await _db_call(save_session, sig, token_id, session_id, nxt)
-            await _db_call(save_session, next_sig, token_id, session_id, nxt)
+            # Persistence must never kill the SSE terminator below: if the
+            # DB write throws here, the exception would escape the generator
+            # and the client would see content chunks followed by an abrupt
+            # close (no finish_reason, no [DONE]) — i.e. "truncated".
+            try:
+                next_messages = _assistant_msg(messages, parsed_tools, clean_text)
+                next_sig = generate_signature_sync(next_messages, model, scope)
+                nxt = next_parent(parent_message_id)
+                await _db_call(save_session, sig, token_id, session_id, nxt)
+                await _db_call(save_session, next_sig, token_id, session_id, nxt)
+            except Exception:
+                logger.exception(
+                    "stream_response: persisting turn failed (non-fatal; stream will still terminate)"
+                )
 
         if not aborted:
             try:
@@ -891,11 +893,18 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         out_tokens = count_tok(full_text)
 
         if not failed:
-            next_messages = _assistant_msg(messages, parsed_tools, clean_text)
-            next_sig = generate_signature_sync(next_messages, model, scope)
-            nxt = next_parent(parent_message_id)
-            await _db_call(save_session, sig, token_id, session_id, nxt)
-            await _db_call(save_session, next_sig, token_id, session_id, nxt)
+            # Same guarantee as stream_response: a failing DB write must not
+            # swallow message_stop (the Anthropic terminator).
+            try:
+                next_messages = _assistant_msg(messages, parsed_tools, clean_text)
+                next_sig = generate_signature_sync(next_messages, model, scope)
+                nxt = next_parent(parent_message_id)
+                await _db_call(save_session, sig, token_id, session_id, nxt)
+                await _db_call(save_session, next_sig, token_id, session_id, nxt)
+            except Exception:
+                logger.exception(
+                    "stream_anthropic_response: persisting turn failed (non-fatal; stream will still terminate)"
+                )
 
         def _tb(text):
             return (f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'text', 'text': ''}})}\n\n"
@@ -1390,12 +1399,7 @@ async def anthropic_messages(request: Request):
     return format_anthropic_response(result, req_model)
 
 
-@app.get("/v1/models")
-@app.get("/models")
-async def list_models(request: Request):
-    if not check_key(request):
-        return JSONResponse({"error": "Invalid API key"}, status_code=401)
-
+def _all_models():
     # Declared limits reflect OBSERVED DeepSeek web behavior (issue #22), not
     # guaranteed upstream API limits: a single first message passes up to ~1M
     # tokens, remembered in-session context reaches ~393K input tokens before
@@ -1450,7 +1454,16 @@ async def list_models(request: Request):
         alias["display_name"] = f"Claude {m['display_name']}"
         claude_aliases.append(alias)
 
-    all_models = base_models + claude_aliases
+    return base_models + claude_aliases
+
+
+@app.get("/v1/models")
+@app.get("/models")
+async def list_models(request: Request):
+    if not check_key(request):
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
+
+    all_models = _all_models()
 
     return {
         "object": "list",
@@ -1459,6 +1472,23 @@ async def list_models(request: Request):
         "first_id": all_models[0]["id"],
         "last_id": all_models[-1]["id"]
     }
+
+
+@app.get("/v1/models/{model_id}")
+@app.get("/models/{model_id}")
+async def retrieve_model(model_id: str, request: Request):
+    # OpenAI SDKs and agents commonly GET /v1/models/{id} to validate the
+    # model before chatting. Without this route FastAPI returns
+    # {"detail": "Not Found"}, which clients surface as HTTP 404.
+    if not check_key(request):
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
+    for m in _all_models():
+        if m["id"] == model_id:
+            return m
+    return JSONResponse(
+        {"error": {"message": f"Model '{model_id}' not found", "type": "invalid_request_error", "code": 404}},
+        status_code=404,
+    )
 
 
 @app.get("/login", response_class=HTMLResponse)
