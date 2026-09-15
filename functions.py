@@ -1171,6 +1171,10 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
 
     think_open = False
     got_output = False
+    # Count of upstream frames that produced no output (diagnostic for
+    # replies cut short: any content arriving in an unhandled frame shape is
+    # silently dropped, and the reply starts mid-sentence).
+    _unhandled = [0]
     resp = await post_with_failover(
         "/api/v0/chat/completion",
         headers=headers, json=json_data,
@@ -1192,6 +1196,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 data = json.loads(decoded_line[6:])
             except Exception:
                 continue
+            __got_before = got_output
             if data.get("p") == "response/status" and data.get("v") == "FINISHED":
                 if think_open:
                     yield "\n</think>\n\n"
@@ -1249,6 +1254,18 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
             if isinstance(v, str) and v:
                 got_output = True
                 yield v
+                continue
+            if got_output == __got_before:
+                # Reaching here means this frame matched no branch above and
+                # its content (if any) was dropped. Log the shape (capped)
+                # so cut-reply reports can be diagnosed from server logs.
+                _unhandled[0] += 1
+                if _unhandled[0] <= 3:
+                    logger.warning(
+                        "DeepSeek unhandled frame #%d for chat %s (o=%r p=%r): %s",
+                        _unhandled[0], chat_id, data.get("o"), data.get("p"),
+                        decoded_line[6:250],
+                    )
         if think_open:
             yield "\n</think>\n\n"
         if not got_output:
