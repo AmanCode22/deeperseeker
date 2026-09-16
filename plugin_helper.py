@@ -191,6 +191,39 @@ async def extract_tools(tools):
     return "\n\n".join(final_tools) if final_tools else None
 
 
+def enrich_tool_names(messages):
+    """Fill missing `name` on role=tool messages from assistant tool_calls.
+
+    Neither OpenAI-style role=tool messages (only tool_call_id) nor our
+    converted Anthropic tool_result messages carry the tool name, so
+    extract_tool_results() rendered every result as "Tool: tool" and the
+    model could not tell which result belonged to which call — results got
+    paired with wrong calls. Returns a new list; input is not mutated.
+    """
+    id_to_name = {}
+    for m in messages:
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict) and tc.get("id"):
+                fn = tc.get("function", {}) or {}
+                if isinstance(fn, dict) and fn.get("name"):
+                    id_to_name[tc["id"]] = fn["name"]
+        content = m.get("content")
+        if isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("id"):
+                    id_to_name[c["id"]] = c.get("name", "")
+    if not id_to_name:
+        return messages
+    out = []
+    for m in messages:
+        if m.get("role") == "tool" and not m.get("name"):
+            name = id_to_name.get(m.get("tool_call_id", ""), "")
+            if name:
+                m = {**m, "name": name}
+        out.append(m)
+    return out
+
+
 async def extract_tool_results(messages, latest_only=False):
     target_messages = messages
     if latest_only:

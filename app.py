@@ -65,6 +65,7 @@ from plugin_helper import (
     build_prompt,
     build_summary_request_prompt,
     context_window_tokens,
+    enrich_tool_names,
     extract_and_upload_files,
     generate_signature,
     generate_signature_sync,
@@ -486,6 +487,11 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     auth_token = await _db_call(get_auth_token)
     if not auth_token:
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
+
+    # Attach tool names to role=tool messages (they carry only tool_call_id)
+    # so the upstream prompt pairs each result with its call. Done before
+    # signature + session lookup so the enriched form is the cached identity.
+    messages = enrich_tool_names(messages)
 
     sig = await generate_signature(messages, model, scope)
     sess = await _db_call(find_session, sig)
