@@ -472,6 +472,8 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
         "TOOL USE INSTRUCTIONS:\n"
         "You have access to tools. When you need to call a tool, output ONLY the tool call XML block and nothing else:\n"
         "<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n"
+        "The name must be one of the listed Tool names (never \"tool_call\", \"invoke\", or \"function_call\"). "
+        "Put the parameters directly in arguments — never nest another {\"name\": ..., \"arguments\": ...} object inside arguments. "
         "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool."
     )
     if is_first_message and (rollover_summary or needs_rollover(messages)):

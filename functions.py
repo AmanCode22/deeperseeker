@@ -604,6 +604,15 @@ def count_tokens(text, model="deepseek-v4.1-flash"):
     return len(deepseek_tokenizer.ds_token.encode(text))
 
 
+# Keys that make an args dict look like another nested tool-call envelope
+# (as opposed to real tool parameters). Used by normalize_tool_call's unwrap.
+_ENVELOPE_KEYS = frozenset({
+    "name", "tool", "tool_name", "function", "action",
+    "arguments", "parameters", "input", "args", "params",
+    "tool_input", "action_input",
+})
+
+
 def normalize_tool_call(tool_data_or_name, args_if_name=None):
     if isinstance(tool_data_or_name, str):
         name = tool_data_or_name
@@ -619,6 +628,41 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
             args = tool_data.get("arguments") or tool_data.get("parameters") or tool_data.get("input") or tool_data.get("args") or tool_data.get("params") or tool_data.get("tool_input") or tool_data.get("action_input") or {}
     else:
         return None
+
+    # Unwrap doubly-nested tool envelopes. Models sometimes duplicate the
+    # wrapper, emitting {"name": X, "arguments": {"name": X, "arguments":
+    # {...}}}. Passed through verbatim, the real parameters end up one level
+    # too deep (arguments.arguments.command) and the client reports them as
+    # missing (e.g. "expected string, got NoneType"). Unwrap while the args
+    # dict looks exactly like another envelope (bounded depth). A dict with
+    # any other key (e.g. {"command": ...}) is real parameters and is kept.
+    for _ in range(3):
+        if not isinstance(args, dict):
+            break
+        if set(args.keys()) - _ENVELOPE_KEYS:
+            break
+        inner_name = (
+            args.get("name") or args.get("tool") or args.get("tool_name")
+            or args.get("function") or args.get("action")
+        )
+        inner_args = (
+            args.get("arguments") if "arguments" in args
+            else args.get("parameters") if "parameters" in args
+            else args.get("input") if "input" in args
+            else args.get("args") if "args" in args
+            else args.get("params") if "params" in args
+            else args.get("tool_input") if "tool_input" in args
+            else args.get("action_input") if "action_input" in args
+            else None
+        )
+        if not isinstance(inner_name, str) or not inner_name.strip() or inner_args is None:
+            break
+        if isinstance(inner_args, str):
+            try:
+                inner_args = json.loads(inner_args)
+            except Exception:
+                break
+        name, args = inner_name.strip(), inner_args
 
     if not name or not isinstance(name, str):
         return None
@@ -1196,6 +1240,26 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 data = json.loads(decoded_line[6:])
             except Exception:
                 continue
+            # Upstream error frames (e.g. {"type":"error","content":"Messages
+            # too frequent. Try again later.","finish_reason":
+            # "rate_limit_reached"}). Previously these fell through every
+            # branch below, so a rate-limited request surfaced as the
+            # misleading "Empty response ... (prompt may exceed the session
+            # context limit)" 502 and the token was never marked limited.
+            # Raising HTTP 429 here engages handle_chat's rotation/retry path.
+            _err_content = _err_reason = None
+            _v_obj = data.get("v")
+            if isinstance(_v_obj, dict) and _v_obj.get("type") == "error":
+                _err_content = _v_obj.get("content", "")
+                _err_reason = _v_obj.get("finish_reason", "")
+            elif data.get("type") == "error":
+                _err_content = data.get("content", "")
+                _err_reason = data.get("finish_reason", "")
+            if _err_content is not None:
+                _msg = str(_err_content)[:200]
+                if "frequent" in _msg or "rate_limit" in str(_err_reason):
+                    raise Exception(f"HTTP 429: DeepSeek rate limited ({_msg})")
+                raise Exception(f"Upstream error: {_msg}")
             __got_before = got_output
             if data.get("p") == "response/status" and data.get("v") == "FINISHED":
                 if think_open:
