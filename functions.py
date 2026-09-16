@@ -893,10 +893,26 @@ def parse_tools(text):
             start_idx = tm.end()
             end_idx = real_tool_matches[i+1].start() if i + 1 < len(real_tool_matches) else len(text)
             body = text[start_idx:end_idx]
-            # Respect closing tag so body does not bleed into prose or next tool block
-            closer_m = _TOOL_END_TAG_RE.search(body)
-            if closer_m:
-                body = body[:closer_m.start()]
+            # Try JSON parsing on the FULL body first. If a DSML closing tag
+            # appears inside a JSON string value (e.g. {"timeout": "60</||DSML||>"}),
+            # the closer regex would truncate the JSON prematurely. By testing
+            # JSON parse first, we detect this case and skip the closer.
+            _body_json_ok = False
+            if "{" in body:
+                _brace_pos = body.find("{")
+                try:
+                    _b_data, _ = json.JSONDecoder().raw_decode(body[_brace_pos:])
+                    if isinstance(_b_data, dict):
+                        _body_json_ok = True
+                except Exception:
+                    pass
+            # Respect closing tag so body does not bleed into prose or next tool block,
+            # but only if the JSON didn't parse clean (meaning the closer is real, not
+            # embedded inside a string value).
+            if not _body_json_ok:
+                closer_m = _TOOL_END_TAG_RE.search(body)
+                if closer_m:
+                    body = body[:closer_m.start()]
             args = {}
             p_matches = re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)", body, flags=re.DOTALL | re.IGNORECASE)
             for pm in p_matches:
@@ -1017,8 +1033,25 @@ def parse_tools(text):
             for m in matches:
                 tag_name = m.group(1)
                 after_tag = text[m.end():]
-                closer_m = _TOOL_END_TAG_RE.search(after_tag)
-                tag_body = after_tag[:closer_m.start()] if closer_m else after_tag
+                # Try JSON parsing on the full after_tag first — same
+                # guard as the primary path: if a DSML closer sits inside
+                # a JSON string value, the closer regex would truncate the
+                # JSON prematurely.  Test full-tag parse first; only fall
+                # back to closer truncation when the full body fails.
+                tag_body = after_tag
+                _tag_json_ok = False
+                if "{" in after_tag:
+                    _brace_pos = after_tag.find("{")
+                    try:
+                        _b_data, _ = json.JSONDecoder().raw_decode(after_tag[_brace_pos:])
+                        if isinstance(_b_data, dict):
+                            _tag_json_ok = True
+                    except Exception:
+                        pass
+                if not _tag_json_ok:
+                    closer_m = _TOOL_END_TAG_RE.search(after_tag)
+                    if closer_m:
+                        tag_body = after_tag[:closer_m.start()]
                 pos = 0
                 matched_in_tag = False
                 while pos < len(tag_body):
@@ -1220,16 +1253,32 @@ class StreamToolParser:
                 if end_match is None:
                     end_match = _TOOL_END_TAG_RE.search(self.buffer)
                 if end_match:
-                    if not self.json_done:
-                        tool_xml = self.buffer[: end_match.end()]
-                        parsed, _ = parse_tools(tool_xml)
-                        for item in parsed:
-                            results.append({"tool": item})
-                    self.buffer = self.buffer[end_match.end():]
-                    self.in_tool = False
-                    self.json_done = False
-                    self._end_re = None
-                    continue
+                    # Guard: if a DSML closer sits inside a JSON string value
+                    # (e.g. {"timeout": "60</||DSML||>"}), the closer regex
+                    # finds it prematurely and truncates the buffer before
+                    # JSON parsing can succeed.  Try a full-buffer JSON parse
+                    # first; if it succeeds the closer is inside a string and
+                    # must be ignored so JSON parsing can proceed normally.
+                    _stream_json_ok = False
+                    if not self.json_done and "{" in self.buffer:
+                        _sb = self.buffer.find("{")
+                        try:
+                            _sd, _ = json.JSONDecoder().raw_decode(self.buffer[_sb:])
+                            if isinstance(_sd, dict):
+                                _stream_json_ok = True
+                        except Exception:
+                            pass
+                    if not _stream_json_ok:
+                        if not self.json_done:
+                            tool_xml = self.buffer[: end_match.end()]
+                            parsed, _ = parse_tools(tool_xml)
+                            for item in parsed:
+                                results.append({"tool": item})
+                        self.buffer = self.buffer[end_match.end():]
+                        self.in_tool = False
+                        self.json_done = False
+                        self._end_re = None
+                        continue
                 candidates = [p for p in (self.buffer.find("{"), self.buffer.find("[")) if p != -1]
                 if candidates and not self.json_done:
                     start_p = min(candidates)
