@@ -548,8 +548,9 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
         "<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n"
         "The name must be one of the listed Tool names (never \"tool_call\", \"invoke\", or \"function_call\"). "
         "Put the parameters directly in arguments — never nest another {\"name\": ..., \"arguments\": ...} object inside arguments. "
+        "Parameter names must match the tool definition exactly (e.g., write_file requires 'path' and 'content'). "
         "Numeric arguments (timeout, count, limit, max_tokens, temperature, etc.) MUST be bare numbers (e.g. 60, 0.7), NOT strings and NOT wrapped in XML/DSML markers. "
-        "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool."
+        "Do not output internal DSML tokens, repetition loops, or pseudo-tool wrappers. Output exactly one tool call block when invoking a tool."
     )
     if is_first_message and (rollover_summary or needs_rollover(messages)):
         # Accumulated context is nearing the observed limit: hand off to a

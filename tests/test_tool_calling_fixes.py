@@ -196,3 +196,118 @@ async def test_stream_response_first_chunk_has_role_and_persists_effective_tools
 
     # SSE must end with [DONE]
     assert chunks[-1] == "data: [DONE]\n\n"
+
+
+def test_write_file_parameter_aliasing_and_dsml_stripping():
+    """write_file must map file_content -> content and file_path -> path,
+    and strip DSML tokens (even when repeated) from the path."""
+    # 1. file_content -> content
+    raw = {
+        "name": "write_file",
+        "arguments": {
+            "path": "/home/user/workspace/script.py",
+            "file_content": "print('hello world')",
+        },
+    }
+    norm = normalize_tool_call(raw)
+    assert norm is not None
+    args = json.loads(norm["function"]["arguments"])
+    assert args["content"] == "print('hello world')"
+    assert args["path"] == "/home/user/workspace/script.py"
+
+    # 2. file_path -> path and DSML token in path stripped
+    raw2 = {
+        "name": "write_file",
+        "arguments": {
+            "file_path": "/home/user/workspace/script.py</｜｜DSML｜｜>",
+            "file_content": "data",
+        },
+    }
+    norm2 = normalize_tool_call(raw2)
+    assert norm2 is not None
+    args2 = json.loads(norm2["function"]["arguments"])
+    assert args2["path"] == "/home/user/workspace/script.py"
+    assert args2["content"] == "data"
+
+    # 3. Path with 1500x repetition of </｜｜DSML｜｜>
+    repeated_dsml_path = "/home/user/workspace/test.txt" + ("</｜｜DSML｜｜>" * 1500)
+    norm3 = normalize_tool_call("write_file", {"path": repeated_dsml_path, "content": "hello"})
+    assert norm3 is not None
+    args3 = json.loads(norm3["function"]["arguments"])
+    assert args3["path"] == "/home/user/workspace/test.txt"
+
+
+def test_execute_code_and_bash_parameter_aliasing():
+    """execute_code must alias command/script -> code, and bash must alias cmd -> command,
+    defaulting to empty string instead of None to prevent NoneType errors."""
+    # execute_code command -> code
+    norm_code = normalize_tool_call("execute_code", {"command": "import sys; print(sys.version)"})
+    assert norm_code is not None
+    args_code = json.loads(norm_code["function"]["arguments"])
+    assert args_code["code"] == "import sys; print(sys.version)"
+
+    # execute_code with missing code defaults to ""
+    norm_empty_code = normalize_tool_call("execute_code", {})
+    assert norm_empty_code is not None
+    args_empty = json.loads(norm_empty_code["function"]["arguments"])
+    assert args_empty["code"] == ""
+
+    # bash cmd -> command
+    norm_bash = normalize_tool_call("bash", {"cmd": "pytest -v"})
+    assert norm_bash is not None
+    args_bash = json.loads(norm_bash["function"]["arguments"])
+    assert args_bash["command"] == "pytest -v"
+
+    # bash with empty args defaults command to ""
+    norm_empty_bash = normalize_tool_call("bash", {})
+    assert norm_empty_bash is not None
+    args_empty_bash = json.loads(norm_empty_bash["function"]["arguments"])
+    assert args_empty_bash["command"] == ""
+
+
+def test_bare_dsml_closer_closes_stream_feed():
+    """StreamToolParser must recognize bare </｜｜DSML｜｜> and </||DSML||> as closing tags
+    during feed(), emitting the tool call without waiting for stream flush."""
+    parser = StreamToolParser()
+    chunk = (
+        '<｜｜DSML｜｜ invoke name="read_file">'
+        '<parameter name="path">/home/user/data.csv</parameter>'
+        '</｜｜DSML｜｜>'
+    )
+    results = parser.feed(chunk)
+    assert len(results) == 1
+    assert "tool" in results[0]
+    tool = results[0]["tool"]
+    assert tool["function"]["name"] == "read_file"
+    args = json.loads(tool["function"]["arguments"])
+    assert args["path"] == "/home/user/data.csv"
+    assert parser.in_tool is False
+
+
+def test_batch_calls_unwrapping_in_tags_and_dict():
+    """Batch shapes with 'calls' or 'tool_calls' arrays must be unpacked."""
+    # In XML tag
+    text = (
+        '<tool_call>'
+        '{"calls": ['
+        '  {"name": "read_file", "arguments": {"path": "/a.txt"}},'
+        '  {"name": "read_file", "arguments": {"path": "/b.txt"}}'
+        ']}'
+        '</tool_call>'
+    )
+    tools, clean = parse_tools(text)
+    assert len(tools) == 2
+    assert tools[0]["function"]["name"] == "read_file"
+    assert json.loads(tools[0]["function"]["arguments"]) == {"path": "/a.txt"}
+    assert tools[1]["function"]["name"] == "read_file"
+    assert json.loads(tools[1]["function"]["arguments"]) == {"path": "/b.txt"}
+
+    # Single call wrapped in calls array passed to normalize_tool_call
+    single_batch = {
+        "calls": [{"name": "bash", "arguments": {"command": "git status"}}]
+    }
+    norm = normalize_tool_call(single_batch)
+    assert norm is not None
+    assert norm["function"]["name"] == "bash"
+    assert json.loads(norm["function"]["arguments"]) == {"command": "git status"}
+

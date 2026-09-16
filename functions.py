@@ -623,6 +623,10 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
         args = args_if_name if args_if_name is not None else {}
     elif isinstance(tool_data_or_name, dict):
         tool_data = tool_data_or_name
+        # Single-call envelope unwrap if wrapped in calls/tool_calls array
+        for list_key in ("calls", "tool_calls"):
+            if list_key in tool_data and isinstance(tool_data[list_key], list) and len(tool_data[list_key]) == 1:
+                return normalize_tool_call(tool_data[list_key][0])
         if "function" in tool_data and isinstance(tool_data["function"], dict):
             fn = tool_data["function"]
             name = fn.get("name") or tool_data.get("name")
@@ -632,6 +636,19 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
             args = tool_data.get("arguments") or tool_data.get("parameters") or tool_data.get("input") or tool_data.get("args") or tool_data.get("params") or tool_data.get("tool_input") or tool_data.get("action_input") or {}
     else:
         return None
+
+    if isinstance(args, str):
+        try:
+            parsed_args = json.loads(args)
+            if isinstance(parsed_args, (dict, list)):
+                args = parsed_args
+        except Exception:
+            pass
+
+    if isinstance(args, dict):
+        for list_key in ("calls", "tool_calls"):
+            if list_key in args and isinstance(args[list_key], list) and len(args[list_key]) == 1:
+                return normalize_tool_call(args[list_key][0])
 
     # Unwrap doubly-nested tool envelopes. Models sometimes duplicate the
     # wrapper, emitting {"name": X, "arguments": {"name": X, "arguments":
@@ -686,22 +703,116 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
     if cleaned_name.lower() in _PSEUDO_TOOL_NAMES:
         return None
 
-    # Coerce numeric arguments that the model often emits as strings
-    # (sometimes with trailing DSML markers like "60</｜｜DSML｜｜>").
-    # Strip DSML markers and cast to int/float where appropriate.
-    _NUMERIC_ARGS = frozenset({"timeout", "count", "limit", "max_tokens", "max_results", "top_k", "top_p", "temperature", "num_predict", "n_predict", "n_keep", "n_batch", "n_threads", "n_gpu_layers", "seed", "port"})
+    _DSML_STRIP_RE = re.compile(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?[^>]*>", re.IGNORECASE)
+    _SPECIAL_TOKEN_STRIP_RE = re.compile(r"<[｜\|]{1,2}[^>]+[｜\|]{1,2}>", re.IGNORECASE)
+    _GENERIC_CLOSER_STRIP_RE = re.compile(r"</?(?:tool_calls?|calls|invoke|function_call|parameter|param)\b[^>]*>", re.IGNORECASE)
+    _EOF_CLOSER_RE = re.compile(
+        r"\s*(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?[^>]*>|<[｜\|]{1,2}[^>]+[｜\|]{1,2}>|</?(?:tool_calls?|calls|invoke|function_call|parameter|param)\b[^>]*>)+\s*$",
+        re.IGNORECASE,
+    )
+
     if isinstance(args, dict):
+        # 1. Clean string arguments of DSML markers, leaked closing tags, and trailing tokens
+        for k, v in list(args.items()):
+            if isinstance(v, str):
+                v_clean = _DSML_STRIP_RE.sub("", v)
+                v_clean = _SPECIAL_TOKEN_STRIP_RE.sub("", v_clean)
+                k_lower = k.lower()
+                if k_lower in ("path", "file_path", "filename", "filepath", "url", "dir", "cwd"):
+                    v_clean = _GENERIC_CLOSER_STRIP_RE.sub("", v_clean).strip().strip("\"'`")
+                elif k_lower in ("command", "cmd", "query", "skill", "name"):
+                    v_clean = _GENERIC_CLOSER_STRIP_RE.sub("", v_clean).strip()
+                else:
+                    v_clean = _EOF_CLOSER_RE.sub("", v_clean)
+                args[k] = v_clean
+
+        tool_lower = cleaned_name.lower()
+
+        # 2. File tool parameter aliasing (write_file: file_content -> content, file_path -> path)
+        if any(term in tool_lower for term in ("file", "write", "create_file", "save_file", "put_file")):
+            if "content" not in args or args["content"] is None:
+                for candidate in ("file_content", "body", "text", "data", "contents"):
+                    if candidate in args and args[candidate] is not None:
+                        args["content"] = args[candidate]
+                        break
+            if "path" not in args or not args["path"]:
+                for candidate in ("file_path", "filepath", "filename", "file"):
+                    if candidate in args and args[candidate]:
+                        args["path"] = args[candidate]
+                        break
+        elif "read" in tool_lower:
+            if "path" not in args or not args["path"]:
+                for candidate in ("file_path", "filepath", "filename", "file"):
+                    if candidate in args and args[candidate]:
+                        args["path"] = args[candidate]
+                        break
+
+        # 3. Code execution tools (execute_code: code parameter)
+        if any(term in tool_lower for term in ("execute_code", "python", "code_execution", "run_code", "eval")):
+            if "code" not in args or not args["code"]:
+                for candidate in ("command", "script", "source", "input", "content", "query"):
+                    if candidate in args and args[candidate] is not None:
+                        args["code"] = str(args[candidate])
+                        break
+            if "code" not in args or args["code"] is None:
+                args["code"] = ""
+
+        # 4. Command/Bash/Terminal tools (command parameter)
+        if any(term in tool_lower for term in ("bash", "terminal", "shell", "cmd", "run_command")):
+            if "command" not in args or not args["command"]:
+                for candidate in ("cmd", "code", "script", "input", "action"):
+                    if candidate in args and args[candidate] is not None:
+                        args["command"] = str(args[candidate])
+                        break
+            if "command" not in args or args["command"] is None:
+                args["command"] = ""
+
+        # 5. Search tools (query parameter)
+        if any(term in tool_lower for term in ("search", "tavily", "google")):
+            if "query" not in args or not args["query"]:
+                for candidate in ("q", "search_query", "text", "input", "prompt"):
+                    if candidate in args and args[candidate] is not None:
+                        args["query"] = str(args[candidate])
+                        break
+
+        # 6. Skill tools (skill parameter)
+        if "skill" in tool_lower:
+            if "skill" not in args or not args["skill"]:
+                for candidate in ("skill_name", "name", "path"):
+                    if candidate in args and args[candidate] and str(args[candidate]).strip() != cleaned_name:
+                        args["skill"] = str(args[candidate]).strip()
+                        break
+
+        # 7. Edit/replace tools (old_string / new_string)
+        if any(term in tool_lower for term in ("replace", "edit", "patch")):
+            if "old_string" not in args or not args["old_string"]:
+                for candidate in ("TargetContent", "target", "find", "old_str", "search"):
+                    if candidate in args and args[candidate] is not None:
+                        args["old_string"] = args[candidate]
+                        break
+            if "new_string" not in args or not args["new_string"]:
+                for candidate in ("ReplacementContent", "replacement", "replace", "new_str"):
+                    if candidate in args and args[candidate] is not None:
+                        args["new_string"] = args[candidate]
+                        break
+
+        # 8. Numeric argument coercion with DSML token stripping
+        _NUMERIC_ARGS = frozenset({
+            "timeout", "count", "limit", "max_tokens", "max_results", "top_k", "top_p",
+            "temperature", "num_predict", "n_predict", "n_keep", "n_batch", "n_threads",
+            "n_gpu_layers", "seed", "port", "StartLine", "EndLine", "start_line", "end_line",
+            "line", "line_number"
+        })
         for k, v in list(args.items()):
             if k in _NUMERIC_ARGS and isinstance(v, str):
-                # Strip DSML markers and whitespace
-                cleaned = v.strip().rstrip("</｜｜DSML｜｜>").rstrip("</||DSML||>").rstrip("</|DSML|>").strip()
+                cleaned_num = _DSML_STRIP_RE.sub("", v).strip()
                 try:
-                    if "." in cleaned:
-                        args[k] = float(cleaned)
+                    if "." in cleaned_num:
+                        args[k] = float(cleaned_num)
                     else:
-                        args[k] = int(cleaned)
+                        args[k] = int(cleaned_num)
                 except Exception:
-                    pass  # leave as string if not a clean number
+                    pass
 
     if isinstance(args, (dict, list)):
         args_str = json.dumps(args)
@@ -745,6 +856,25 @@ def _code_fence_spans(text):
     return [(m.start(), m.end()) for m in re.finditer(r"```.*?(?:```|$)", text, re.DOTALL)]
 
 
+# Family-wide closer pattern for the tool-call wrapper family, including
+# bare DSML closers (</｜｜DSML｜｜>, </||DSML||>, </|DSML|>), DSML special tokens,
+# and |/｜-decorated variants that parse_tools and StreamToolParser accept.
+_TOOL_END_TAG_RE = re.compile(
+    r"(?:</[｜\|]{1,2}(?:DSML)?[｜\|]{0,2}\s*(?:tool_calls?|calls|invoke|function_call)?\s*[｜\|]{0,2}>|</(?:DSML)[｜\|]{0,2}\s*(?:tool_calls?|calls|invoke|function_call)?\s*[｜\|]{0,2}>|</\s*(?:tool_calls?|calls|invoke|function_call)\s*[｜\|]{0,2}>|<[｜\|]{1,2}\s*tool\s*calls?\s*end\s*[｜\|]{1,2}>)",
+    re.IGNORECASE,
+)
+
+# Orphan closers trailing a block already closed by the per-tag or family
+# fallback (e.g. "</｜｜DSML｜｜ calls>" or bare "</｜｜DSML｜｜>" after the inner invoke was flushed).
+_ORPHAN_CLOSER_RE = re.compile(
+    r"(?:</[｜\|]{1,2}(?:DSML)?[｜\|]{0,2}\s*(?:tool_calls?|calls|function_call|invoke)?\s*[｜\|]{0,2}>|</(?:DSML)[｜\|]{0,2}\s*(?:tool_calls?|calls|function_call|invoke)?\s*[｜\|]{0,2}>|</\s*(?:tool_calls?|calls|function_call|invoke)\s*[｜\|]{0,2}>|<[｜\|]{1,2}\s*tool\s*calls?\s*end\s*[｜\|]{1,2}>)",
+    re.IGNORECASE,
+)
+
+_DSML_STRIP_GLOBAL_RE = re.compile(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?[^>]*>", re.IGNORECASE)
+_SPECIAL_TOKEN_STRIP_GLOBAL_RE = re.compile(r"<[｜\|]{1,2}[^>]+[｜\|]{1,2}>", re.IGNORECASE)
+
+
 def parse_tools(text):
     tools = []
     clean_text = text
@@ -764,7 +894,7 @@ def parse_tools(text):
             end_idx = real_tool_matches[i+1].start() if i + 1 < len(real_tool_matches) else len(text)
             body = text[start_idx:end_idx]
             # Respect closing tag so body does not bleed into prose or next tool block
-            closer_m = re.search(r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|tool_call)[^>]*>", body, re.IGNORECASE)
+            closer_m = _TOOL_END_TAG_RE.search(body)
             if closer_m:
                 body = body[:closer_m.start()]
             args = {}
@@ -773,6 +903,8 @@ def parse_tools(text):
                 p_name = pm.group(1).strip()
                 p_val = pm.group(2).strip()
                 p_val = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>", "", p_val, flags=re.IGNORECASE).strip()
+                p_val = _DSML_STRIP_GLOBAL_RE.sub("", p_val).strip()
+                p_val = _SPECIAL_TOKEN_STRIP_GLOBAL_RE.sub("", p_val).strip()
                 try:
                     args[p_name] = json.loads(p_val)
                 except Exception:
@@ -783,6 +915,8 @@ def parse_tools(text):
                 if t_name in param_names:
                     t_val = pm.group(2).strip()
                     t_val = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>", "", t_val, flags=re.IGNORECASE).strip()
+                    t_val = _DSML_STRIP_GLOBAL_RE.sub("", t_val).strip()
+                    t_val = _SPECIAL_TOKEN_STRIP_GLOBAL_RE.sub("", t_val).strip()
                     try:
                         args[t_name] = json.loads(t_val)
                     except Exception:
@@ -883,7 +1017,7 @@ def parse_tools(text):
             for m in matches:
                 tag_name = m.group(1)
                 after_tag = text[m.end():]
-                closer_m = re.search(r"</(?:tool_call|function_call|tool_calls|invoke)[^>]*>", after_tag, re.IGNORECASE)
+                closer_m = _TOOL_END_TAG_RE.search(after_tag)
                 tag_body = after_tag[:closer_m.start()] if closer_m else after_tag
                 pos = 0
                 matched_in_tag = False
@@ -904,26 +1038,39 @@ def parse_tools(text):
                                     tools.append(norm)
                                     matched_in_tag = True
                         elif isinstance(data, dict):
-                            if tag_name:
-                                name = tag_name
-                                if "arguments" in data and isinstance(data["arguments"], dict):
-                                    args = data["arguments"]
-                                elif "parameters" in data and isinstance(data["parameters"], dict):
-                                    args = data["parameters"]
-                                elif "input" in data and isinstance(data["input"], dict):
-                                    args = data["input"]
-                                else:
-                                    args = {k: v for k, v in data.items() if k not in ["name", "tool", "function"]}
+                            if "calls" in data and isinstance(data["calls"], list):
+                                for item in data["calls"]:
+                                    norm = normalize_tool_call(item)
+                                    if norm:
+                                        tools.append(norm)
+                                        matched_in_tag = True
+                            elif "tool_calls" in data and isinstance(data["tool_calls"], list):
+                                for item in data["tool_calls"]:
+                                    norm = normalize_tool_call(item)
+                                    if norm:
+                                        tools.append(norm)
+                                        matched_in_tag = True
                             else:
-                                name = data.get("name") or data.get("tool") or data.get("tool_name") or data.get("function") or data.get("action")
-                                args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or data.get("params") or data.get("tool_input") or data.get("action_input")
-                                if args is None:
-                                    args = {}
-                            if name:
-                                norm = normalize_tool_call(name, args)
-                                if norm:
-                                    tools.append(norm)
-                                    matched_in_tag = True
+                                if tag_name:
+                                    name = tag_name
+                                    if "arguments" in data and isinstance(data["arguments"], dict):
+                                        args = data["arguments"]
+                                    elif "parameters" in data and isinstance(data["parameters"], dict):
+                                        args = data["parameters"]
+                                    elif "input" in data and isinstance(data["input"], dict):
+                                        args = data["input"]
+                                    else:
+                                        args = {k: v for k, v in data.items() if k not in ["name", "tool", "function"]}
+                                else:
+                                    name = data.get("name") or data.get("tool") or data.get("tool_name") or data.get("function") or data.get("action")
+                                    args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or data.get("params") or data.get("tool_input") or data.get("action_input")
+                                    if args is None:
+                                        args = {}
+                                if name:
+                                    norm = normalize_tool_call(name, args)
+                                    if norm:
+                                        tools.append(norm)
+                                        matched_in_tag = True
                     except Exception:
                         pos = start_p + 1
 
@@ -985,7 +1132,8 @@ def parse_tools(text):
             clean_text = re.sub(json_pattern, "", clean_text, flags=re.DOTALL).strip()
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
-    clean_text = re.sub(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+    clean_text = re.sub(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter|param)?[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+    clean_text = _SPECIAL_TOKEN_STRIP_GLOBAL_RE.sub("", clean_text).strip()
     if tools:
         logger.info(
             "parse_tools: parsed %d tool(s): %s",
@@ -995,15 +1143,6 @@ def parse_tools(text):
     return tools, clean_text
 
 
-# Family-wide closer pattern for the tool-call wrapper family, including
-# the |/｜-decorated variants that parse_tools accepts. Used by
-# StreamToolParser so a mismatched closer closes the open block instead of
-# hanging until flush(). [FIX 3]
-_TOOL_END_TAG_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call)\s*>",
-    re.IGNORECASE,
-)
-
 # [FIX 4] Spaced-DSML dialect: deepseek-harness emits decorated tags with a
 # space between the ｜｜DSML｜｜ marker and the tag name, e.g.
 # "<｜｜DSML｜｜ invoke name=...>". Entry detection cannot rely on plain
@@ -1011,13 +1150,6 @@ _TOOL_END_TAG_RE = re.compile(
 # space in any combination.
 _STREAM_ENTRY_RE = re.compile(
     r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_call|invoke)\b[^>]*>",
-    re.IGNORECASE,
-)
-
-# Orphan closers trailing a block already closed by the per-tag or family
-# fallback (e.g. "</｜｜DSML｜｜ calls>" after the inner invoke was flushed).
-_ORPHAN_CLOSER_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_call|invoke)\s*[｜\|]{0,2}>",
     re.IGNORECASE,
 )
 
@@ -1112,10 +1244,23 @@ class StreamToolParser:
                                     results.append({"tool": norm})
                                     emitted = True
                         elif isinstance(data, dict):
-                            norm = normalize_tool_call(data)
-                            if norm:
-                                results.append({"tool": norm})
-                                emitted = True
+                            if "calls" in data and isinstance(data["calls"], list):
+                                for item in data["calls"]:
+                                    norm = normalize_tool_call(item)
+                                    if norm:
+                                        results.append({"tool": norm})
+                                        emitted = True
+                            elif "tool_calls" in data and isinstance(data["tool_calls"], list):
+                                for item in data["tool_calls"]:
+                                    norm = normalize_tool_call(item)
+                                    if norm:
+                                        results.append({"tool": norm})
+                                        emitted = True
+                            else:
+                                norm = normalize_tool_call(data)
+                                if norm:
+                                    results.append({"tool": norm})
+                                    emitted = True
                         if emitted:
                             self.json_done = True
                             self.buffer = self.buffer[start_p + consumed:]
