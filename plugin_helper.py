@@ -192,40 +192,53 @@ async def extract_tools(tools):
 
 
 def enrich_tool_names(messages):
-    """Fill missing `name` on role=tool messages from assistant tool_calls.
+    """Fill missing `name` and call arguments on role=tool messages from assistant tool_calls.
 
     Neither OpenAI-style role=tool messages (only tool_call_id) nor our
-    converted Anthropic tool_result messages carry the tool name, so
-    extract_tool_results() rendered every result as "Tool: tool" and the
-    model could not tell which result belonged to which call — results got
-    paired with wrong calls. Returns a new list; input is not mutated.
+    converted Anthropic tool_result messages carry the tool name and arguments, so
+    extract_tool_results() could not distinguish multiple calls to the same tool
+    (e.g. concurrent skill_view calls) and results got crossed. Returns a new list;
+    input is not mutated.
     """
-    id_to_name = {}
+    id_to_info = {}
     for m in messages:
         for tc in m.get("tool_calls") or []:
             if isinstance(tc, dict) and tc.get("id"):
                 fn = tc.get("function", {}) or {}
                 if isinstance(fn, dict) and fn.get("name"):
-                    id_to_name[tc["id"]] = fn["name"]
+                    id_to_info[tc["id"]] = {
+                        "name": fn["name"],
+                        "arguments": fn.get("arguments"),
+                    }
         content = m.get("content")
         if isinstance(content, list):
             for c in content:
                 if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("id"):
-                    id_to_name[c["id"]] = c.get("name", "")
-    if not id_to_name:
+                    id_to_info[c["id"]] = {
+                        "name": c.get("name", ""),
+                        "arguments": c.get("input"),
+                    }
+    if not id_to_info:
         return messages
     out = []
     for m in messages:
-        if m.get("role") == "tool" and not m.get("name"):
-            name = id_to_name.get(m.get("tool_call_id", ""), "")
-            if name:
-                m = {**m, "name": name}
+        if m.get("role") == "tool":
+            info = id_to_info.get(m.get("tool_call_id", ""), {})
+            if info:
+                updates = {}
+                if not m.get("name") and info.get("name"):
+                    updates["name"] = info["name"]
+                if "tool_arguments" not in m and info.get("arguments") is not None:
+                    updates["tool_arguments"] = info["arguments"]
+                if updates:
+                    m = {**m, **updates}
         out.append(m)
     return out
 
 
 async def extract_tool_results(messages, latest_only=False):
     target_messages = messages
+    ast_tool_order = {}
     if latest_only:
         last_ast_idx = -1
         for idx in range(len(messages) - 1, -1, -1):
@@ -233,17 +246,45 @@ async def extract_tool_results(messages, latest_only=False):
                 last_ast_idx = idx
                 break
         if last_ast_idx != -1:
+            last_ast = messages[last_ast_idx]
+            for order, tc in enumerate(last_ast.get("tool_calls") or []):
+                if isinstance(tc, dict) and tc.get("id"):
+                    ast_tool_order[tc["id"]] = order
+            content = last_ast.get("content")
+            if isinstance(content, list):
+                for order, c in enumerate(content):
+                    if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("id"):
+                        ast_tool_order[c["id"]] = order
             target_messages = messages[last_ast_idx + 1:]
+
+    # Stable-sort tool result messages according to the assistant's invocation order
+    # so concurrent execution in clients (like hermes-agent) does not scramble results.
+    if ast_tool_order:
+        target_messages = sorted(
+            target_messages,
+            key=lambda m: ast_tool_order.get(m.get("tool_call_id", ""), 999999) if m.get("role") == "tool" else 0
+        )
+
     tools_final = []
     for i in target_messages:
         if i.get("role") == "tool":
             name = i.get("name", "tool")
             call_id = i.get("tool_call_id", "")
+            args = i.get("tool_arguments")
             content = i.get("content", "")
             if isinstance(content, list):
                 content = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
             content = _trim_to_budget(str(content), PER_TOOL_RESULT_TOKENS)
-            tools_final.append(f"Tool: {name} (Call ID: {call_id})\nResult: {content}")
+            args_str = ""
+            if args is not None:
+                if isinstance(args, str):
+                    args_str = f"({args})"
+                elif isinstance(args, dict):
+                    try:
+                        args_str = f"({json.dumps(args)})"
+                    except Exception:
+                        args_str = f"({args})"
+            tools_final.append(f"Tool: {name}{args_str} (Call ID: {call_id})\nResult: {content}")
     return "\n\n".join(tools_final) if tools_final else None
 
 
@@ -507,6 +548,7 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
         "<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n"
         "The name must be one of the listed Tool names (never \"tool_call\", \"invoke\", or \"function_call\"). "
         "Put the parameters directly in arguments — never nest another {\"name\": ..., \"arguments\": ...} object inside arguments. "
+        "Numeric arguments (timeout, count, limit, max_tokens, temperature, etc.) MUST be bare numbers (e.g. 60, 0.7), NOT strings and NOT wrapped in XML/DSML markers. "
         "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool."
     )
     if is_first_message and (rollover_summary or needs_rollover(messages)):

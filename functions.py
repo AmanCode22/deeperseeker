@@ -612,6 +612,10 @@ _ENVELOPE_KEYS = frozenset({
     "tool_input", "action_input",
 })
 
+_PSEUDO_TOOL_NAMES = frozenset({
+    "tool_call", "invoke", "function_call", "tool_calls", "calls", "function", "tool", "action"
+})
+
 
 def normalize_tool_call(tool_data_or_name, args_if_name=None):
     if isinstance(tool_data_or_name, str):
@@ -640,6 +644,18 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
         if not isinstance(args, dict):
             break
         if set(args.keys()) - _ENVELOPE_KEYS:
+            # If name is a generic pseudo name (e.g. "tool_call") and args has a
+            # single key that is a valid tool name (and not a parameter name or envelope key),
+            # adopt that key as the tool name.
+            if isinstance(name, str) and name.strip().lower() in _PSEUDO_TOOL_NAMES and len(args) == 1:
+                single_k = next(iter(args.keys()))
+                lower_k = single_k.lower()
+                _PARAM_KEYS = frozenset({"command", "description", "file_path", "content", "path", "prompt", "query", "subject", "old_string", "new_string", "url", "input"})
+                if lower_k not in _PSEUDO_TOOL_NAMES and lower_k not in _ENVELOPE_KEYS and lower_k not in _PARAM_KEYS and (single_k.isidentifier() or "_" in single_k or "-" in single_k):
+                    inner_val = args[single_k]
+                    name = single_k
+                    args = inner_val if isinstance(inner_val, (dict, list, str)) else {}
+                    continue
             break
         inner_name = (
             args.get("name") or args.get("tool") or args.get("tool_name")
@@ -666,6 +682,27 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
 
     if not name or not isinstance(name, str):
         return None
+    cleaned_name = name.strip()
+    if cleaned_name.lower() in _PSEUDO_TOOL_NAMES:
+        return None
+
+    # Coerce numeric arguments that the model often emits as strings
+    # (sometimes with trailing DSML markers like "60</｜｜DSML｜｜>").
+    # Strip DSML markers and cast to int/float where appropriate.
+    _NUMERIC_ARGS = frozenset({"timeout", "count", "limit", "max_tokens", "max_results", "top_k", "top_p", "temperature", "num_predict", "n_predict", "n_keep", "n_batch", "n_threads", "n_gpu_layers", "seed", "port"})
+    if isinstance(args, dict):
+        for k, v in list(args.items()):
+            if k in _NUMERIC_ARGS and isinstance(v, str):
+                # Strip DSML markers and whitespace
+                cleaned = v.strip().rstrip("</｜｜DSML｜｜>").rstrip("</||DSML||>").rstrip("</|DSML|>").strip()
+                try:
+                    if "." in cleaned:
+                        args[k] = float(cleaned)
+                    else:
+                        args[k] = int(cleaned)
+                except Exception:
+                    pass  # leave as string if not a clean number
+
     if isinstance(args, (dict, list)):
         args_str = json.dumps(args)
     elif isinstance(args, str):
@@ -681,7 +718,7 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
         "id": call_id,
         "type": "function",
         "function": {
-            "name": name.strip(),
+            "name": cleaned_name,
             "arguments": args_str,
         },
     }
@@ -726,6 +763,10 @@ def parse_tools(text):
             start_idx = tm.end()
             end_idx = real_tool_matches[i+1].start() if i + 1 < len(real_tool_matches) else len(text)
             body = text[start_idx:end_idx]
+            # Respect closing tag so body does not bleed into prose or next tool block
+            closer_m = re.search(r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|tool_call)[^>]*>", body, re.IGNORECASE)
+            if closer_m:
+                body = body[:closer_m.start()]
             args = {}
             p_matches = re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)", body, flags=re.DOTALL | re.IGNORECASE)
             for pm in p_matches:
@@ -746,6 +787,28 @@ def parse_tools(text):
                         args[t_name] = json.loads(t_val)
                     except Exception:
                         args[t_name] = t_val
+            if not args and "{" in body:
+                brace_pos = body.find("{")
+                if brace_pos != -1:
+                    try:
+                        b_data, _ = json.JSONDecoder().raw_decode(body[brace_pos:])
+                        if isinstance(b_data, dict):
+                            if "arguments" in b_data and isinstance(b_data["arguments"], (dict, str)):
+                                b_args = b_data["arguments"]
+                                if isinstance(b_args, str):
+                                    try:
+                                        b_args = json.loads(b_args)
+                                    except Exception:
+                                        pass
+                                args = b_args
+                            elif "parameters" in b_data and isinstance(b_data["parameters"], dict):
+                                args = b_data["parameters"]
+                            elif "input" in b_data and isinstance(b_data["input"], dict):
+                                args = b_data["input"]
+                            else:
+                                args = b_data
+                    except Exception:
+                        pass
             if candidate_name:
                 norm = normalize_tool_call(candidate_name, args)
                 if norm:
@@ -820,15 +883,54 @@ def parse_tools(text):
             for m in matches:
                 tag_name = m.group(1)
                 after_tag = text[m.end():]
-                brace_pos = after_tag.find("{")
-                if brace_pos != -1:
-                    json_substr = after_tag[brace_pos:]
-                    data = None
+                closer_m = re.search(r"</(?:tool_call|function_call|tool_calls|invoke)[^>]*>", after_tag, re.IGNORECASE)
+                tag_body = after_tag[:closer_m.start()] if closer_m else after_tag
+                pos = 0
+                matched_in_tag = False
+                while pos < len(tag_body):
+                    brace_pos = tag_body.find("{", pos)
+                    bracket_pos = tag_body.find("[", pos)
+                    candidates = [p for p in (brace_pos, bracket_pos) if p != -1]
+                    if not candidates:
+                        break
+                    start_p = min(candidates)
                     try:
-                        data, _ = decoder.raw_decode(json_substr)
+                        data, consumed = decoder.raw_decode(tag_body[start_p:])
+                        pos = start_p + max(consumed, 1)
+                        if isinstance(data, list):
+                            for item in data:
+                                norm = normalize_tool_call(item)
+                                if norm:
+                                    tools.append(norm)
+                                    matched_in_tag = True
+                        elif isinstance(data, dict):
+                            if tag_name:
+                                name = tag_name
+                                if "arguments" in data and isinstance(data["arguments"], dict):
+                                    args = data["arguments"]
+                                elif "parameters" in data and isinstance(data["parameters"], dict):
+                                    args = data["parameters"]
+                                elif "input" in data and isinstance(data["input"], dict):
+                                    args = data["input"]
+                                else:
+                                    args = {k: v for k, v in data.items() if k not in ["name", "tool", "function"]}
+                            else:
+                                name = data.get("name") or data.get("tool") or data.get("tool_name") or data.get("function") or data.get("action")
+                                args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or data.get("params") or data.get("tool_input") or data.get("action_input")
+                                if args is None:
+                                    args = {}
+                            if name:
+                                norm = normalize_tool_call(name, args)
+                                if norm:
+                                    tools.append(norm)
+                                    matched_in_tag = True
                     except Exception:
-                        pass
-                    if not data:
+                        pos = start_p + 1
+
+                if not matched_in_tag:
+                    brace_pos = tag_body.find("{")
+                    if brace_pos != -1:
+                        json_substr = tag_body[brace_pos:]
                         cleaned_json = re.sub(r"</?(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*", "", json_substr, flags=re.DOTALL).strip()
                         open_b = cleaned_json.count("{")
                         close_b = cleaned_json.count("}")
@@ -836,28 +938,14 @@ def parse_tools(text):
                             cleaned_json += "}" * (open_b - close_b)
                         try:
                             data = json.loads(cleaned_json)
+                            if isinstance(data, dict):
+                                name = tag_name or data.get("name") or data.get("tool") or data.get("tool_name") or data.get("function") or data.get("action")
+                                args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or data.get("params") or {}
+                                norm = normalize_tool_call(name, args)
+                                if norm:
+                                    tools.append(norm)
                         except Exception:
                             pass
-                    if isinstance(data, dict):
-                        if tag_name:
-                            name = tag_name
-                            if "arguments" in data and isinstance(data["arguments"], dict):
-                                args = data["arguments"]
-                            elif "parameters" in data and isinstance(data["parameters"], dict):
-                                args = data["parameters"]
-                            elif "input" in data and isinstance(data["input"], dict):
-                                args = data["input"]
-                            else:
-                                args = {k: v for k, v in data.items() if k not in ["name", "tool", "function"]}
-                        else:
-                            name = data.get("name") or data.get("tool") or data.get("tool_name") or data.get("function") or data.get("action")
-                            args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or data.get("params") or data.get("tool_input") or data.get("action_input")
-                            if args is None:
-                                args = {}
-                        if name:
-                            norm = normalize_tool_call(name, args)
-                            if norm:
-                                tools.append(norm)
             clean_text = re.sub(r"<(?:tool_call|function_call)[^>]*>.*?(?:</(?:tool_call|function_call)>|$)", "", text, flags=re.DOTALL).strip()
 
     if not tools:
@@ -898,6 +986,12 @@ def parse_tools(text):
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
     clean_text = re.sub(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+    if tools:
+        logger.info(
+            "parse_tools: parsed %d tool(s): %s",
+            len(tools),
+            [(tc.get("id"), (tc.get("function") or {}).get("name"), (tc.get("function") or {}).get("arguments")) for tc in tools],
+        )
     return tools, clean_text
 
 
@@ -1004,16 +1098,27 @@ class StreamToolParser:
                     self.json_done = False
                     self._end_re = None
                     continue
-                brace_idx = self.buffer.find("{")
-                if brace_idx != -1 and not self.json_done:
+                candidates = [p for p in (self.buffer.find("{"), self.buffer.find("[")) if p != -1]
+                if candidates and not self.json_done:
+                    start_p = min(candidates)
                     decoder = json.JSONDecoder()
                     try:
-                        data, consumed = decoder.raw_decode(self.buffer[brace_idx:])
-                        norm = normalize_tool_call(data)
-                        if norm:
-                            results.append({"tool": norm})
+                        data, consumed = decoder.raw_decode(self.buffer[start_p:])
+                        emitted = False
+                        if isinstance(data, list):
+                            for item in data:
+                                norm = normalize_tool_call(item)
+                                if norm:
+                                    results.append({"tool": norm})
+                                    emitted = True
+                        elif isinstance(data, dict):
+                            norm = normalize_tool_call(data)
+                            if norm:
+                                results.append({"tool": norm})
+                                emitted = True
+                        if emitted:
                             self.json_done = True
-                            self.buffer = self.buffer[brace_idx + consumed:]
+                            self.buffer = self.buffer[start_p + consumed:]
                             continue
                     except Exception:
                         pass

@@ -432,11 +432,11 @@ def _clean_text(text):
 
 
 def _log_tool_shapes(parsed_tools, where):
-    """Log tool name + top-level argument types (never values).
+    """Log tool name + call_id + top-level argument types and preview.
 
     Distinguishes "model emitted a string where the schema wants a list"
     from "the bridge mangled a list into a string" when hermes rejects a
-    call's shape. One line per tool call; safe for default log levels.
+    call's shape, and tracks tool call IDs across streams to detect result crossing.
     """
     for tc in parsed_tools:
         try:
@@ -449,8 +449,9 @@ def _log_tool_shapes(parsed_tools, where):
             )
         except Exception:
             shape = "unparseable"
+            args = {}
             fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-        logger.info("%s tool=%s arg_shapes=%s", where, fn.get("name"), shape)
+        logger.info("%s tool id=%s name=%s arg_shapes=%s args=%s", where, tc.get("id"), fn.get("name"), shape, str(args)[:300])
 
 
 def _assistant_msg(messages, parsed_tools, clean_text):
@@ -727,8 +728,6 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         if delta and not _role_sent[0]:
             delta = {"role": "assistant", **delta}
             _role_sent[0] = True
-
-    def _chunk(delta, finish_reason=None):
         return (
             "data: "
             + json.dumps(
@@ -799,8 +798,16 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
             pass
     finally:
         parsed_tools, clean_text = _clean_text(full_text)
-        if parsed_tools:
-            _log_tool_shapes(parsed_tools, "stream")
+        flush_text_parts = []
+        flush_tools = []
+        for r in parser.flush():
+            if "text" in r:
+                flush_text_parts.append(r["text"])
+            elif "tool" in r:
+                flush_tools.append(r["tool"])
+        effective_tools = parsed_tools or streamed_tools or flush_tools
+        if effective_tools:
+            _log_tool_shapes(effective_tools, "stream")
 
         if not failed:
             # Persistence must never kill the SSE terminator below: if the
@@ -808,7 +815,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
             # and the client would see content chunks followed by an abrupt
             # close (no finish_reason, no [DONE]) — i.e. "truncated".
             try:
-                next_messages = _assistant_msg(messages, parsed_tools, clean_text)
+                next_messages = _assistant_msg(messages, effective_tools, clean_text)
                 next_sig = generate_signature_sync(next_messages, model, scope)
                 nxt = next_parent(parent_message_id)
                 await _db_call(save_session, sig, token_id, session_id, nxt)
@@ -820,17 +827,6 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
 
         if not aborted:
             try:
-                # Merge order: end-of-stream parse wins (it sees the whole
-                # text); fall back to tools the streaming parser completed
-                # mid-stream or salvaged at flush() so none are dropped.
-                flush_text_parts = []
-                flush_tools = []
-                for r in parser.flush():
-                    if "text" in r:
-                        flush_text_parts.append(r["text"])
-                    elif "tool" in r:
-                        flush_tools.append(r["tool"])
-                effective_tools = parsed_tools or streamed_tools or flush_tools
                 if not effective_tools:
                     for part in flush_text_parts:
                         yield _chunk({"content": part})
@@ -934,14 +930,23 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
     finally:
         parsed_tools, clean_text = _clean_text(full_text)
         out_tokens = count_tok(full_text)
-        if parsed_tools:
-            _log_tool_shapes(parsed_tools, "stream-anthropic")
+
+        flushed_text = ""
+        flush_tools = []
+        for r in parser.flush():
+            if "text" in r:
+                flushed_text += r["text"]
+            elif "tool" in r:
+                flush_tools.append(r["tool"])
+        effective_tools = parsed_tools or streamed_tools or flush_tools
+        if effective_tools:
+            _log_tool_shapes(effective_tools, "stream-anthropic")
 
         if not failed:
             # Same guarantee as stream_response: a failing DB write must not
             # swallow message_stop (the Anthropic terminator).
             try:
-                next_messages = _assistant_msg(messages, parsed_tools, clean_text)
+                next_messages = _assistant_msg(messages, effective_tools, clean_text)
                 next_sig = generate_signature_sync(next_messages, model, scope)
                 nxt = next_parent(parent_message_id)
                 await _db_call(save_session, sig, token_id, session_id, nxt)
@@ -961,15 +966,6 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         if is_thinking:
             tail_events += f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
             block_index_local[0] += 1
-
-        flushed_text = ""
-        flush_tools = []
-        for r in parser.flush():
-            if "text" in r:
-                flushed_text += r["text"]
-            elif "tool" in r:
-                flush_tools.append(r["tool"])
-        effective_tools = parsed_tools or streamed_tools or flush_tools
 
         if not text_block_started and not effective_tools and (clean_text or flushed_text):
             tail_events += _tb(clean_text or flushed_text)
