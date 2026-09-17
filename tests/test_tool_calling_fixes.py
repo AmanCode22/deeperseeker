@@ -214,6 +214,11 @@ def test_write_file_parameter_aliasing_and_dsml_stripping():
     args = json.loads(norm["function"]["arguments"])
     assert args["content"] == "print('hello world')"
     assert args["path"] == "/home/user/workspace/script.py"
+    # The source key must be consumed, not left duplicated alongside the
+    # canonical one — a live hermes-agent session reported write_file calls
+    # failing schema validation (or silently doubling large payload size)
+    # because the aliased-from key survived in the final args dict.
+    assert "file_content" not in args
 
     # 2. file_path -> path and DSML token in path stripped
     raw2 = {
@@ -228,6 +233,8 @@ def test_write_file_parameter_aliasing_and_dsml_stripping():
     args2 = json.loads(norm2["function"]["arguments"])
     assert args2["path"] == "/home/user/workspace/script.py"
     assert args2["content"] == "data"
+    assert "file_path" not in args2
+    assert "file_content" not in args2
 
     # 3. Path with 1500x repetition of </｜｜DSML｜｜>
     repeated_dsml_path = "/home/user/workspace/test.txt" + ("</｜｜DSML｜｜>" * 1500)
@@ -236,15 +243,26 @@ def test_write_file_parameter_aliasing_and_dsml_stripping():
     args3 = json.loads(norm3["function"]["arguments"])
     assert args3["path"] == "/home/user/workspace/test.txt"
 
+    # 4. An empty-string content is a deliberate "write an empty file" and
+    # must NOT be aliased over by a candidate key (unlike path/code/command,
+    # which treat "" as missing).
+    raw4 = {"name": "write_file", "arguments": {"path": "/tmp/empty.txt", "content": ""}}
+    norm4 = normalize_tool_call(raw4)
+    args4 = json.loads(norm4["function"]["arguments"])
+    assert args4["content"] == ""
+
 
 def test_execute_code_and_bash_parameter_aliasing():
     """execute_code must alias command/script -> code, and bash must alias cmd -> command,
-    defaulting to empty string instead of None to prevent NoneType errors."""
+    defaulting to empty string instead of None to prevent NoneType errors. The source
+    key must not survive alongside the canonical one (duplicated payload / extra-field
+    schema rejection)."""
     # execute_code command -> code
     norm_code = normalize_tool_call("execute_code", {"command": "import sys; print(sys.version)"})
     assert norm_code is not None
     args_code = json.loads(norm_code["function"]["arguments"])
     assert args_code["code"] == "import sys; print(sys.version)"
+    assert "command" not in args_code
 
     # execute_code with missing code defaults to ""
     norm_empty_code = normalize_tool_call("execute_code", {})
@@ -257,12 +275,28 @@ def test_execute_code_and_bash_parameter_aliasing():
     assert norm_bash is not None
     args_bash = json.loads(norm_bash["function"]["arguments"])
     assert args_bash["command"] == "pytest -v"
+    assert "cmd" not in args_bash
 
     # bash with empty args defaults command to ""
     norm_empty_bash = normalize_tool_call("bash", {})
     assert norm_empty_bash is not None
     args_empty_bash = json.loads(norm_empty_bash["function"]["arguments"])
     assert args_empty_bash["command"] == ""
+
+
+def test_skill_tool_aliasing_skips_own_name_without_dropping_it():
+    """skill_view aliases skill_name/name/path (in that order) onto 'skill', but a
+    candidate whose value equals the tool's own name (a redundant {"name":
+    "skill_view", ...} echo) must be skipped rather than adopted, falling through to
+    the next candidate — and because it was skipped rather than consumed, it must
+    still be present afterwards (only a candidate actually used as the alias source
+    gets popped)."""
+    norm = normalize_tool_call("skill_view", {"name": "skill_view", "path": "grounded-citations"})
+    assert norm is not None
+    args = json.loads(norm["function"]["arguments"])
+    assert args["skill"] == "grounded-citations"
+    assert "path" not in args  # consumed as the alias source
+    assert args.get("name") == "skill_view"  # skipped (matches the tool's own name), left untouched
 
 
 def test_bare_dsml_closer_closes_stream_feed():
@@ -310,4 +344,34 @@ def test_batch_calls_unwrapping_in_tags_and_dict():
     assert norm is not None
     assert norm["function"]["name"] == "bash"
     assert json.loads(norm["function"]["arguments"]) == {"command": "git status"}
+
+
+def test_bare_parameter_tag_without_invoke_wrapper_is_unattributable():
+    """A <parameter name=...> block with no enclosing invoke/tool_call opener
+    carries no tool name anywhere in the text, so there is nothing to dispatch
+    to — parse_tools correctly returns no tools rather than guessing, and the
+    raw markup (stripped of the parameter tag itself) falls through as plain
+    text. This is the exact shape reported from a live hermes-agent session
+    where a tool call's opening wrapper was lost before reaching the bridge
+    ("terminal output failure" pushing raw markup into chat) — captured here
+    so a real fix (if the wrapper turns out to be recoverable) has a concrete
+    regression case, and so _clean_text's leaked-markup warning (app.py) has
+    a known trigger to log against."""
+    text = (
+        '<｜｜DSML｜｜ parameter name="code">\n'
+        'import json\n'
+        'print("hi")\n'
+        '</｜｜DSML｜｜ parameter>'
+    )
+    tools, clean = parse_tools(text)
+    assert tools == []
+    assert "print" in clean
+
+    import app
+    from functions import _SUSPECT_LEAKED_TOOL_MARKUP_RE
+
+    assert _SUSPECT_LEAKED_TOOL_MARKUP_RE.search(text)
+    parsed_tools, clean_text = app._clean_text(text)
+    assert parsed_tools == []
+    assert "print" in clean_text
 

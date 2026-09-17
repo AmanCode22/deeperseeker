@@ -728,73 +728,61 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
 
         tool_lower = cleaned_name.lower()
 
+        # Alias a stray parameter name onto the canonical key the tool schema
+        # expects, consuming (popping) the source key so it doesn't survive
+        # alongside the canonical one. Leaving both in place (the original
+        # bug here) sends e.g. {"path":..., "content":..., "file_content":...}
+        # to hermes: it duplicates large payloads (content gets sent twice —
+        # directly costly for large file writes under context pressure) and,
+        # on any tool schema that rejects unexpected fields, still fails
+        # validation after "fixing" the missing-field error, just with a
+        # different message.
+        def _alias(canonical, candidates, transform=None, skip_value=None, empty_counts_as_missing=True):
+            current = args.get(canonical)
+            already_set = current is None if not empty_counts_as_missing else not current
+            if not already_set:
+                return
+            for candidate in candidates:
+                if candidate not in args or args[candidate] is None:
+                    continue
+                if skip_value is not None and str(args[candidate]).strip() == skip_value:
+                    continue
+                args[canonical] = transform(args.pop(candidate)) if transform else args.pop(candidate)
+                return
+
         # 2. File tool parameter aliasing (write_file: file_content -> content, file_path -> path)
         if any(term in tool_lower for term in ("file", "write", "create_file", "save_file", "put_file")):
-            if "content" not in args or args["content"] is None:
-                for candidate in ("file_content", "body", "text", "data", "contents"):
-                    if candidate in args and args[candidate] is not None:
-                        args["content"] = args[candidate]
-                        break
-            if "path" not in args or not args["path"]:
-                for candidate in ("file_path", "filepath", "filename", "file"):
-                    if candidate in args and args[candidate]:
-                        args["path"] = args[candidate]
-                        break
+            # content: only None counts as missing — an empty string is a
+            # deliberate "write an empty file" and must not be aliased over.
+            _alias("content", ("file_content", "body", "text", "data", "contents"), empty_counts_as_missing=False)
+            _alias("path", ("file_path", "filepath", "filename", "file"))
         elif "read" in tool_lower:
-            if "path" not in args or not args["path"]:
-                for candidate in ("file_path", "filepath", "filename", "file"):
-                    if candidate in args and args[candidate]:
-                        args["path"] = args[candidate]
-                        break
+            _alias("path", ("file_path", "filepath", "filename", "file"))
 
         # 3. Code execution tools (execute_code: code parameter)
         if any(term in tool_lower for term in ("execute_code", "python", "code_execution", "run_code", "eval")):
-            if "code" not in args or not args["code"]:
-                for candidate in ("command", "script", "source", "input", "content", "query"):
-                    if candidate in args and args[candidate] is not None:
-                        args["code"] = str(args[candidate])
-                        break
+            _alias("code", ("command", "script", "source", "input", "content", "query"), transform=str)
             if "code" not in args or args["code"] is None:
                 args["code"] = ""
 
         # 4. Command/Bash/Terminal tools (command parameter)
         if any(term in tool_lower for term in ("bash", "terminal", "shell", "cmd", "run_command")):
-            if "command" not in args or not args["command"]:
-                for candidate in ("cmd", "code", "script", "input", "action"):
-                    if candidate in args and args[candidate] is not None:
-                        args["command"] = str(args[candidate])
-                        break
+            _alias("command", ("cmd", "code", "script", "input", "action"), transform=str)
             if "command" not in args or args["command"] is None:
                 args["command"] = ""
 
         # 5. Search tools (query parameter)
         if any(term in tool_lower for term in ("search", "tavily", "google")):
-            if "query" not in args or not args["query"]:
-                for candidate in ("q", "search_query", "text", "input", "prompt"):
-                    if candidate in args and args[candidate] is not None:
-                        args["query"] = str(args[candidate])
-                        break
+            _alias("query", ("q", "search_query", "text", "input", "prompt"), transform=str)
 
         # 6. Skill tools (skill parameter)
         if "skill" in tool_lower:
-            if "skill" not in args or not args["skill"]:
-                for candidate in ("skill_name", "name", "path"):
-                    if candidate in args and args[candidate] and str(args[candidate]).strip() != cleaned_name:
-                        args["skill"] = str(args[candidate]).strip()
-                        break
+            _alias("skill", ("skill_name", "name", "path"), transform=lambda v: str(v).strip(), skip_value=cleaned_name)
 
         # 7. Edit/replace tools (old_string / new_string)
         if any(term in tool_lower for term in ("replace", "edit", "patch")):
-            if "old_string" not in args or not args["old_string"]:
-                for candidate in ("TargetContent", "target", "find", "old_str", "search"):
-                    if candidate in args and args[candidate] is not None:
-                        args["old_string"] = args[candidate]
-                        break
-            if "new_string" not in args or not args["new_string"]:
-                for candidate in ("ReplacementContent", "replacement", "replace", "new_str"):
-                    if candidate in args and args[candidate] is not None:
-                        args["new_string"] = args[candidate]
-                        break
+            _alias("old_string", ("TargetContent", "target", "find", "old_str", "search"))
+            _alias("new_string", ("ReplacementContent", "replacement", "replace", "new_str"))
 
         # 8. Numeric argument coercion with DSML token stripping
         _NUMERIC_ARGS = frozenset({
@@ -1189,6 +1177,21 @@ _STREAM_ENTRY_RE = re.compile(
 # Tag names _STREAM_ENTRY_RE can open on.
 _STREAM_ENTRY_TAGS = ("tool_calls", "tool_call", "function_call", "invoke", "calls")
 
+# A fragment that LOOKS like part of a tool call but parse_tools()/StreamToolParser
+# could not attribute to any tool (most commonly a bare <parameter name=...> with
+# no enclosing invoke/tool_call opener — the model dropped or truncated the wrapper
+# that names the tool, so there is nothing to dispatch to) is currently passed
+# through silently as chat content instead of a tool_calls entry; from the end
+# user's side this looks like raw markup leaking into the reply. This pattern is
+# intentionally broader than _STREAM_ENTRY_RE (it also matches bare "parameter"/
+# "param" tags) and is used only for diagnostic logging in app.py's _clean_text,
+# so real occurrences land in the server log with the exact raw text instead of
+# only being visible as garbled chat output with no way to reproduce them.
+_SUSPECT_LEAKED_TOOL_MARKUP_RE = re.compile(
+    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter|param)\b",
+    re.IGNORECASE,
+)
+
 def _skip_bars(text, pos):
     for _ in range(2):
         if pos < len(text) and text[pos] in "|｜":
@@ -1518,6 +1521,35 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
     # replies cut short: any content arriving in an unhandled frame shape is
     # silently dropped, and the reply starts mid-sentence).
     _unhandled = [0]
+
+    # DeepSeek's web-chat endpoint (unlike a standard completions API) takes no
+    # temperature/repetition_penalty/stop params in the request body above — there
+    # is nothing upstream we can tune to prevent a degenerate generation loop (the
+    # model emitting the same fragment over and over with no new content) at the
+    # source. The only lever available here is detecting the loop as it streams
+    # and closing the connection early, instead of buffering an unbounded wall of
+    # repeated text until something external (hermes' own output cap, or the
+    # request simply timing out) finally stops it. A live session hit ~1,500
+    # repeats (~31.5KB) of a filler fragment inside one tool-call argument before
+    # anything intervened; this catches the same pattern within _REPEAT_THRESHOLD
+    # repeats instead.
+    _REPEAT_THRESHOLD = int(os.getenv("DEEPSEEKER_REPEAT_FRAGMENT_THRESHOLD", "24"))
+    _REPEAT_MIN_LEN = int(os.getenv("DEEPSEEKER_REPEAT_FRAGMENT_MIN_LEN", "2"))
+    _repeat_last = [None]
+    _repeat_count = [0]
+
+    def _is_repeat_loop(content):
+        # Fragments shorter than _REPEAT_MIN_LEN (a lone space, a single
+        # newline) legitimately repeat in normal output (indentation, blank
+        # lines between paragraphs) and must not build a false streak.
+        if not content or len(content) < _REPEAT_MIN_LEN:
+            return False
+        if content == _repeat_last[0]:
+            _repeat_count[0] += 1
+        else:
+            _repeat_last[0] = content
+            _repeat_count[0] = 1
+        return _repeat_count[0] >= _REPEAT_THRESHOLD
     resp = await post_with_failover(
         "/api/v0/chat/completion",
         headers=headers, json=json_data,
@@ -1578,43 +1610,77 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 fragments = data["v"]["response"].get("fragments")
                 if fragments:
                     for fragment in fragments:
+                        content = fragment.get("content", "")
                         if fragment.get("type") == "THINK":
+                            if _is_repeat_loop(content):
+                                logger.warning(
+                                    "DeepSeek repetition loop detected for chat %s (THINK fragment "
+                                    "repeated %d+ times); closing the stream early", chat_id, _REPEAT_THRESHOLD,
+                                )
+                                if think_open:
+                                    yield "\n</think>\n\n"
+                                return
                             if not think_open:
                                 yield "<think>\n"
                                 think_open = True
                             got_output = True
-                            yield fragment.get("content", "")
+                            yield content
                         else:
+                            if _is_repeat_loop(content):
+                                logger.warning(
+                                    "DeepSeek repetition loop detected for chat %s (fragment repeated "
+                                    "%d+ times); closing the stream early", chat_id, _REPEAT_THRESHOLD,
+                                )
+                                if think_open:
+                                    yield "\n</think>\n\n"
+                                return
                             if think_open:
                                 yield "\n</think>\n\n"
                                 think_open = False
                             got_output = True
-                            yield fragment.get("content", "")
+                            yield content
                 continue
 
             if data.get("p") == "response/fragments" and data.get("o") == "APPEND":
                 fragments = data.get("v")
                 if isinstance(fragments, list):
                     for fragment in fragments:
+                        content = fragment.get("content", "")
+                        if _is_repeat_loop(content):
+                            logger.warning(
+                                "DeepSeek repetition loop detected for chat %s (fragment repeated "
+                                "%d+ times); closing the stream early", chat_id, _REPEAT_THRESHOLD,
+                            )
+                            if think_open:
+                                yield "\n</think>\n\n"
+                            return
                         if fragment.get("type") == "RESPONSE":
                             if think_open:
                                 yield "\n</think>\n\n"
                                 think_open = False
                             got_output = True
-                            yield fragment.get("content", "")
+                            yield content
                         elif fragment.get("type") == "THINK":
                             if not think_open:
                                 yield "<think>\n"
                                 think_open = True
                             got_output = True
-                            yield fragment.get("content", "")
+                            yield content
                         else:
                             got_output = True
-                            yield fragment.get("content", "")
+                            yield content
                 continue
 
             v = data.get("v")
             if isinstance(v, str) and v:
+                if _is_repeat_loop(v):
+                    logger.warning(
+                        "DeepSeek repetition loop detected for chat %s (raw frame repeated %d+ "
+                        "times); closing the stream early", chat_id, _REPEAT_THRESHOLD,
+                    )
+                    if think_open:
+                        yield "\n</think>\n\n"
+                    return
                 got_output = True
                 yield v
                 continue

@@ -53,6 +53,7 @@ from functions import (
     next_parent,
     parse_tools,
     pick_token,
+    _SUSPECT_LEAKED_TOOL_MARKUP_RE,
     save_session,
     send_message,
     StreamToolParser,
@@ -426,6 +427,14 @@ async def _preflight_stream(gen):
 def _clean_text(text):
     """Single place for tool-parse + think/tag stripping (was copy-pasted 5x)."""
     parsed_tools, clean_text = parse_tools(text)
+    if not parsed_tools and _SUSPECT_LEAKED_TOOL_MARKUP_RE.search(text):
+        # parse_tools found tool-call-shaped markup but could not attribute it
+        # to any tool (most often a bare <parameter name=...> with no enclosing
+        # invoke/tool_call opener naming the tool) — it falls through to chat
+        # content, which end users see as garbled raw markup. Log the raw text
+        # so a real occurrence can be captured verbatim and turned into a
+        # regression test instead of only being visible as a user bug report.
+        logger.warning("Suspected leaked tool-call markup (no tool attributed): %r", text[:2000])
     clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
     clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
     return parsed_tools, clean_text

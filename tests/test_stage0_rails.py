@@ -862,6 +862,88 @@ def test_handle_chat_retry_surrenders_lock_before_recursing():
 
 
 # ------------------------------------------------------------------------------
+# send_message: abort a degenerate upstream repetition loop early
+
+class FakeStreamResp:
+    """Minimal async-context-manager response with a `.content` async
+    line iterator, matching what send_message consumes from post_with_failover."""
+
+    def __init__(self, lines):
+        self.status = 200
+        self._lines = lines
+
+    @property
+    def content(self):
+        return self._aiter()
+
+    async def _aiter(self):
+        for line in self._lines:
+            yield line.encode("utf-8")
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _sse_append_frame(content, ftype="RESPONSE"):
+    return "data: " + json.dumps({
+        "p": "response/fragments", "o": "APPEND",
+        "v": [{"type": ftype, "content": content}],
+    }) + "\n"
+
+
+def test_send_message_aborts_degenerate_repetition_loop_early():
+    """DeepSeek's web-chat endpoint takes no temperature/repetition_penalty/stop
+    params (see json_data in send_message) — there is nothing upstream to tune to
+    prevent a degenerate generation loop. A live session hit ~1,500 repeats
+    (~31.5KB) of a filler fragment inside one tool-call argument before anything
+    external stopped it. send_message must detect the same pattern (the same
+    non-trivial fragment repeated many times in a row with no new content) and
+    close the connection instead of consuming the rest of the scripted frames."""
+    import functions
+
+    real_content = "echo '=== ok ===' && "
+    filler = "filler "
+    sentinel = "SHOULD_NEVER_APPEAR"
+
+    lines = [_sse_append_frame(real_content)]
+    lines += [_sse_append_frame(filler) for _ in range(40)]  # well past the default threshold (24)
+    lines.append(_sse_append_frame(sentinel))
+    lines.append("data: " + json.dumps({"p": "response/status", "v": "FINISHED"}) + "\n")
+
+    fake_resp = FakeStreamResp(lines)
+
+    async def fake_post_with_failover(path, *, headers, **kwargs):
+        return fake_resp
+
+    async def fake_solve_pow(target_path, auth_token):
+        return "pow-stub"
+
+    orig_post = functions.post_with_failover
+    orig_pow = functions.solve_create_pow
+    functions.post_with_failover = fake_post_with_failover
+    functions.solve_create_pow = fake_solve_pow
+    try:
+        async def scenario():
+            chunks = []
+            async for chunk in functions.send_message("chat-1", "tok", "prompt", 0):
+                chunks.append(chunk)
+            return "".join(chunks)
+
+        collected = asyncio.run(scenario())
+    finally:
+        functions.post_with_failover = orig_post
+        functions.solve_create_pow = orig_pow
+
+    assert collected.startswith(real_content), "real content before the loop must still come through"
+    assert sentinel not in collected, "frames after the detected loop must never be reached"
+    assert collected.count(filler) < 40, "must abort before consuming all 40 scripted repeats"
+    assert collected.count(filler) >= 1, "some repeats are expected before the threshold trips"
+
+
+# ------------------------------------------------------------------------------
 # Tool-call/session crossing fix — refresh parent_message_id under the chat lock
 
 def test_handle_chat_refreshes_stale_parent_after_lock_acquired():
