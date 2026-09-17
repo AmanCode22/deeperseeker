@@ -861,6 +861,92 @@ def test_handle_chat_retry_surrenders_lock_before_recursing():
         app_module._chat_locks.clear()
 
 
+# ------------------------------------------------------------------------------
+# Tool-call/session crossing fix — refresh parent_message_id under the chat lock
+
+def test_handle_chat_refreshes_stale_parent_after_lock_acquired():
+    """The session row for a signature is read once before this request queues
+    for the per-chat lock. `sig` only covers history up to the last assistant
+    message, not the tool results that follow it, so a client-side retry (or
+    any second request sharing that prefix) hashes to the same sig. If that
+    other request already completed its turn and advanced parent_message_id
+    while this one waited on the lock, sending with the stale pre-lock parent
+    forks the upstream chat and the two requests' results end up crossed.
+    handle_chat must re-read the session row after acquiring the lock and use
+    whatever the most recent holder actually left behind."""
+    import app as app_module
+
+    async def scenario():
+        app_module._chat_locks.clear()
+        sig = "sig-refresh"
+        find_calls = {"n": 0}
+        sent = {}
+
+        def fake_find(s):
+            find_calls["n"] += 1
+            if find_calls["n"] == 1:
+                # Stale snapshot taken before this request queued for the lock.
+                return {"token_id": "t1", "session_id": "chat-1", "parent_message_id": 0}
+            # A concurrent holder of the same sig already completed its turn
+            # and advanced the session while we waited for the lock.
+            return {"token_id": "t1", "session_id": "chat-1", "parent_message_id": 4}
+
+        def fake_get_token(tid):
+            return {"token": "tok", "status": "ACTIVE"}
+
+        def fake_send(chat_id, auth_token, message, parent, thinking=False, search=False, file_ids_=None):
+            sent["parent"] = parent
+
+            async def gen():
+                yield "hi"
+
+            return gen()
+
+        async def fake_files(messages, token, last_user_only=False):
+            return []
+
+        async def fake_prompt(messages, tools, model, is_first, rollover_summary=None):
+            sent["is_first"] = is_first
+            return "prompt"
+
+        async def fake_sig(messages, model, scope=""):
+            return sig
+
+        patches = [
+            ("get_auth_token", lambda: "tok"),
+            ("generate_signature", fake_sig),
+            ("find_session", fake_find),
+            ("get_token", fake_get_token),
+            ("send_message", fake_send),
+            ("extract_and_upload_files", fake_files),
+            ("build_prompt", fake_prompt),
+            ("mark_active", lambda tid: None),
+            ("save_session", lambda *a, **k: None),
+            ("parse_tools", lambda t: ([], t)),
+            ("format_response", lambda text, model, messages, tools=None: "FORMATTED"),
+        ]
+        saved = [(name, getattr(app_module, name)) for name, _ in patches]
+        for name, fn in patches:
+            setattr(app_module, name, fn)
+        try:
+            result = await app_module.handle_chat([{"role": "user", "content": "hi"}], "test-model")
+        finally:
+            for name, fn in saved:
+                setattr(app_module, name, fn)
+        return result, sent, find_calls["n"]
+
+    try:
+        result, sent, n = asyncio.run(scenario())
+        assert n == 2, "must re-read the session row after acquiring the chat lock"
+        assert sent["parent"] == 4, "must send with the freshly-read parent, not the stale pre-lock value"
+        assert sent["is_first"] is False, "is_first must reflect the refreshed parent, not the stale one"
+        assert result == "FORMATTED"
+    finally:
+        import app as app_module
+
+        app_module._chat_locks.clear()
+
+
 def _main():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

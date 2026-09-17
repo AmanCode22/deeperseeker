@@ -3,22 +3,59 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import types
-aio = types.ModuleType('aiohttp')
-aio.ClientSession = type('CS', (), {
-    '__init__': lambda *a, **k: None,
-    '__aenter__': lambda s: s,
-    '__aexit__': lambda *a: None,
-    'post': lambda *a, **k: None,
-})
-aio.ClientTimeout = lambda **k: None
-aio.ClientError = Exception
-aio.HTTPError = Exception
-aio.ContentTypeError = Exception
-sys.modules['aiohttp'] = aio
-dst = types.ModuleType('deepseek_tokenizer')
-dst.ds_token = types.SimpleNamespace(encode=lambda t: list(t))
-sys.modules['deepseek_tokenizer'] = dst
-sys.modules['wasmtime'] = types.ModuleType('wasmtime')
+import importlib.util
+
+# These fake modules exist only to satisfy functions.py/plugin_helper.py's
+# imports when the real aiohttp/deepseek_tokenizer/wasmtime packages aren't
+# installed (this file must be importable standalone in a minimal debug env).
+#
+# Each is only injected into sys.modules if it isn't already loaded AND isn't
+# actually installed. Faking one that IS installed would get baked permanently
+# into functions.py's/plugin_helper.py's module namespace on first import
+# (Python binds `import aiohttp` to whatever object sys.modules['aiohttp'] is
+# at that moment, for the life of the process) and desync from other test
+# files — e.g. test_stage0_rails.py's real aiohttp.ClientConnectionError would
+# no longer be caught by functions.py's `except aiohttp.ClientError` because
+# the two files would be looking at unrelated exception hierarchies.
+def _ensure_fake_module(name, build):
+    if name in sys.modules:
+        return
+    try:
+        found = importlib.util.find_spec(name) is not None
+    except ImportError:
+        found = False
+    if found:
+        return
+    sys.modules[name] = build()
+
+
+def _build_fake_aiohttp():
+    aio = types.ModuleType('aiohttp')
+    aio.ClientSession = type('CS', (), {
+        '__init__': lambda *a, **k: None,
+        '__aenter__': lambda s: s,
+        '__aexit__': lambda *a: None,
+        'post': lambda *a, **k: None,
+    })
+    aio.ClientTimeout = lambda **k: None
+    class _MockClientError(Exception): pass
+    class _MockClientConnectionError(_MockClientError): pass
+    aio.ClientError = _MockClientError
+    aio.ClientConnectionError = _MockClientConnectionError
+    aio.HTTPError = _MockClientError
+    aio.ContentTypeError = Exception
+    return aio
+
+
+def _build_fake_deepseek_tokenizer():
+    dst = types.ModuleType('deepseek_tokenizer')
+    dst.ds_token = types.SimpleNamespace(encode=lambda t: list(t))
+    return dst
+
+
+_ensure_fake_module('aiohttp', _build_fake_aiohttp)
+_ensure_fake_module('deepseek_tokenizer', _build_fake_deepseek_tokenizer)
+_ensure_fake_module('wasmtime', lambda: types.ModuleType('wasmtime'))
 
 from functions import normalize_tool_call, parse_tools
 from plugin_helper import enrich_tool_names, extract_tool_results

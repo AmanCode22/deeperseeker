@@ -609,13 +609,32 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         return JSONResponse({"error": "Token expired"}, status_code=503)
     _set_key_name(tok.get("alias"))
 
-    is_first = parent_message_id == 0
     # Stage 0.3: hold this chat's lock across the whole send -> save critical
     # section; for streams, ownership transfers to the response generator via
     # _release_chat_lock_stream (the final save_session happens there).
     lock_owner = await _own_chat_lock(session_id)
     lock_transferred = False
     try:
+        # Re-check the signature's session row now that the chat lock is held.
+        # `sess`/`parent_message_id` above were read before this request queued
+        # for the lock; a concurrent request sharing the same sig (e.g. a
+        # client-side retry racing the original call — sig only covers the
+        # history up to the last assistant message, not the tool results that
+        # follow, so a retry with the same prefix hashes identically) may have
+        # already completed its turn and advanced parent_message_id while we
+        # waited. Sending with the stale parent forks the upstream chat and the
+        # two requests' results end up crossed. Re-reading under the lock picks
+        # up whatever the most recent holder actually left behind.
+        fresh_sess = await _db_call(find_session, sig)
+        if fresh_sess and fresh_sess["session_id"] == session_id:
+            parent_message_id = fresh_sess["parent_message_id"]
+            token_id = fresh_sess["token_id"]
+            fresh_tok = await _db_call(get_token, token_id)
+            if fresh_tok:
+                tok = fresh_tok
+                _set_key_name(tok.get("alias"))
+        is_first = parent_message_id == 0
+
         file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
         prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
 
