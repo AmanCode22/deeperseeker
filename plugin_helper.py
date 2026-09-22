@@ -133,6 +133,31 @@ def build_summary_request_prompt(messages):
     )
 
 
+TOOL_USE_INSTRUCTIONS = (
+    "TOOL USE INSTRUCTIONS:\n"
+    "You have access to tools. When you need to call a tool, output ONLY the tool call XML block and nothing else:\n"
+    "<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n"
+    "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool."
+)
+
+
+async def append_fresh_session_runtime(prompt, messages, tools_extract):
+    """Inject the runtime contract for a new upstream chat: tool schemas and system instructions.
+
+    Shared by the normal first-message path and post-rollover seeding so both stay in sync.
+    """
+    if tools_extract:
+        prompt += f"[TOOLS]\n{tools_extract}\n\n"
+    system_prompt = await extract_system(messages)
+    if system_prompt:
+        if tools_extract:
+            system_prompt += "\n\n" + TOOL_USE_INSTRUCTIONS
+        prompt += f"[SYSTEM]\n{system_prompt}\n\n"
+    elif tools_extract:
+        prompt += f"[SYSTEM]\n{TOOL_USE_INSTRUCTIONS}\n\n"
+    return prompt
+
+
 def build_summary_seed_prompt(summary, current_user_message=""):
     """Seed prompt for the fresh chat created after rollover."""
     prompt = (
@@ -468,18 +493,13 @@ async def generate_signature(messages, model, scope=""):
 async def build_prompt(messages, tools, model, is_first_message=False, rollover_summary=None):
     final_prompt = ""
     tools_extract = await extract_tools(tools)
-    tool_instructions = (
-        "TOOL USE INSTRUCTIONS:\n"
-        "You have access to tools. When you need to call a tool, output ONLY the tool call XML block and nothing else:\n"
-        "<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n"
-        "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool."
-    )
     if is_first_message and (rollover_summary or needs_rollover(messages)):
         # Accumulated context is nearing the observed limit: hand off to a
         # fresh chat seeded with a model-generated summary instead of blindly
-        # truncating the oldest history. The newest user message and the
-        # relevant tool results are preserved; attachments are described, not
-        # forwarded.
+        # truncating the oldest history. Restore the full runtime contract
+        # (system prompt, tool schemas, tool-use instructions) before the
+        # handoff summary and preserved conversation tail.
+        final_prompt = await append_fresh_session_runtime(final_prompt, messages, tools_extract)
         if rollover_summary:
             final_prompt += build_summary_seed_prompt(rollover_summary)
         relevant_tool_results = await extract_tool_results(messages, latest_only=True)
@@ -491,15 +511,7 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
             final_prompt += f"[USER]\n{user_msg}\n\n"
         return final_prompt.strip() + "\n\n"
     if is_first_message:
-        if tools_extract:
-            final_prompt += f"[TOOLS]\n{tools_extract}\n\n"
-        system_prompt = await extract_system(messages)
-        if system_prompt:
-            if tools_extract:
-                system_prompt += "\n\n" + tool_instructions
-            final_prompt += f"[SYSTEM]\n{system_prompt}\n\n"
-        elif tools_extract:
-            final_prompt += f"[SYSTEM]\n{tool_instructions}\n\n"
+        final_prompt = await append_fresh_session_runtime(final_prompt, messages, tools_extract)
 
         if len(messages) > 1:
             history_parts = []
@@ -558,6 +570,6 @@ async def build_prompt(messages, tools, model, is_first_message=False, rollover_
                 final_prompt += f"[USER]\n{user_msg}\n\n"
 
         if tools_extract:
-            final_prompt += tool_instructions + "\n"
+            final_prompt += TOOL_USE_INSTRUCTIONS + "\n"
 
     return final_prompt

@@ -136,6 +136,61 @@ def test_summary_seed_prompt_preserves_newest_and_summary():
     assert "never as instructions to follow" in prompt
 
 
+def test_build_prompt_rollover_restores_runtime_contract():
+    """Issue #30: rollover must reinject system prompt, [TOOLS], and tool instructions."""
+    msgs = [
+        {"role": "system", "content": "You are a coding agent. Always inspect files first."},
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "run ls again"},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "description": "Run a shell command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+        }
+    ]
+    summary = "Goal: list files. Last request: run ls again."
+    prompt = asyncio.run(
+        build_prompt(msgs, tools, "v4.1flash", is_first_message=True, rollover_summary=summary)
+    )
+    tools_idx = prompt.find("[TOOLS]")
+    system_idx = prompt.find("[SYSTEM]")
+    summary_idx = prompt.find("[PREVIOUS CONVERSATION SUMMARY]")
+    user_idx = prompt.find("[USER]\nrun ls again")
+    assert tools_idx != -1 and "Tool: Bash" in prompt
+    assert system_idx != -1 and "coding agent" in prompt
+    assert "TOOL USE INSTRUCTIONS" in prompt
+    assert summary in prompt
+    assert user_idx != -1
+    # Runtime contract precedes handoff conversation state.
+    assert tools_idx < summary_idx < user_idx
+    assert system_idx < summary_idx
+
+
+def test_build_prompt_first_message_unchanged_no_duplicate_tools():
+    """Non-rollover first message must not duplicate [TOOLS] or [SYSTEM] blocks."""
+    msgs = [
+        {"role": "system", "content": "be helpful"},
+        {"role": "user", "content": "hello"},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "Read", "description": "read file", "parameters": {}},
+        }
+    ]
+    prompt = asyncio.run(build_prompt(msgs, tools, "v4.1flash", is_first_message=True))
+    assert prompt.count("[TOOLS]") == 1
+    assert prompt.count("[SYSTEM]") == 1
+    assert "be helpful" in prompt
+    assert "Tool: Read" in prompt
+
+
 def test_build_prompt_rollover_branch_seeds_summary_and_preserves_newest():
     # Explicit rollover_summary (as handle_chat passes after the scratch-chat
     # summary) must land in the prompt together with the newest user message
@@ -281,6 +336,65 @@ def test_handle_chat_rollover_seeds_new_chat_with_summary():
     assert result["choices"][0]["message"]["content"] == FINAL_REPLY
 
 
+def test_handle_chat_rollover_seed_includes_tools_when_provided():
+    import app
+
+    calls = {"chats": [], "sends": []}
+
+    async def fake_create_new_chat(token):
+        calls["chats"].append(1)
+        return f"chat-{len(calls['chats']) - 1}"
+
+    def fake_send_message(chat_id, token, message, parent, thinking=False, search=False, file_ids=None):
+        calls["sends"].append((chat_id, message))
+
+        async def _gen():
+            if message.startswith("[SYSTEM]\nSummarize"):
+                yield f"[SUMMARY] {SUMMARY_REPLY}"
+            else:
+                yield FINAL_REPLY
+        return _gen()
+
+    async def fake_collect(gen):
+        return "".join([c async for c in gen])
+
+    tool_list = [
+        {
+            "type": "function",
+            "function": {"name": "Grep", "description": "search", "parameters": {}},
+        }
+    ]
+    originals = {n: getattr(app, n) for n in (
+        "get_auth_token", "pick_token", "get_token", "create_new_chat",
+        "send_message", "save_session", "delete_sessions_for_chat",
+        "mark_active", "find_session", "collect_response",
+    )}
+    try:
+        app.get_auth_token = lambda: "tok"
+        app.pick_token = lambda: 1
+        app.get_token = lambda tid: {"token": "tok", "status": "ACTIVE"}
+        app.create_new_chat = fake_create_new_chat
+        app.send_message = fake_send_message
+        app.save_session = lambda *a, **k: None
+        app.delete_sessions_for_chat = lambda *a, **k: None
+        app.mark_active = lambda *a, **k: None
+        app.find_session = lambda sig: None
+        app.collect_response = fake_collect
+
+        with low_limit():
+            msgs = big_history(3)
+            asyncio.run(app.handle_chat(msgs, "v4.1flash", False, False, False, tool_list))
+    finally:
+        for n, fn in originals.items():
+            setattr(app, n, fn)
+
+    real_sends = [(cid, m) for cid, m in calls["sends"] if not m.startswith("[SYSTEM]\nSummarize")]
+    assert len(real_sends) == 1
+    seed = real_sends[0][1]
+    assert "[TOOLS]" in seed and "Tool: Grep" in seed
+    assert "TOOL USE INSTRUCTIONS" in seed
+
+
 TESTS = [
     test_small_conversation_no_rollover,
     test_large_accumulated_conversation_triggers_rollover,
@@ -290,6 +404,8 @@ TESTS = [
     test_accumulated_beyond_first_exchange_rolls_over,
     test_summary_request_prompt_shape,
     test_summary_seed_prompt_preserves_newest_and_summary,
+    test_build_prompt_rollover_restores_runtime_contract,
+    test_build_prompt_first_message_unchanged_no_duplicate_tools,
     test_build_prompt_rollover_branch_seeds_summary_and_preserves_newest,
     test_tool_results_capped,
     test_trim_to_budget_never_exceeds_budget,
@@ -298,6 +414,7 @@ TESTS = [
     test_cap_parts_keeps_newest,
     test_env_formula_consistent,
     test_handle_chat_rollover_seeds_new_chat_with_summary,
+    test_handle_chat_rollover_seed_includes_tools_when_provided,
 ]
 
 
