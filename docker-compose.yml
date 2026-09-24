@@ -5,7 +5,7 @@ services:
     ports:
       # Host port follows ${PORT} from .env / shell (defaults to 4000);
       # container port is the same $PORT the app listens on.
-      - "192.168.1.25:${PORT:-4000}:${PORT:-4000}"
+      - "0.0.0.0:${PORT:-4000}:${PORT:-4000}"
     environment:
       # Must win over .env (which defaults to 127.0.0.1 for bare-metal):
       # inside a container localhost means "container only".
