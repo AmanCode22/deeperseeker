@@ -193,3 +193,76 @@ def test_stream_parser_dsml_inside_json_incremental():
     assert len(tool_results) == 1
     args = json.loads(tool_results[0]["tool"]["function"]["arguments"])
     assert args["timeout"] == 30
+
+
+def test_nested_envelope_with_empty_canonical_key():
+    """Live hermes failure: execute_code arrived as
+    {arguments: '{"code": "..."}', name: 'execute_code', code: ''} and hermes
+    reported 'No code provided'. Collapse the envelope and drop the empty key."""
+    raw = {
+        "name": "execute_code",
+        "arguments": {
+            "arguments": '{"code": "print(1)"}',
+            "name": "execute_code",
+            "code": "",
+        },
+    }
+    n = normalize_tool_call(raw)
+    args = json.loads(n["function"]["arguments"])
+    assert args["code"] == "print(1)"
+    assert "arguments" not in args
+    assert args.get("name") in (None, "execute_code")  # name echo must not hide code
+    assert args["code"]
+
+
+def test_empty_command_nested_arguments():
+    raw = {
+        "name": "terminal",
+        "arguments": {
+            "command": "",
+            "arguments": {"command": "ls -la"},
+            "name": "terminal",
+        },
+    }
+    n = normalize_tool_call(raw)
+    args = json.loads(n["function"]["arguments"])
+    assert args["command"] == "ls -la"
+    assert "arguments" not in args
+
+
+def test_dsml_strip_does_not_eat_html():
+    """The old DSML regex treated the marker as optional and then consumed
+    [^>]*>, which deleted <div> from write_file content and execute_code."""
+    n = normalize_tool_call("write_file", {
+        "path": "/tmp/a.html",
+        "content": "<div>hello</div>",
+    })
+    args = json.loads(n["function"]["arguments"])
+    assert args["content"] == "<div>hello</div>"
+
+    n2 = normalize_tool_call("execute_code", {"code": 'print("<div>x</div>")'})
+    args2 = json.loads(n2["function"]["arguments"])
+    assert args2["code"] == 'print("<div>x</div>")'
+
+
+def test_write_file_missing_path_from_file_path_only():
+    n = normalize_tool_call("write_file", {"file_path": "/tmp/x.py", "file_content": "x=1"})
+    args = json.loads(n["function"]["arguments"])
+    assert args["path"] == "/tmp/x.py"
+    assert args["content"] == "x=1"
+
+
+def test_stream_orphan_parameter_code_becomes_execute_code():
+    from functions import StreamToolParser
+    parser = StreamToolParser()
+    chunk = (
+        '<｜｜DSML｜｜ parameter name="code">'
+        'print("hi")'
+        '</｜｜DSML｜｜ parameter>'
+    )
+    results = parser.feed(chunk)
+    results.extend(parser.flush())
+    tools = [r["tool"] for r in results if "tool" in r]
+    assert len(tools) == 1
+    assert tools[0]["function"]["name"] == "execute_code"
+    assert "print" in json.loads(tools[0]["function"]["arguments"])["code"]

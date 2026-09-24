@@ -1029,6 +1029,186 @@ def test_handle_chat_refreshes_stale_parent_after_lock_acquired():
         app_module._chat_locks.clear()
 
 
+def test_send_message_content_filter_raises_before_any_yield():
+    """CONTENT_FILTER arrives after the think prefix and before any RESPONSE.
+
+    The prefix must not be yielded: handle_chat has to see the exception on
+    the first pull (preflight) so it can retry on the next token. The canned
+    TEMPLATE_RESPONSE and anything after the filter must not leak either.
+    """
+    import functions
+    from functions import ContentFiltered
+
+    lines = [
+        _sse_append_frame("planning notes about the topic", "THINK"),
+        "data: " + json.dumps({
+            "p": "response", "o": "BATCH",
+            "v": [
+                {"p": "ban_regenerate", "v": True},
+                {"p": "status", "v": "CONTENT_FILTER"},
+                {"p": "fragments", "v": [{
+                    "id": 3, "type": "TEMPLATE_RESPONSE",
+                    "content": "Sorry, that's beyond my current scope",
+                }]},
+            ],
+        }) + "\n",
+        _sse_append_frame("SHOULD_NOT_STREAM"),
+    ]
+
+    async def fake_post(path, *, headers, **kwargs):
+        return FakeStreamResp(lines)
+
+    async def fake_pow(target_path, auth_token):
+        return "pow-stub"
+
+    orig_post, orig_pow = functions.post_with_failover, functions.solve_create_pow
+    functions.post_with_failover = fake_post
+    functions.solve_create_pow = fake_pow
+    try:
+        async def scenario():
+            chunks = []
+            async for chunk in functions.send_message("chat-1", "tok", "prompt", 0):
+                chunks.append(chunk)
+            return chunks
+
+        try:
+            asyncio.run(scenario())
+        except ContentFiltered as e:
+            assert "CONTENT_FILTER" in str(e)
+            return
+        raise AssertionError("CONTENT_FILTER must raise before yielding the think prefix")
+    finally:
+        functions.post_with_failover = orig_post
+        functions.solve_create_pow = orig_pow
+
+
+def test_send_message_still_flushes_think_before_response():
+    """Holding the think prefix for the filter check must not drop it once a real answer starts."""
+    import functions
+
+    lines = [
+        _sse_append_frame("plan first", "THINK"),
+        _sse_append_frame("the answer"),
+        "data: " + json.dumps({"p": "response/status", "v": "FINISHED"}) + "\n",
+    ]
+
+    async def fake_post(path, *, headers, **kwargs):
+        return FakeStreamResp(lines)
+
+    async def fake_pow(target_path, auth_token):
+        return "pow-stub"
+
+    orig_post, orig_pow = functions.post_with_failover, functions.solve_create_pow
+    functions.post_with_failover = fake_post
+    functions.solve_create_pow = fake_pow
+    try:
+        async def scenario():
+            chunks = []
+            async for chunk in functions.send_message("chat-1", "tok", "prompt", 0):
+                chunks.append(chunk)
+            return "".join(chunks)
+
+        collected = asyncio.run(scenario())
+    finally:
+        functions.post_with_failover = orig_post
+        functions.solve_create_pow = orig_pow
+
+    assert "<think>" in collected and "plan first" in collected
+    assert "</think>" in collected and "the answer" in collected
+    assert collected.index("plan first") < collected.index("the answer")
+
+
+def test_handle_chat_skips_session_token_on_content_filter():
+    """The session's token content-filters: drop that session and complete on the next token."""
+    import app as app_module
+    from functions import ContentFiltered
+
+    async def scenario():
+        app_module._chat_locks.clear()
+        state = {"session": {"token_id": 1, "session_id": "chat-a", "parent_message_id": 2}}
+        seen = {"tokens": [], "exclude": None}
+
+        async def fake_sig(messages, model, scope=""):
+            return "sig-filter"
+
+        def fake_find(s):
+            return dict(state["session"]) if state["session"] else None
+
+        def fake_get_token(tid):
+            return {"id": tid, "token": f"tok-{tid}", "status": "ACTIVE", "alias": f"a{tid}"}
+
+        def fake_pick(exclude_ids=()):
+            seen["exclude"] = tuple(exclude_ids)
+            assert 1 in exclude_ids
+            return 2
+
+        def fake_delete(tid, sid):
+            state["session"] = None
+
+        def fake_send(chat_id, auth_token, message, parent, thinking=False, search=False, file_ids_=None):
+            seen["tokens"].append((auth_token, chat_id))
+            if auth_token == "tok-1":
+                async def boom():
+                    raise ContentFiltered("chat-a")
+                    yield ""  # noqa: makes this an async generator
+                return boom()
+
+            async def ok():
+                yield "from-token-2"
+            return ok()
+
+        async def fake_create(auth):
+            assert auth == "tok-2"
+            return "chat-b"
+
+        def fake_get_tokens():
+            return [{"id": 1}, {"id": 2}]
+
+        async def fake_files(messages, token, last_user_only=False):
+            return []
+
+        async def fake_prompt(messages, tools, model, is_first, rollover_summary=None):
+            return "prompt"
+
+        patches = [
+            ("get_auth_token", lambda: "tok"),
+            ("generate_signature", fake_sig),
+            ("find_session", fake_find),
+            ("get_token", fake_get_token),
+            ("pick_token", fake_pick),
+            ("get_tokens", fake_get_tokens),
+            ("send_message", fake_send),
+            ("create_new_chat", fake_create),
+            ("extract_and_upload_files", fake_files),
+            ("build_prompt", fake_prompt),
+            ("delete_sessions_for_chat", fake_delete),
+            ("save_session", lambda *a, **k: None),
+            ("mark_active", lambda tid: None),
+            ("mark_limited", lambda tid: (_ for _ in ()).throw(AssertionError("content filter must not rate-limit the token"))),
+            ("parse_tools", lambda t: ([], t)),
+            ("format_response", lambda text, model, messages, tools=None: text),
+        ]
+        saved = [(name, getattr(app_module, name)) for name, _ in patches]
+        for name, fn in patches:
+            setattr(app_module, name, fn)
+        try:
+            result = await app_module.handle_chat([{"role": "user", "content": "hi"}], "test-model")
+        finally:
+            for name, fn in saved:
+                setattr(app_module, name, fn)
+        return result, seen
+
+    try:
+        result, seen = asyncio.run(scenario())
+    finally:
+        import app as app_module
+        app_module._chat_locks.clear()
+
+    assert result == "from-token-2"
+    assert seen["tokens"] == [("tok-1", "chat-a"), ("tok-2", "chat-b")]
+    assert seen["exclude"] == (1,)
+
+
 def _main():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

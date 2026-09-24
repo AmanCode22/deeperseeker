@@ -34,6 +34,7 @@ security = HTTPBasic()
 
 
 from functions import (
+    ContentFiltered,
     CookieGenerationError,
     cookie_file_path,
     add_token,
@@ -493,7 +494,36 @@ def _save_turn_sync(sig, next_messages, model, scope, token_id, session_id, pare
     return next_sig
 
 
-async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, scope="", _retried=False):
+def _skip_with(skip_ids, token_id):
+    return tuple(dict.fromkeys((*skip_ids, token_id)))
+
+
+async def _retry_after_content_filter(e, token_id, skip_ids, messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, retried):
+    """Drop the token that just content-filtered and run the completion on the next one.
+
+    The token stays ACTIVE (other sessions may still use it). This request
+    walks the remaining pool, one token at a time, and stops when every token
+    has filtered or eight have been tried.
+    """
+    skipped = _skip_with(skip_ids, token_id)
+    tokens = await _db_call(get_tokens)
+    if len(skipped) < len(tokens) and len(skipped) < 8:
+        logger.warning(
+            "CONTENT_FILTER on token %s; retrying on the next token (%d/%d skipped)",
+            token_id, len(skipped), len(tokens),
+        )
+        return await handle_chat(
+            messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope,
+            _retried=retried, _skip_token_ids=skipped,
+        )
+    logger.warning(
+        "CONTENT_FILTER on token %s; no further token to try (%d skipped)",
+        token_id, len(skipped),
+    )
+    return _api_error_response(e, is_anthropic)
+
+
+async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, scope="", _retried=False, _skip_token_ids=()):
     auth_token = await _db_call(get_auth_token)
     if not auth_token:
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
@@ -507,14 +537,20 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     sess = await _db_call(find_session, sig)
     rollover_summary = None
 
+    # A token already skipped for CONTENT_FILTER on this request must not be
+    # reused just because the signature row is still there.
+    if sess and sess["token_id"] in _skip_token_ids:
+        await _db_call(delete_sessions_for_chat, sess["token_id"], sess["session_id"])
+        sess = None
+
     if sess:
 
         token_id = sess["token_id"]
         session_id = sess["session_id"]
         parent_message_id = sess["parent_message_id"]
         tok = await _db_call(get_token, token_id)
-        if not tok or tok["status"] == "RATE_LIMITED":
-            new_token_id = await _db_call(pick_token)
+        if not tok or tok["status"] == "RATE_LIMITED" or tok.get("id") in _skip_token_ids:
+            new_token_id = await _db_call(pick_token, _skip_token_ids) if _skip_token_ids else await _db_call(pick_token)
             if new_token_id and (not tok or new_token_id != token_id):
                 new_tok = await _db_call(get_token, new_token_id)
                 if new_tok:
@@ -542,9 +578,14 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         if rot_owner is not None:
                             rot_owner.release()
                         logger.exception("Token-rotation recovery failed (chat %s): %s", session_id, e)
+                        if isinstance(e, ContentFiltered):
+                            return await _retry_after_content_filter(
+                                e, new_token_id, _skip_token_ids, messages, model, thinking, search, stream,
+                                tools, is_anthropic, req_model, scope, _retried,
+                            )
                         if _retried:
                             return _api_error_response(e, is_anthropic)
-                        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
+                        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True, _skip_token_ids=_skip_token_ids)
                     if stream:
                         gen = _release_chat_lock_stream(gen, rot_owner)
                         if is_anthropic:
@@ -557,9 +598,14 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                             logger.exception("Upstream failed during token-rotation request: %s", e)
                             if rot_owner is not None:
                                 rot_owner.release()
+                            if isinstance(e, ContentFiltered):
+                                return await _retry_after_content_filter(
+                                    e, new_token_id, _skip_token_ids, messages, model, thinking, search, stream,
+                                    tools, is_anthropic, req_model, scope, _retried,
+                                )
                             if _retried:
                                 return _api_error_response(e, is_anthropic)
-                            return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
+                            return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True, _skip_token_ids=_skip_token_ids)
                         await _db_call(mark_active, new_token_id)
 
                         parsed_tools, clean_text = _clean_text(resp_text)
@@ -578,7 +624,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         async with create_lock:
             sess = await _db_call(find_session, sig)
             if not sess:
-                token_id = await _db_call(pick_token)
+                token_id = await _db_call(pick_token, _skip_token_ids) if _skip_token_ids else await _db_call(pick_token)
                 if not token_id:
                     return JSONResponse({"error": "No tokens available"}, status_code=503)
                 tok = await _db_call(get_token, token_id)
@@ -673,6 +719,14 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         if code in (401, 403, 429):
             await _db_call(mark_limited, token_id)
         await _db_call(delete_sessions_for_chat, token_id, session_id)
+        if isinstance(e, ContentFiltered):
+            # Same deadlock rule as the rate-limit retry below: release this
+            # chat's lock before the recursive call re-resolves a session.
+            lock_owner.release()
+            return await _retry_after_content_filter(
+                e, token_id, _skip_token_ids, messages, model, thinking, search, stream,
+                tools, is_anthropic, req_model, scope, _retried,
+            )
         if _retried:
             return _api_error_response(e, is_anthropic)
         if code not in (401, 403, 429) and parent_message_id == 0:
@@ -687,7 +741,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         # a no-op, the retry re-acquires cleanly, and queued same-chat requests
         # are no longer starved for the entire retry either.
         lock_owner.release()
-        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
+        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True, _skip_token_ids=_skip_token_ids)
     finally:
         if not lock_transferred:
             lock_owner.release()
@@ -817,7 +871,13 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         failed = True
         m = re.match(r"HTTP (\d{3}):", str(e))
         code = int(m.group(1)) if m else None
-        if code in (401, 403, 429):
+        if isinstance(e, ContentFiltered):
+            # Filter arrived after visible content was already flushed. The
+            # HTTP response is committed, so this turn cannot swap tokens;
+            # drop the session so the next request does not resume it.
+            logger.warning("CONTENT_FILTER after stream start on token %s; dropping session %s", token_id, session_id)
+            await _db_call(delete_sessions_for_chat, token_id, session_id)
+        elif code in (401, 403, 429):
             await _db_call(mark_limited, token_id)
         logger.exception("stream_response failed")
         try:
@@ -948,7 +1008,10 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         failed = True
         m = re.match(r"HTTP (\d{3}):", str(e))
         code = int(m.group(1)) if m else None
-        if code in (401, 403, 429):
+        if isinstance(e, ContentFiltered):
+            logger.warning("CONTENT_FILTER after stream start on token %s; dropping session %s", token_id, session_id)
+            await _db_call(delete_sessions_for_chat, token_id, session_id)
+        elif code in (401, 403, 429):
             await _db_call(mark_limited, token_id)
         logger.exception("stream_anthropic_response failed")
         try:

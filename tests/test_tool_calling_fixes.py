@@ -18,7 +18,13 @@ def test_reject_pseudo_tool_names():
     assert normalize_tool_call("invoke", {}) is None
     assert normalize_tool_call("function_call", {}) is None
     assert normalize_tool_call({"name": "tool_call", "arguments": {}}) is None
-    assert normalize_tool_call({"name": "tool_call", "arguments": {"command": "ls"}}) is None
+    # A wrapper name plus a real payload (command/code/path) is recoverable —
+    # live hermes sessions were dropping these as "pseudo" and then failing
+    # terminal/execute_code with missing arguments.
+    inferred = normalize_tool_call({"name": "tool_call", "arguments": {"command": "ls"}})
+    assert inferred is not None
+    assert inferred["function"]["name"] == "terminal"
+    assert json.loads(inferred["function"]["arguments"])["command"] == "ls"
 
 
 def test_unwrap_valid_nested_tool_call():
@@ -346,17 +352,10 @@ def test_batch_calls_unwrapping_in_tags_and_dict():
     assert json.loads(norm["function"]["arguments"]) == {"command": "git status"}
 
 
-def test_bare_parameter_tag_without_invoke_wrapper_is_unattributable():
-    """A <parameter name=...> block with no enclosing invoke/tool_call opener
-    carries no tool name anywhere in the text, so there is nothing to dispatch
-    to — parse_tools correctly returns no tools rather than guessing, and the
-    raw markup (stripped of the parameter tag itself) falls through as plain
-    text. This is the exact shape reported from a live hermes-agent session
-    where a tool call's opening wrapper was lost before reaching the bridge
-    ("terminal output failure" pushing raw markup into chat) — captured here
-    so a real fix (if the wrapper turns out to be recoverable) has a concrete
-    regression case, and so _clean_text's leaked-markup warning (app.py) has
-    a known trigger to log against."""
+def test_bare_parameter_tag_without_invoke_wrapper_is_inferred():
+    """A <parameter name="code"> block with no enclosing invoke/tool_call opener
+    is the exact shape from live hermes sessions where DeepSeek dropped the
+    wrapper. Infer execute_code rather than leaking DSML markup into chat."""
     text = (
         '<｜｜DSML｜｜ parameter name="code">\n'
         'import json\n'
@@ -364,14 +363,15 @@ def test_bare_parameter_tag_without_invoke_wrapper_is_unattributable():
         '</｜｜DSML｜｜ parameter>'
     )
     tools, clean = parse_tools(text)
-    assert tools == []
-    assert "print" in clean
+    assert len(tools) == 1
+    assert tools[0]["function"]["name"] == "execute_code"
+    args = json.loads(tools[0]["function"]["arguments"])
+    assert "print" in args["code"]
+    assert "DSML" not in args["code"]
+    assert "parameter" not in clean.lower()
 
     import app
-    from functions import _SUSPECT_LEAKED_TOOL_MARKUP_RE
-
-    assert _SUSPECT_LEAKED_TOOL_MARKUP_RE.search(text)
     parsed_tools, clean_text = app._clean_text(text)
-    assert parsed_tools == []
-    assert "print" in clean_text
+    assert len(parsed_tools) == 1
+    assert parsed_tools[0]["function"]["name"] == "execute_code"
 

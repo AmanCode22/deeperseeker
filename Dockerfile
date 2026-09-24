@@ -2,9 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt update && apt install curl -y
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

@@ -313,6 +313,50 @@ class CookieGenerationError(Exception):
     """Raised when the DeepSeek WAF cookie file cannot be produced."""
 
 
+class ContentFiltered(Exception):
+    """Upstream ended this completion with status CONTENT_FILTER.
+
+    Raised before any chunk is yielded when the filter cuts off the thinking
+    prefix, so the caller can drop this session and retry on another token.
+    The token itself stays ACTIVE — the filter is about this prompt, not a
+    dead account.
+    """
+
+    def __init__(self, chat_id=None):
+        self.chat_id = chat_id
+        super().__init__("HTTP 502: DeepSeek CONTENT_FILTER; session token skipped")
+
+
+def _frame_is_content_filter(data):
+    """True for the BATCH/status frame DeepSeek sends instead of a completion.
+
+    Live shape (logged as an unhandled frame before this check existed):
+    {"p":"response","o":"BATCH","v":[{"p":"status","v":"CONTENT_FILTER"},
+    {"p":"fragments","v":[{"type":"TEMPLATE_RESPONSE","content":"Sorry, ..."}]}]}
+    """
+    if not isinstance(data, dict):
+        return False
+
+    def _status(value):
+        return isinstance(value, str) and value == "CONTENT_FILTER"
+
+    if _status(data.get("v")) and data.get("p") in ("status", "response/status"):
+        return True
+
+    ops = data.get("v") if data.get("o") == "BATCH" and isinstance(data.get("v"), list) else None
+    if ops:
+        for op in ops:
+            if isinstance(op, dict) and op.get("p") in ("status", "response/status") and _status(op.get("v")):
+                return True
+
+    v = data.get("v")
+    if isinstance(v, dict):
+        resp = v.get("response") if isinstance(v.get("response"), dict) else v
+        if isinstance(resp, dict) and _status(resp.get("status")):
+            return True
+    return False
+
+
 def _read_cookie_file():
     """Return valid (unexpired) cookies, or None."""
     try:
@@ -473,15 +517,32 @@ def delete_token(token_id):
     conn.close()
 
 
-def pick_token():
+def pick_token(exclude_ids=()):
+    """Pick an ACTIVE token, optionally skipping ids that just content-filtered.
+
+    With no exclusions the historical fallback remains: when nothing is ACTIVE,
+    return the lowest id (a RATE_LIMITED token is still better than no token).
+    Exclusions are not included in that fallback — a token skipped for
+    CONTENT_FILTER must not be immediately reused for the same request.
+    """
+    exclude = tuple(i for i in (exclude_ids or ()) if i is not None)
     conn = get_db()
-    row = conn.execute("SELECT id FROM tokens WHERE status = 'ACTIVE' ORDER BY RANDOM() LIMIT 1").fetchone()
-    if row:
+    try:
+        if exclude:
+            placeholders = ",".join("?" * len(exclude))
+            row = conn.execute(
+                f"SELECT id FROM tokens WHERE status = 'ACTIVE' AND id NOT IN ({placeholders}) "
+                "ORDER BY id LIMIT 1",
+                exclude,
+            ).fetchone()
+            return row[0] if row else None
+        row = conn.execute("SELECT id FROM tokens WHERE status = 'ACTIVE' ORDER BY RANDOM() LIMIT 1").fetchone()
+        if row:
+            return row[0]
+        row = conn.execute("SELECT id FROM tokens ORDER BY id LIMIT 1").fetchone()
+        return row[0] if row else None
+    finally:
         conn.close()
-        return row[0]
-    row = conn.execute("SELECT id FROM tokens ORDER BY id LIMIT 1").fetchone()
-    conn.close()
-    return row[0] if row else None
 
 
 def mark_limited(token_id):
@@ -612,9 +673,114 @@ _ENVELOPE_KEYS = frozenset({
     "tool_input", "action_input",
 })
 
+_ARG_ENVELOPE_KEYS = (
+    "arguments", "parameters", "input", "args", "params",
+    "tool_input", "action_input",
+)
+
 _PSEUDO_TOOL_NAMES = frozenset({
     "tool_call", "invoke", "function_call", "tool_calls", "calls", "function", "tool", "action"
 })
+
+# Live DeepSeek/DSML markup only — MUST NOT match arbitrary XML/HTML such as
+# <div> in write_file content or print("<div>") in execute_code. The previous
+# pattern treated DSML as optional and then consumed [^>]*>, which stripped
+# every tag out of tool arguments (hermes then saw empty/garbled payloads).
+_DSML_TAG_RE = re.compile(
+    r"</?[｜\|]{0,2}\s*DSML[｜\|]{0,2}[^>]*>",
+    re.IGNORECASE,
+)
+_TOOL_XML_TAG_RE = re.compile(
+    r"</?\s*(?:tool_calls?|calls|invoke|function_call|parameter|param)\b[^>]*>",
+    re.IGNORECASE,
+)
+_SPECIAL_TOKEN_RE = re.compile(r"<[｜\|]{1,2}[^<>]{0,80}[｜\|]{1,2}>")
+
+
+def _strip_dsml_and_tool_markup(s):
+    """Remove DSML / tool-call XML / special tokens from a string argument.
+
+    Leaves ordinary HTML/XML and code containing angle brackets intact.
+    """
+    if not isinstance(s, str) or not s:
+        return s
+    s = _DSML_TAG_RE.sub("", s)
+    s = _TOOL_XML_TAG_RE.sub("", s)
+    s = _SPECIAL_TOKEN_RE.sub("", s)
+    return s
+
+
+def _empty_payload(v):
+    return v is None or v == "" or v == {} or v == []
+
+
+def _maybe_json(v):
+    if isinstance(v, str):
+        s = v.strip()
+        if s.startswith("{") or s.startswith("["):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, (dict, list)):
+                    return parsed
+            except Exception:
+                pass
+    return v
+
+
+def _merge_envelope_payload(args, depth=0):
+    """Collapse {"arguments": {"code": "..."}, "name": "execute_code", "code": ""}
+    into {"code": "..."}. Live DeepSeek often emits the real payload one level
+    down AND an empty canonical key, which made the old unwrap bail out and
+    hermes report "No code provided" / missing path/content/command.
+    """
+    if depth > 4 or not isinstance(args, dict):
+        return args
+    args = dict(args)
+    for ek in _ARG_ENVELOPE_KEYS:
+        if ek in args:
+            args[ek] = _maybe_json(args[ek])
+    inner = None
+    inner_key = None
+    for ek in _ARG_ENVELOPE_KEYS:
+        val = args.get(ek)
+        if isinstance(val, dict):
+            inner_key, inner = ek, _merge_envelope_payload(val, depth + 1)
+            break
+        if isinstance(val, list) and len(val) == 1 and isinstance(val[0], dict):
+            inner_key, inner = ek, _merge_envelope_payload(val[0], depth + 1)
+            break
+    if inner is None:
+        return args
+    merged = {k: v for k, v in args.items() if k != inner_key}
+    for k, v in inner.items():
+        if k in _ARG_ENVELOPE_KEYS:
+            continue
+        if k not in merged or _empty_payload(merged.get(k)):
+            merged[k] = v
+    return merged
+
+
+def _infer_tool_from_params(args):
+    """Best-effort tool name when the model emitted <parameter> tags without
+    an enclosing invoke/tool_call opener (common DSML truncation)."""
+    if not isinstance(args, dict) or not args:
+        return None
+    keys = {k.lower() for k, v in args.items() if not _empty_payload(v)}
+    if "code" in keys:
+        return "execute_code"
+    if "command" in keys or "cmd" in keys:
+        return "terminal"
+    if "old_string" in keys or "new_string" in keys:
+        return "patch"
+    if "skill" in keys or "skill_name" in keys:
+        return "skill_view"
+    if "path" in keys or "file_path" in keys or "filepath" in keys:
+        if "content" in keys or "file_content" in keys:
+            return "write_file"
+        return "read_file"
+    if "query" in keys:
+        return "web_search"
+    return None
 
 
 def normalize_tool_call(tool_data_or_name, args_if_name=None):
@@ -697,33 +863,48 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
                 break
         name, args = inner_name.strip(), inner_args
 
+    args = _maybe_json(args)
+    if isinstance(args, dict):
+        args = _merge_envelope_payload(args)
+        # If the wrapper still has no real name, take it from the collapsed payload.
+        if (not name or (isinstance(name, str) and name.strip().lower() in _PSEUDO_TOOL_NAMES)) and isinstance(args.get("name"), str):
+            maybe = args["name"].strip()
+            if maybe and maybe.lower() not in _PSEUDO_TOOL_NAMES:
+                name = maybe
+
     if not name or not isinstance(name, str):
-        return None
+        inferred = _infer_tool_from_params(args) if isinstance(args, dict) else None
+        if inferred:
+            name = inferred
+        else:
+            return None
     cleaned_name = name.strip()
     if cleaned_name.lower() in _PSEUDO_TOOL_NAMES:
-        return None
+        inferred = _infer_tool_from_params(args) if isinstance(args, dict) else None
+        if inferred:
+            cleaned_name = inferred
+        else:
+            return None
 
-    _DSML_STRIP_RE = re.compile(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?[^>]*>", re.IGNORECASE)
-    _SPECIAL_TOKEN_STRIP_RE = re.compile(r"<[｜\|]{1,2}[^>]+[｜\|]{1,2}>", re.IGNORECASE)
-    _GENERIC_CLOSER_STRIP_RE = re.compile(r"</?(?:tool_calls?|calls|invoke|function_call|parameter|param)\b[^>]*>", re.IGNORECASE)
-    _EOF_CLOSER_RE = re.compile(
-        r"\s*(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?[^>]*>|<[｜\|]{1,2}[^>]+[｜\|]{1,2}>|</?(?:tool_calls?|calls|invoke|function_call|parameter|param)\b[^>]*>)+\s*$",
-        re.IGNORECASE,
-    )
+    if isinstance(args, dict):
+        # Drop a redundant echo of the tool's own name so hermes schemas that
+        # reject unknown fields (execute_code, terminal, write_file) don't fail
+        # after a successful unwrap.
+        echoed = args.get("name")
+        if isinstance(echoed, str) and echoed.strip().lower() in {cleaned_name.lower()} | _PSEUDO_TOOL_NAMES:
+            if "skill" not in cleaned_name.lower():
+                args.pop("name", None)
 
     if isinstance(args, dict):
         # 1. Clean string arguments of DSML markers, leaked closing tags, and trailing tokens
         for k, v in list(args.items()):
             if isinstance(v, str):
-                v_clean = _DSML_STRIP_RE.sub("", v)
-                v_clean = _SPECIAL_TOKEN_STRIP_RE.sub("", v_clean)
+                v_clean = _strip_dsml_and_tool_markup(v)
                 k_lower = k.lower()
                 if k_lower in ("path", "file_path", "filename", "filepath", "url", "dir", "cwd"):
-                    v_clean = _GENERIC_CLOSER_STRIP_RE.sub("", v_clean).strip().strip("\"'`")
+                    v_clean = v_clean.strip().strip("\"'`")
                 elif k_lower in ("command", "cmd", "query", "skill", "name"):
-                    v_clean = _GENERIC_CLOSER_STRIP_RE.sub("", v_clean).strip()
-                else:
-                    v_clean = _EOF_CLOSER_RE.sub("", v_clean)
+                    v_clean = v_clean.strip()
                 args[k] = v_clean
 
         tool_lower = cleaned_name.lower()
@@ -793,7 +974,7 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
         })
         for k, v in list(args.items()):
             if k in _NUMERIC_ARGS and isinstance(v, str):
-                cleaned_num = _DSML_STRIP_RE.sub("", v).strip()
+                cleaned_num = _strip_dsml_and_tool_markup(v).strip()
                 try:
                     if "." in cleaned_num:
                         args[k] = float(cleaned_num)
@@ -859,8 +1040,8 @@ _ORPHAN_CLOSER_RE = re.compile(
     re.IGNORECASE,
 )
 
-_DSML_STRIP_GLOBAL_RE = re.compile(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?[^>]*>", re.IGNORECASE)
-_SPECIAL_TOKEN_STRIP_GLOBAL_RE = re.compile(r"<[｜\|]{1,2}[^>]+[｜\|]{1,2}>", re.IGNORECASE)
+_DSML_STRIP_GLOBAL_RE = _DSML_TAG_RE
+_SPECIAL_TOKEN_STRIP_GLOBAL_RE = _SPECIAL_TOKEN_RE
 
 
 def parse_tools(text):
@@ -871,7 +1052,7 @@ def parse_tools(text):
     def fenced(pos):
         return any(s <= pos < e for s, e in fence_spans)
 
-    param_names = {"command", "description", "file_path", "content", "path", "prompt", "query", "subject", "old_string", "new_string", "url", "input"}
+    param_names = {"command", "cmd", "code", "description", "file_path", "content", "path", "prompt", "query", "subject", "old_string", "new_string", "url", "input", "skill"}
     tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_call|invoke|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
     real_tool_matches = [tm for tm in tool_matches if not fenced(tm.start())]
 
@@ -905,10 +1086,7 @@ def parse_tools(text):
             p_matches = re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)", body, flags=re.DOTALL | re.IGNORECASE)
             for pm in p_matches:
                 p_name = pm.group(1).strip()
-                p_val = pm.group(2).strip()
-                p_val = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>", "", p_val, flags=re.IGNORECASE).strip()
-                p_val = _DSML_STRIP_GLOBAL_RE.sub("", p_val).strip()
-                p_val = _SPECIAL_TOKEN_STRIP_GLOBAL_RE.sub("", p_val).strip()
+                p_val = _strip_dsml_and_tool_markup(pm.group(2).strip()).strip()
                 try:
                     args[p_name] = json.loads(p_val)
                 except Exception:
@@ -917,10 +1095,7 @@ def parse_tools(text):
             for pm in tag_param_matches:
                 t_name = pm.group(1).strip().lower()
                 if t_name in param_names:
-                    t_val = pm.group(2).strip()
-                    t_val = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>", "", t_val, flags=re.IGNORECASE).strip()
-                    t_val = _DSML_STRIP_GLOBAL_RE.sub("", t_val).strip()
-                    t_val = _SPECIAL_TOKEN_STRIP_GLOBAL_RE.sub("", t_val).strip()
+                    t_val = _strip_dsml_and_tool_markup(pm.group(2).strip()).strip()
                     try:
                         args[t_name] = json.loads(t_val)
                     except Exception:
@@ -1151,10 +1326,38 @@ def parse_tools(text):
                 pass
         if tools:
             clean_text = re.sub(json_pattern, "", clean_text, flags=re.DOTALL).strip()
+    if not tools:
+        # Recover <parameter name="code">...</parameter> (and DSML-decorated
+        # variants) that arrived without an enclosing invoke/tool_call opener.
+        # Previously this leaked raw markup into chat and hermes never ran the tool.
+        orphan_args = {}
+        orphan_re = re.compile(
+            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|param)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|param)>|$)",
+            re.DOTALL | re.IGNORECASE,
+        )
+        for pm in orphan_re.finditer(text):
+            if fenced(pm.start()):
+                continue
+            p_name = pm.group(1).strip()
+            p_val = _strip_dsml_and_tool_markup(pm.group(2).strip()).strip()
+            if not p_name:
+                continue
+            try:
+                orphan_args[p_name] = json.loads(p_val)
+            except Exception:
+                orphan_args[p_name] = p_val
+        inferred = _infer_tool_from_params(orphan_args)
+        if inferred:
+            norm = normalize_tool_call(inferred, orphan_args)
+            if norm:
+                tools.append(norm)
+                clean_text = orphan_re.sub("", clean_text).strip()
+
     # Keep companion text: the tool-call blocks themselves were already removed
-    # from clean_text above; only leftover bare tags are stripped here.
-    clean_text = re.sub(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter|param)?[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
-    clean_text = _SPECIAL_TOKEN_STRIP_GLOBAL_RE.sub("", clean_text).strip()
+    # from clean_text above; only leftover DSML/tool markup tags are stripped.
+    # Do not strip arbitrary HTML — that used to mangle assistant text and
+    # tool argument previews.
+    clean_text = _strip_dsml_and_tool_markup(clean_text).strip()
     if tools:
         logger.info(
             "parse_tools: parsed %d tool(s): %s",
@@ -1170,12 +1373,12 @@ def parse_tools(text):
 # substring start tags; this regex accepts bars, the DSML marker and the
 # space in any combination.
 _STREAM_ENTRY_RE = re.compile(
-    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_call|invoke)\b[^>]*>",
+    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_call|invoke|parameter|param)\b[^>]*>",
     re.IGNORECASE,
 )
 
 # Tag names _STREAM_ENTRY_RE can open on.
-_STREAM_ENTRY_TAGS = ("tool_calls", "tool_call", "function_call", "invoke", "calls")
+_STREAM_ENTRY_TAGS = ("tool_calls", "tool_call", "function_call", "invoke", "calls", "parameter", "param")
 
 # A fragment that LOOKS like part of a tool call but parse_tools()/StreamToolParser
 # could not attribute to any tool (most commonly a bare <parameter name=...> with
@@ -1371,12 +1574,7 @@ class StreamToolParser:
                 for item in parsed:
                     out.append({"tool": item})
             elif not self.json_done:
-                stripped = re.sub(
-                    r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter)[^>]*>",
-                    "",
-                    self.buffer,
-                    flags=re.IGNORECASE,
-                ).strip()
+                stripped = _strip_dsml_and_tool_markup(self.buffer).strip()
                 if stripped:
                     out.append({"text": stripped})
             # With json_done set, whatever is left after the consumed JSON
@@ -1550,6 +1748,38 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
             _repeat_last[0] = content
             _repeat_count[0] = 1
         return _repeat_count[0] >= _REPEAT_THRESHOLD
+
+    # Hold the think prefix until the first visible fragment or a normal
+    # finish. CONTENT_FILTER is sent after that prefix and before any
+    # RESPONSE; yielding <think> early commits the HTTP stream, and the
+    # caller can no longer swap tokens. Nothing is yielded until _release().
+    _held = []
+    _released = False
+
+    def _push(text):
+        if not text:
+            return []
+        if _released:
+            return [text]
+        _held.append(text)
+        return []
+
+    def _release():
+        nonlocal _released
+        _released = True
+        out = list(_held)
+        _held.clear()
+        return out
+
+    def _finish_stream():
+        nonlocal think_open
+        parts = []
+        if think_open:
+            think_open = False
+            parts.extend(_push("\n</think>\n\n"))
+        parts.extend(_release())
+        return parts
+
     resp = await post_with_failover(
         "/api/v0/chat/completion",
         headers=headers, json=json_data,
@@ -1591,20 +1821,29 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                 if "frequent" in _msg or "rate_limit" in str(_err_reason):
                     raise Exception(f"HTTP 429: DeepSeek rate limited ({_msg})")
                 raise Exception(f"Upstream error: {_msg}")
+            if _frame_is_content_filter(data):
+                # Drop the held think prefix. The caller retries this
+                # completion on the next token; the client must not see the
+                # truncated plan or the canned TEMPLATE_RESPONSE.
+                logger.warning(
+                    "DeepSeek CONTENT_FILTER for chat %s; skipping this session token",
+                    chat_id,
+                )
+                raise ContentFiltered(chat_id)
             __got_before = got_output
             if data.get("p") == "response/status" and data.get("v") == "FINISHED":
-                if think_open:
-                    yield "\n</think>\n\n"
                 if not got_output:
                     raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
+                for part in _finish_stream():
+                    yield part
                 return
             if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
                 for op in data["v"]:
                     if isinstance(op, dict) and op.get("p") == "quasi_status" and op.get("v") == "FINISHED":
-                        if think_open:
-                            yield "\n</think>\n\n"
                         if not got_output:
                             raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
+                        for part in _finish_stream():
+                            yield part
                         return
             if "v" in data and isinstance(data["v"], dict) and "response" in data["v"]:
                 fragments = data["v"]["response"].get("fragments")
@@ -1617,28 +1856,32 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                                     "DeepSeek repetition loop detected for chat %s (THINK fragment "
                                     "repeated %d+ times); closing the stream early", chat_id, _REPEAT_THRESHOLD,
                                 )
-                                if think_open:
-                                    yield "\n</think>\n\n"
+                                for part in _finish_stream():
+                                    yield part
                                 return
                             if not think_open:
-                                yield "<think>\n"
                                 think_open = True
+                                _push("<think>\n")
                             got_output = True
-                            yield content
+                            for part in _push(content):
+                                yield part
                         else:
                             if _is_repeat_loop(content):
                                 logger.warning(
                                     "DeepSeek repetition loop detected for chat %s (fragment repeated "
                                     "%d+ times); closing the stream early", chat_id, _REPEAT_THRESHOLD,
                                 )
-                                if think_open:
-                                    yield "\n</think>\n\n"
+                                for part in _finish_stream():
+                                    yield part
                                 return
                             if think_open:
-                                yield "\n</think>\n\n"
                                 think_open = False
+                                _push("\n</think>\n\n")
                             got_output = True
-                            yield content
+                            for part in _release():
+                                yield part
+                            if content:
+                                yield content
                 continue
 
             if data.get("p") == "response/fragments" and data.get("o") == "APPEND":
@@ -1651,24 +1894,31 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                                 "DeepSeek repetition loop detected for chat %s (fragment repeated "
                                 "%d+ times); closing the stream early", chat_id, _REPEAT_THRESHOLD,
                             )
-                            if think_open:
-                                yield "\n</think>\n\n"
+                            for part in _finish_stream():
+                                yield part
                             return
                         if fragment.get("type") == "RESPONSE":
                             if think_open:
-                                yield "\n</think>\n\n"
                                 think_open = False
+                                _push("\n</think>\n\n")
                             got_output = True
-                            yield content
+                            for part in _release():
+                                yield part
+                            if content:
+                                yield content
                         elif fragment.get("type") == "THINK":
                             if not think_open:
-                                yield "<think>\n"
                                 think_open = True
+                                _push("<think>\n")
                             got_output = True
-                            yield content
+                            for part in _push(content):
+                                yield part
                         else:
                             got_output = True
-                            yield content
+                            for part in _release():
+                                yield part
+                            if content:
+                                yield content
                 continue
 
             v = data.get("v")
@@ -1678,11 +1928,16 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                         "DeepSeek repetition loop detected for chat %s (raw frame repeated %d+ "
                         "times); closing the stream early", chat_id, _REPEAT_THRESHOLD,
                     )
-                    if think_open:
-                        yield "\n</think>\n\n"
+                    for part in _finish_stream():
+                        yield part
                     return
                 got_output = True
-                yield v
+                if think_open and not _released:
+                    _push(v)
+                else:
+                    for part in _release():
+                        yield part
+                    yield v
                 continue
             if got_output == __got_before:
                 # Reaching here means this frame matched no branch above and
@@ -1695,10 +1950,10 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                         _unhandled[0], chat_id, data.get("o"), data.get("p"),
                         decoded_line[6:250],
                     )
-        if think_open:
-            yield "\n</think>\n\n"
         if not got_output:
             raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
+        for part in _finish_stream():
+            yield part
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):
