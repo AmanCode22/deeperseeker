@@ -1,6 +1,3 @@
-# Important Note
-I am busy with exams so new PR and Issues might be slow to resolve or merge (but i would merge them or resolve the issue as I get time in between) so expect some inconvenience.
-
 # DeeperSeeker
 
 DeepSeek website reverse-proxy server with FastAPI, supporting OpenAI & Anthropic API standards.
