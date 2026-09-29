@@ -584,7 +584,7 @@ def parse_tools(text):
         return any(s <= pos < e for s, e in fence_spans)
 
     param_names = {"command", "description", "file_path", "content", "path", "prompt", "query", "subject", "old_string", "new_string", "url", "input"}
-    tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_call|invoke|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
+    tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|invoke|function_calls?)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
     real_tool_matches = [tm for tm in tool_matches if not fenced(tm.start())]
 
     if real_tool_matches:
@@ -764,7 +764,7 @@ def parse_tools(text):
             clean_text = re.sub(json_pattern, "", clean_text, flags=re.DOTALL).strip()
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
-    clean_text = re.sub(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+    clean_text = _strip_wrapper_tags(clean_text).strip()
     return tools, clean_text
 
 
@@ -773,7 +773,7 @@ def parse_tools(text):
 # StreamToolParser so a mismatched closer closes the open block instead of
 # hanging until flush(). [FIX 3]
 _TOOL_END_TAG_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call)\s*>",
+    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_calls?)\s*>",
     re.IGNORECASE,
 )
 
@@ -783,19 +783,68 @@ _TOOL_END_TAG_RE = re.compile(
 # substring start tags; this regex accepts bars, the DSML marker and the
 # space in any combination.
 _STREAM_ENTRY_RE = re.compile(
-    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_call|invoke)\b[^>]*>",
+    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
     re.IGNORECASE,
 )
 
 # Orphan closers trailing a block already closed by the per-tag or family
 # fallback (e.g. "</｜｜DSML｜｜ calls>" after the inner invoke was flushed).
 _ORPHAN_CLOSER_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_call|invoke)\s*[｜\|]{0,2}>",
+    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_calls?|invoke)\s*[｜\|]{0,2}>",
     re.IGNORECASE,
 )
 
+# [FIX 5] Bare DSML marker: a "<｜｜DSML｜｜>" / "</｜｜DSML｜｜>" whose tag-name
+# slot is empty (nothing between the DSML marker and ">"). Every other cleanup
+# regex in this module requires an actual tag name (tool_calls/calls/invoke/
+# function_call/parameter), so these bare markers used to slip through and get
+# streamed to the client as literal text. Note the tag-name slot is required to
+# be EMPTY: "<｜｜DSML｜｜ invoke ...>" does not match and is left for the entry
+# regex.
+_BARE_DSML_MARKER_RE = re.compile(
+    r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*>",
+    re.IGNORECASE,
+)
+
+
+# Full wrapper-tag family (open or close, with an optional tag name). Used on
+# the non-streaming path and on flush() to strip wrapper noise; unlike
+# _ORPHAN_CLOSER_RE it also removes stray OPEN tags.
+_WRAPPER_TAG_RE = re.compile(
+    r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_calls?|invoke|parameter)[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def _strip_stray_markers(text: str) -> str:
+    """Prose path: drop bare DSML markers + orphan closers only.
+
+    Open tags are left untouched here so literal prose mentioning e.g.
+    "" is not silently deleted mid-stream.
+    """
+    if not text:
+        return text
+    text = _BARE_DSML_MARKER_RE.sub("", text)
+    return _ORPHAN_CLOSER_RE.sub("", text)
+
+
+def _strip_wrapper_tags(text: str) -> str:
+    """Wrapper path: drop the whole tag family (open or close) + bare markers."""
+    if not text:
+        return text
+    text = _BARE_DSML_MARKER_RE.sub("", text)
+    return _WRAPPER_TAG_RE.sub("", text)
+
+
+def _append_clean_text(results, text: str) -> None:
+    """Append cleaned prose, skipping empty deltas after marker stripping."""
+    cleaned = _strip_stray_markers(text)
+    if cleaned:
+        results.append({"text": cleaned})
+
+
 # Tag names _STREAM_ENTRY_RE can open on.
-_STREAM_ENTRY_TAGS = ("tool_calls", "tool_call", "function_call", "invoke", "calls")
+_STREAM_ENTRY_TAGS = ("tool_calls", "tool_call", "function_calls", "function_call", "invoke", "calls")
 
 def _skip_bars(text, pos):
     for _ in range(2):
@@ -892,7 +941,7 @@ class StreamToolParser:
                 if m:
                     start = m.start()
                     if start > 0:
-                        results.append({"text": _ORPHAN_CLOSER_RE.sub("", self.buffer[:start])})
+                        _append_clean_text(results, self.buffer[:start])
                     self.buffer = self.buffer[start:]
                     tag_name = m.group(1).lower()
                     self._end_re = re.compile(
@@ -913,11 +962,11 @@ class StreamToolParser:
                 )
                 if last_lt != -1 and hold:
                     if last_lt > 0:
-                        results.append({"text": _ORPHAN_CLOSER_RE.sub("", self.buffer[:last_lt])})
+                        _append_clean_text(results, self.buffer[:last_lt])
                     self.buffer = tail
                     break
                 if self.buffer:
-                    results.append({"text": _ORPHAN_CLOSER_RE.sub("", self.buffer)})
+                    _append_clean_text(results, self.buffer)
                 self.buffer = ""
                 break
         return results
@@ -925,7 +974,7 @@ class StreamToolParser:
     def flush(self):
         out = []
         if self.buffer and not self.in_tool:
-            out.append({"text": self.buffer})
+            _append_clean_text(out, self.buffer)
         elif self.in_tool:
             # [FIX 1] Recover the tool before stripping: if the stream was cut
             # off before the closing tag arrived but the payload itself is
@@ -936,12 +985,7 @@ class StreamToolParser:
                 for item in parsed:
                     out.append({"tool": item})
             elif not self.json_done:
-                stripped = re.sub(
-                    r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter)[^>]*>",
-                    "",
-                    self.buffer,
-                    flags=re.IGNORECASE,
-                ).strip()
+                stripped = _strip_wrapper_tags(self.buffer).strip()
                 if stripped:
                     out.append({"text": stripped})
             # With json_done set, whatever is left after the consumed JSON
