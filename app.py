@@ -28,7 +28,43 @@ os.chdir(BASE_DIR)
 
 load_dotenv()
 
-API_KEY = os.getenv("DEEPSEEKER_API_KEY") or "dseeker"
+def _resolve_api_key():
+    """B9 (Stage 1 audit): never ship an open relay.
+
+    The API key used to fall back to the publicly documented 'dseeker'
+    silently, and the dashboard to admin/admin — an exposed host plus these
+    defaults manufactured an open relay (the failure class that killed
+    ds2api). Now: an unset key is GENERATED (dsk- + 24 urlsafe chars),
+    printed once on boot and persisted next to the database so restarts keep
+    the same key. An explicit DEEPSEEKER_API_KEY is honored unchanged.
+
+    Returns (api_key, was_generated)."""
+    key = os.getenv("DEEPSEEKER_API_KEY", "").strip()
+    if key:
+        return key, False
+    key_file = os.path.join(
+        os.path.dirname(os.path.abspath(os.getenv("DB_PATH", "deeperseeker.db"))),
+        "api_key.txt",
+    )
+    try:
+        with open(key_file) as f:
+            saved = f.read().strip()
+        if saved:
+            return saved, True
+    except OSError:
+        pass
+    generated = "dsk-" + secrets.token_urlsafe(24)
+    try:
+        os.makedirs(os.path.dirname(key_file) or ".", exist_ok=True)
+        with open(key_file, "w") as f:
+            f.write(generated + "\n")
+        os.chmod(key_file, 0o600)
+    except OSError:
+        pass  # best-effort persistence; the key is printed below regardless
+    return generated, True
+
+
+API_KEY, _api_key_generated = _resolve_api_key()
 ADMIN_USER = os.getenv("DEEPSEEKER_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("DEEPSEEKER_ADMIN_PASSWORD", "admin")
 
@@ -87,6 +123,41 @@ if not logging.getLogger().handlers:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+
+def _log_security_banner():
+    """B9 (Stage 1 audit): surface insecure defaults loudly on boot instead of
+    quietly shipping an open relay."""
+    host = (os.getenv("HOST") or "").strip().lower()
+    loopback = host in ("", "127.0.0.1", "localhost", "::1")
+    if _api_key_generated:
+        logger.warning(
+            "SECURITY: DEEPSEEKER_API_KEY was not set — a strong API key was generated for this "
+            "instance and saved to api_key.txt next to the database. It is shown ONCE here:\n"
+            "  API key: %s",
+            API_KEY,
+        )
+    elif API_KEY.strip().lower() == "dseeker":
+        logger.warning(
+            "SECURITY: DEEPSEEKER_API_KEY is the publicly documented default 'dseeker'. "
+            "Set a strong key before exposing this service beyond loopback."
+        )
+    if ADMIN_USER == "admin" and ADMIN_PASSWORD == "admin":
+        if loopback:
+            logger.warning(
+                "SECURITY: the dashboard uses the default admin/admin credentials — "
+                "set DEEPSEEKER_ADMIN_USER / DEEPSEEKER_ADMIN_PASSWORD."
+            )
+        else:
+            logger.error(
+                "SECURITY: the dashboard uses admin/admin while binding a NON-LOOPBACK host (%s). "
+                "Anyone who can reach this service owns its token pool — set DEEPSEEKER_ADMIN_USER "
+                "and DEEPSEEKER_ADMIN_PASSWORD before exposing it.",
+                host or "0.0.0.0",
+            )
+
+
+_log_security_banner()
 
 # The token used for this request, logged as "key: <alias>".
 # Must stay a dict: BaseHTTPMiddleware runs the endpoint in a child task, and
