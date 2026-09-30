@@ -194,6 +194,14 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
     raise last_exc if last_exc is not None else RuntimeError("post_with_failover: no endpoints configured")
 
 
+# B11 (Stage 1 audit): the Android client identity used to be hardcoded to one
+# version for ALL tokens — when DeepSeek's app moves, a single stale string
+# degrades every account simultaneously, and identical fingerprints correlate
+# bans. The version is env-configurable now; per-token identity profiles
+# (rotating UA/version/locale) remain a P1.
+DEEPSEEKER_CLIENT_VERSION = os.getenv("DEEPSEEKER_CLIENT_VERSION", "2.4.5")
+
+
 def get_headers(auth_token, pow=None):
     headers = {
         "accept": "*/*",
@@ -203,7 +211,7 @@ def get_headers(auth_token, pow=None):
         "referer": "https://chat.deepseek.com/",
         "user-agent": "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 7)",
         "x-client-platform": "android",
-        "x-client-version": "2.4.5",
+        "x-client-version": DEEPSEEKER_CLIENT_VERSION,
         "x-client-locale": "en_US",
         "x-client-bundle-id": "com.deepseek.chat",
         "x-client-timezone-offset": _TZ_OFFSET,
