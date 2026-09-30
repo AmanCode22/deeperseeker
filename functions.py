@@ -137,6 +137,18 @@ async def get_session():
     return _session
 
 
+async def close_session():
+    """Close the shared aiohttp ClientSession (Stage 1 minor list).
+
+    Called from app lifespan shutdown: without it, every uvicorn reload/exit
+    leaked the session's connector sockets and logged 'Unclosed client
+    session' warnings."""
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+    _session = None
+
+
 # ==============================================================================
 # Stage 0.4 — Dual-endpoint failover
 #

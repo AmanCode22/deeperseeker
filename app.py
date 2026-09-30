@@ -59,6 +59,7 @@ from functions import (
     get_file_token,
     save_session,
     send_message,
+    close_session,
     StreamToolParser,
     upload_file,
     get_file_content,
@@ -243,6 +244,9 @@ async def lifespan(app: FastAPI):
     await _db(init_db)
     _install_key_access_formatter()
     yield
+    # Stage 1 minor list: release the shared aiohttp ClientSession so shutdown
+    # does not leak its connector sockets.
+    await close_session()
 
 
 app = FastAPI(title="DeeperSeeker", lifespan=lifespan)
@@ -1223,12 +1227,16 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
             await _db(save_session, sig, token_id, session_id, next_parent(parent_message_id))
             await _db(save_session, next_sig, token_id, session_id, next_parent(parent_message_id))
 
+        # Declared BEFORE _tb so the helper's closure reads top-down — it used
+        # to be defined after _tb and worked only by late binding (Stage 1
+        # minor list: hostile to readers).
+        block_index_local = [block_index]
+
         def _tb(text):
             return (f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'text', 'text': ''}})}\n\n"
                     f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index_local[0], 'delta': {'type': 'text_delta', 'text': text}})}\n\n"
                     f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n")
 
-        block_index_local = [block_index]
         tail_events = ""
         if is_thinking:
             tail_events += f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
@@ -1463,7 +1471,7 @@ def is_thinking_enabled(body, request=None):
         e_str = str(effort).strip().lower()
         if e_str in ["medium", "high", "max", "ultra", "extreme", "enabled", "adaptive", "on"]:
             return True
-        if e_str in ["low", "none", "off", "disable", "disabled", "false"]:
+        if e_str in ["low", "minimal", "none", "off", "disable", "disabled", "false"]:
             return False
 
     out_cfg = body.get("output_config")
@@ -1473,7 +1481,7 @@ def is_thinking_enabled(body, request=None):
             e_str = str(out_effort).strip().lower()
             if e_str in ["medium", "high", "max", "ultra", "extreme", "enabled", "adaptive", "on"]:
                 return True
-            if e_str in ["low", "none", "off", "disable", "disabled", "false"]:
+            if e_str in ["low", "minimal", "none", "off", "disable", "disabled", "false"]:
                 return False
 
     thinking_val = body.get("thinking")
@@ -1491,13 +1499,13 @@ def is_thinking_enabled(body, request=None):
             e_str = str(t_effort).strip().lower()
             if e_str in ["medium", "high", "max", "ultra", "extreme", "enabled", "adaptive", "on"]:
                 return True
-            if e_str in ["low", "none", "off", "disable", "disabled", "false"]:
+            if e_str in ["low", "minimal", "none", "off", "disable", "disabled", "false"]:
                 return False
     elif isinstance(thinking_val, str):
         t_str = thinking_val.strip().lower()
         if t_str in ["medium", "high", "max", "ultra", "extreme", "true", "enabled", "adaptive", "on"]:
             return True
-        if t_str in ["low", "none", "off", "disable", "disabled", "false"]:
+        if t_str in ["low", "minimal", "none", "off", "disable", "disabled", "false"]:
             return False
     elif isinstance(thinking_val, bool):
         return thinking_val
@@ -1507,7 +1515,7 @@ def is_thinking_enabled(body, request=None):
         effort_str = str(reasoning_effort).strip().lower()
         if effort_str in ["medium", "high", "max", "ultra", "extreme"]:
             return True
-        if effort_str in ["low", "none", "off", "disable", "disabled"]:
+        if effort_str in ["low", "minimal", "none", "off", "disable", "disabled"]:
             return False
 
     if request:
@@ -1529,11 +1537,36 @@ def resolve_model(model_raw):
     return SINGLE_MODEL
 
 
+async def _json_body(request: Request):
+    """Parse the body as JSON; empty/malformed payloads are a client error.
+
+    Stage 1 minor list: the completion endpoints used to call request.json()
+    directly, so an empty body or invalid JSON surfaced as a 500 — a client
+    mistake reported as a server fault (and paged as one)."""
+    try:
+        raw = await request.body()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Unable to read request body")
+    if not raw or not raw.strip():
+        raise HTTPException(status_code=400, detail="Empty request body; expected a JSON object")
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON in request body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    return body
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    # NOTE (Stage 1 minor list): `stop` and `max_tokens` are accepted but
+    # IGNORED — the upstream web-session API exposes no stop/length controls
+    # and v4.1flash ends its turn on its own. Local stop-trim is a possible
+    # follow-up; it is intentionally not silently claimed as supported.
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
-    body = await request.json()
+    body = await _json_body(request)
     messages = body.get("messages", [])
     model = resolve_model(body.get("model"))
     thinking = is_thinking_enabled(body, request)
@@ -1543,18 +1576,13 @@ async def chat_completions(request: Request):
     return await handle_chat(messages, model, thinking, search, stream, tools, scope=get_api_key(request))
 
 
-@app.post("/v1/responses")
-async def openai_responses(request: Request):
-    if not check_key(request):
-        return JSONResponse({"error": "Invalid API key"}, status_code=401)
-    body = await request.json()
-    model = resolve_model(body.get("model"))
-    inputs = body.get("input", [])
-    if isinstance(inputs, str):
-        inputs = [inputs]
-    elif isinstance(inputs, dict):
-        inputs = [inputs]
+def _responses_input_to_messages(inputs):
+    """Map the Responses API `input` array onto chat messages.
 
+    Stage 1 minor list: `input_image` parts are now mapped onto the
+    chat-completions image shape (the vision path already exists upstream);
+    previously only input_text/input_file were recognized and images were
+    passed through untouched."""
     messages = []
     for item in inputs:
         if isinstance(item, str):
@@ -1572,9 +1600,35 @@ async def openai_responses(request: Request):
                     msg_content.append({"type": "text", "text": c.get("text")})
                 elif c.get("type") == "input_file":
                     msg_content.append({"type": "file", "file_id": c.get("file_id")})
+                elif c.get("type") == "input_image":
+                    url = c.get("image_url")
+                    if isinstance(url, dict):
+                        url = url.get("url")
+                    if url:
+                        msg_content.append({"type": "image_url", "image_url": {"url": url}})
+                    elif c.get("file_id"):
+                        msg_content.append({"type": "file", "file_id": c.get("file_id")})
+                    else:
+                        msg_content.append(c)
                 else:
                     msg_content.append(c)
         messages.append({"role": role, "content": msg_content})
+    return messages
+
+
+@app.post("/v1/responses")
+async def openai_responses(request: Request):
+    if not check_key(request):
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
+    body = await _json_body(request)
+    model = resolve_model(body.get("model"))
+    inputs = body.get("input", [])
+    if isinstance(inputs, str):
+        inputs = [inputs]
+    elif isinstance(inputs, dict):
+        inputs = [inputs]
+
+    messages = _responses_input_to_messages(inputs)
 
     thinking = is_thinking_enabled(body, request)
     search = body.get("search", False)
@@ -1682,9 +1736,11 @@ def convert_anthropic_messages(messages):
 @app.post("/v1/messages")
 @app.post("/messages")
 async def anthropic_messages(request: Request):
+    # NOTE (Stage 1 minor list): Anthropic `stop_sequences` is accepted but
+    # IGNORED — the upstream web-session API exposes no stop controls.
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
-    body = await request.json()
+    body = await _json_body(request)
     system = body.get("system", "")
 
     messages = body.get("messages", [])
