@@ -630,6 +630,13 @@ async def handle_chat(
             save_session(sig, token_id, session_id, next_parent(parent_message_id))
             save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
             return format_response(resp_text, model, messages, tools)
+    except asyncio.CancelledError:
+        # B2 (Stage 1 audit): the client went away mid-request — the exchange
+        # never completed upstream, so the stored parent_message_id would fork
+        # the conversation on the next turn. Purge the rows and let the
+        # cancellation propagate; the finally below releases the chat lock.
+        delete_sessions_for_chat(token_id, session_id)
+        raise
     except Exception as e:
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
@@ -776,6 +783,17 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
         failed = True
+        # B2 (Stage 1 audit): the exchange never completed upstream. The stored
+        # session rows still point at the pre-abort parent_message_id, so the
+        # next turn would reuse them and fork/duplicate the conversation.
+        # Purge them — the next request opens a fresh chat, which is already
+        # the supported first-message path. Deletion must not be skipped even
+        # while the task is being torn down, hence it lives here and not in
+        # the finally block.
+        try:
+            delete_sessions_for_chat(token_id, session_id)
+        except Exception:
+            logger.exception("stream_response: failed to purge session rows after client abort")
         raise
     except Exception as e:
         failed = True
@@ -899,6 +917,13 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
         failed = True
+        # B2 (Stage 1 audit): same purge as stream_response — a client abort
+        # mid-stream leaves session rows pointing at a parent the upstream
+        # chat never answered, and the next turn would fork the exchange.
+        try:
+            delete_sessions_for_chat(token_id, session_id)
+        except Exception:
+            logger.exception("stream_anthropic_response: failed to purge session rows after client abort")
         raise
     except Exception as e:
         failed = True
