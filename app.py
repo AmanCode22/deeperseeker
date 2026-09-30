@@ -151,9 +151,21 @@ def count_tok(text):
     return len(deepseek_tokenizer.ds_token.encode(text))
 
 
+async def _db(fn, *args):
+    """Run a blocking SQLite store helper off the event loop (B5, Stage 1 audit).
+
+    Every sessions/tokens read + write used to run inline: under concurrent
+    streams each sqlite3.connect() round-trip and WAL commit stalled the whole
+    loop exactly when the proxy was busiest — head-of-line blocking on every
+    request (B5). to_thread keeps the store helpers sync (they are shared by
+    CLI paths and tests) while the loop never blocks on disk I/O. The
+    aiosqlite migration belongs to the store split (Stage 6)."""
+    return await asyncio.to_thread(fn, *args)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    await _db(init_db)
     _install_key_access_formatter()
     yield
 
@@ -450,15 +462,15 @@ async def _rehome_foreign_files(file_ids, token_id, tok):
     unchanged — nothing better than the old behavior is possible for them."""
     out = []
     for fid in file_ids:
-        owner = get_file_token(fid)
+        owner = await _db(get_file_token, fid)
         if owner is None or owner == token_id:
             out.append(fid)
             continue
-        owner_tok = get_token(owner)
+        owner_tok = await _db(get_token, owner)
         fetch_token = owner_tok["token"] if owner_tok else tok["token"]
         new_id = await _copy_file_to_token(fid, fetch_token, tok["token"])
         if new_id:
-            record_file(new_id, token_id)
+            await _db(record_file, new_id, token_id)
             logger.info(
                 "File ownership: re-uploaded file %s (token #%s) onto token #%s as %s",
                 fid, owner, token_id, new_id,
@@ -501,12 +513,12 @@ async def handle_chat(
     _retried=False,
     _auth_rotated=False,
 ):
-    auth_token = get_auth_token()
+    auth_token = await _db(get_auth_token)
     if not auth_token:
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
 
     sig = await generate_signature(messages, model, scope)
-    sess = find_session(sig)
+    sess = await _db(find_session, sig)
     rollover_summary = None
     ref_ids = []  # B4: file ids referenced by the conversation (set by the create path)
 
@@ -515,11 +527,11 @@ async def handle_chat(
         token_id = sess["token_id"]
         session_id = sess["session_id"]
         parent_message_id = sess["parent_message_id"]
-        tok = get_token(token_id)
+        tok = await _db(get_token, token_id)
         if not tok or tok["status"] == "RATE_LIMITED":
-            new_token_id = pick_token()
+            new_token_id = await _db(pick_token)
             if new_token_id and (not tok or new_token_id != token_id):
-                new_tok = get_token(new_token_id)
+                new_tok = await _db(get_token, new_token_id)
                 if new_tok:
                     _set_key_name(new_tok.get("alias"))
                     # Stage 0.3: rotation re-creates the upstream chat; hold the
@@ -528,7 +540,7 @@ async def handle_chat(
                     rot_owner = None
                     rot_slot = acquire_token_slot(new_token_id)  # B3: reservation follows the send
                     try:
-                        delete_sessions_for_chat(token_id, session_id)
+                        await _db(delete_sessions_for_chat, token_id, session_id)
                         new_session_id = await create_new_chat(new_tok["token"])
                         rot_owner = await _own_chat_lock(new_session_id)
                         if needs_rollover(messages):
@@ -541,7 +553,7 @@ async def handle_chat(
 
                         file_ids = await extract_and_upload_files(messages, new_tok["token"])
                         for fid in file_ids:
-                            record_file(fid, new_token_id)
+                            await _db(record_file, fid, new_token_id)
                         gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, file_ids)
                         gen = await _preflight_stream(gen)
                     except Exception as e:
@@ -568,7 +580,7 @@ async def handle_chat(
                             if _retried:
                                 return _api_error_response(e, is_anthropic)
                             return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
-                        mark_active(new_token_id)
+                        await _db(mark_active, new_token_id)
                         rot_slot.release()
 
                         parsed_tools, clean_text = parse_tools(resp_text)
@@ -583,8 +595,8 @@ async def handle_chat(
                         next_messages.append(ast_msg)
                         next_sig = await generate_signature(next_messages, model, scope)
 
-                        save_session(sig, new_token_id, new_session_id, next_parent(0))
-                        save_session(next_sig, new_token_id, new_session_id, next_parent(0))
+                        await _db(save_session, sig, new_token_id, new_session_id, next_parent(0))
+                        await _db(save_session, next_sig, new_token_id, new_session_id, next_parent(0))
                         if rot_owner is not None:
                             rot_owner.release()
                         return format_response(resp_text, model, messages, tools)
@@ -593,9 +605,9 @@ async def handle_chat(
 
         create_lock = _take_lock("sig", _sig_locks, sig, SIG_LOCKS_MAX)
         async with create_lock:
-            sess = find_session(sig)
+            sess = await _db(find_session, sig)
             if not sess:
-                token_id = pick_token()
+                token_id = await _db(pick_token)
                 if not token_id:
                     return JSONResponse({"error": "No tokens available"}, status_code=503)
                 # B4: upstream files are account-scoped. If the conversation's
@@ -604,19 +616,19 @@ async def handle_chat(
                 # different account would get "file not found" upstream.
                 ref_ids = _referenced_file_ids(messages)
                 if ref_ids:
-                    owners = {get_file_token(fid) for fid in ref_ids}
+                    owners = {await _db(get_file_token, fid) for fid in ref_ids}
                     owners.discard(None)
                     if len(owners) == 1:
                         owner_id = owners.pop()
                         if owner_id != token_id:
-                            owner_tok = get_token(owner_id)
+                            owner_tok = await _db(get_token, owner_id)
                             if owner_tok and owner_tok["status"] == "ACTIVE":
                                 logger.info(
                                     "File ownership: chat references file(s) pinned to token #%s; using it",
                                     owner_id,
                                 )
                                 token_id = owner_id
-                tok = get_token(token_id)
+                tok = await _db(get_token, token_id)
                 if not tok:
                     return JSONResponse({"error": "Token not found"}, status_code=503)
 
@@ -641,14 +653,14 @@ async def handle_chat(
                     )
 
                 session_id = await create_new_chat(tok["token"])
-                save_session(sig, token_id, session_id, 0)
+                await _db(save_session, sig, token_id, session_id, 0)
                 parent_message_id = 0
             else:
                 token_id = sess["token_id"]
                 session_id = sess["session_id"]
                 parent_message_id = sess["parent_message_id"]
 
-    tok = get_token(token_id)
+    tok = await _db(get_token, token_id)
     if not tok:
         return JSONResponse({"error": "Token expired"}, status_code=503)
     _set_key_name(tok.get("alias"))
@@ -666,7 +678,7 @@ async def handle_chat(
     lock_transferred = False
     slot = None  # B3: in-flight token reservation for the send below
     try:
-        fresh = find_session(sig)
+        fresh = await _db(find_session, sig)
         if fresh:
             if fresh["session_id"] != session_id:
                 # The chat moved under us (a concurrent request already rolled
@@ -675,7 +687,7 @@ async def handle_chat(
                 token_id = fresh["token_id"]
                 session_id = fresh["session_id"]
                 parent_message_id = fresh["parent_message_id"]
-                tok = get_token(token_id)
+                tok = await _db(get_token, token_id)
                 if not tok:
                     return JSONResponse({"error": "Token expired"}, status_code=503)
                 _set_key_name(tok.get("alias"))
@@ -691,14 +703,14 @@ async def handle_chat(
                 "Context rollover: accumulated context over limit; purging session mappings for chat %s",
                 session_id,
             )
-            delete_sessions_for_chat(token_id, session_id)
+            await _db(delete_sessions_for_chat, token_id, session_id)
             scratch_chat = await create_new_chat(tok["token"])
             summary_gen = send_message(
                 scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
             )
             rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
             session_id = await create_new_chat(tok["token"])
-            save_session(sig, token_id, session_id, 0)
+            await _db(save_session, sig, token_id, session_id, 0)
             parent_message_id = 0
             # The rollover itself was serialized under the OLD chat's lock;
             # the send -> save section below must hold the FRESH chat's lock.
@@ -709,7 +721,7 @@ async def handle_chat(
             # A request that read the fresh mapping in the window between our
             # save and our acquisition may have already appended to this
             # chat; adopt the stored parent so we never fork it.
-            fresh = find_session(sig)
+            fresh = await _db(find_session, sig)
             if fresh and fresh["session_id"] == session_id:
                 parent_message_id = fresh["parent_message_id"]
 
@@ -734,7 +746,7 @@ async def handle_chat(
             file_ids = await _rehome_foreign_files(file_ids, token_id, tok)
             for fid in file_ids:
                 if fid not in ref_set:
-                    record_file(fid, token_id)
+                    await _db(record_file, fid, token_id)
         prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
 
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
@@ -747,7 +759,7 @@ async def handle_chat(
             return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope), media_type="text/event-stream")
         else:
             resp_text = await collect_response(gen)
-            mark_active(token_id)
+            await _db(mark_active, token_id)
 
             parsed_tools, clean_text = parse_tools(resp_text)
             clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
@@ -761,23 +773,23 @@ async def handle_chat(
             next_messages.append(ast_msg)
             next_sig = await generate_signature(next_messages, model, scope)
 
-            save_session(sig, token_id, session_id, next_parent(parent_message_id))
-            save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
+            await _db(save_session, sig, token_id, session_id, next_parent(parent_message_id))
+            await _db(save_session, next_sig, token_id, session_id, next_parent(parent_message_id))
             return format_response(resp_text, model, messages, tools)
     except asyncio.CancelledError:
         # B2 (Stage 1 audit): the client went away mid-request — the exchange
         # never completed upstream, so the stored parent_message_id would fork
         # the conversation on the next turn. Purge the rows and let the
         # cancellation propagate; the finally below releases the chat lock.
-        delete_sessions_for_chat(token_id, session_id)
+        await _db(delete_sessions_for_chat, token_id, session_id)
         raise
     except Exception as e:
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            mark_limited(token_id)
-            delete_sessions_for_chat(token_id, session_id)
+            await _db(mark_limited, token_id)
+            await _db(delete_sessions_for_chat, token_id, session_id)
             if not _auth_rotated:
-                new_token_id = pick_token()
+                new_token_id = await _db(pick_token)
                 if new_token_id and new_token_id != token_id:
                     logger.warning(
                         "Upstream HTTP %s on token #%s (session %s); rotating to token #%s",
@@ -809,7 +821,7 @@ async def handle_chat(
             return _api_error_response(e, is_anthropic)
 
         logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
-        delete_sessions_for_chat(token_id, session_id)
+        await _db(delete_sessions_for_chat, token_id, session_id)
         if _retried:
             return _api_error_response(e, is_anthropic)
         # PR #26 review fix (Blocker 2 — retry self-deadlock): the recursive
@@ -915,7 +927,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
             for r in parser.feed(chunk):
                 if "text" in r:
                     yield f"data: {json.dumps({'choices': [{'delta': {'content': r['text']}}]})}\n\n"
-        mark_active(token_id)
+        await _db(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
         failed = True
@@ -927,7 +939,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         # while the task is being torn down, hence it lives here and not in
         # the finally block.
         try:
-            delete_sessions_for_chat(token_id, session_id)
+            await _db(delete_sessions_for_chat, token_id, session_id)
         except Exception:
             logger.exception("stream_response: failed to purge session rows after client abort")
         raise
@@ -935,11 +947,11 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            mark_limited(token_id)
-            delete_sessions_for_chat(token_id, session_id)
+            await _db(mark_limited, token_id)
+            await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_response upstream HTTP %s: %s", code, e)
         else:
-            delete_sessions_for_chat(token_id, session_id)
+            await _db(delete_sessions_for_chat, token_id, session_id)
             logger.exception("stream_response failed")
         try:
             yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
@@ -959,8 +971,8 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
-            save_session(sig, token_id, session_id, next_parent(parent_message_id))
-            save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
+            await _db(save_session, sig, token_id, session_id, next_parent(parent_message_id))
+            await _db(save_session, next_sig, token_id, session_id, next_parent(parent_message_id))
 
         if not aborted and not failed:
             try:
@@ -1049,7 +1061,7 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                         text_block_started = True
                     delta_evt = f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': r['text']}})}\n\n"
                     yield delta_evt
-        mark_active(token_id)
+        await _db(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
         failed = True
@@ -1057,7 +1069,7 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         # mid-stream leaves session rows pointing at a parent the upstream
         # chat never answered, and the next turn would fork the exchange.
         try:
-            delete_sessions_for_chat(token_id, session_id)
+            await _db(delete_sessions_for_chat, token_id, session_id)
         except Exception:
             logger.exception("stream_anthropic_response: failed to purge session rows after client abort")
         raise
@@ -1065,11 +1077,11 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            mark_limited(token_id)
-            delete_sessions_for_chat(token_id, session_id)
+            await _db(mark_limited, token_id)
+            await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_anthropic_response upstream HTTP %s: %s", code, e)
         else:
-            delete_sessions_for_chat(token_id, session_id)
+            await _db(delete_sessions_for_chat, token_id, session_id)
             logger.exception("stream_anthropic_response failed")
         try:
             yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)[:300]}})}\n\n"
@@ -1091,8 +1103,8 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
-            save_session(sig, token_id, session_id, next_parent(parent_message_id))
-            save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
+            await _db(save_session, sig, token_id, session_id, next_parent(parent_message_id))
+            await _db(save_session, next_sig, token_id, session_id, next_parent(parent_message_id))
 
         def _tb(text):
             return (f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'text', 'text': ''}})}\n\n"
@@ -1230,10 +1242,10 @@ def format_anthropic_response(result, model):
 async def files_upload(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
-    tok_id = pick_token()
+    tok_id = await _db(pick_token)
     if not tok_id:
         return JSONResponse({"error": "No tokens available"}, status_code=503)
-    tok = get_token(tok_id)
+    tok = await _db(get_token, tok_id)
     if not tok:
         return JSONResponse({"error": "Token not found"}, status_code=503)
     _set_key_name(tok.get("alias"))
@@ -1259,7 +1271,7 @@ async def files_upload(request: Request):
         slot.release()
     # B4: pin the upload to the token that performed it so later chats can
     # prefer (or re-home onto) the owning account.
-    record_file(file_info["file_id"], tok_id)
+    await _db(record_file, file_info["file_id"], tok_id)
 
     if request.url.path.startswith("/v1/files/upload"):
         return {
@@ -1284,10 +1296,10 @@ async def files_upload(request: Request):
 async def files_content(file_id: str, request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
-    tok_id = pick_token()
+    tok_id = await _db(pick_token)
     if not tok_id:
         return JSONResponse({"error": "No tokens available"}, status_code=503)
-    tok = get_token(tok_id)
+    tok = await _db(get_token, tok_id)
     if not tok:
         return JSONResponse({"error": "Token not found"}, status_code=503)
     _set_key_name(tok.get("alias"))
@@ -1707,7 +1719,7 @@ async def dashboard(request: Request):
         get_current_admin(request)
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
-    tokens = get_tokens()
+    tokens = await _db(get_tokens)
     return templates.TemplateResponse(request, "dashboard.html", {"tokens": tokens})
 
 
@@ -1721,7 +1733,7 @@ async def tokens_add(request: Request):
     auth_token = form.get("auth_token", "").strip().strip("'\"")
     alias = form.get("alias", "").strip() or None
     if auth_token:
-        add_token(auth_token, alias)
+        await _db(add_token, auth_token, alias)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 
@@ -1731,7 +1743,7 @@ async def tokens_delete(token_id: int, request: Request):
         get_current_admin(request)
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
-    delete_token(token_id)
+    await _db(delete_token, token_id)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 
@@ -1742,7 +1754,7 @@ async def root(request: Request):
 
 @app.get("/health")
 async def health(request: Request):
-    active = sum(1 for t in get_tokens() if t["status"] == "ACTIVE")
+    active = sum(1 for t in await _db(get_tokens) if t["status"] == "ACTIVE")
     cookies_valid = False
     try:
         with open(cookie_file_path()) as f:
