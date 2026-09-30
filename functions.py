@@ -88,6 +88,14 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+    # B3 (Stage 1 audit) migration: pool cooldown + usage tracking. Older
+    # databases miss the columns; the ALTERs are idempotent behind the
+    # pragma check.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(tokens)").fetchall()}
+    if "rate_limited_until" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN rate_limited_until REAL")
+    if "last_used" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN last_used REAL")
     conn.commit()
     conn.close()
     try:
@@ -384,28 +392,151 @@ def delete_token(token_id):
     conn.close()
 
 
-def pick_token():
+# ==============================================================================
+# B3 (Stage 1 audit) — token pool scheduler v2
+#
+# The old pool selected ACTIVE tokens with ORDER BY RANDOM() and, when every
+# token was RATE_LIMITED, fell back to the FIRST token by id. Consequences
+# (root cause of issue #32): a limited token never recovered while any other
+# token stayed ACTIVE, a single-token pool had no backoff at all, and
+# concurrent requests stampeded onto one account — uneven wear and a
+# ban-ladder accelerator. The scheduler now provides:
+#   * a rate_limited_until cooldown with automatic RATE_LIMITED -> ACTIVE
+#     recovery once the cooldown expires (flipped back on the next pick),
+#   * least-in-flight selection (spreads load instead of RANDOM()),
+#   * an idle-oldest tie-break (the never/least-recently-used token leads),
+#   * a soft per-token concurrency cap: capped tokens are only used when
+#     nothing else is free,
+#   * a soonest-to-recover fallback when every token is still cooling down.
+# ==============================================================================
+
+TOKEN_COOLDOWN_SECONDS = max(1, int(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "60")))
+TOKEN_CONCURRENCY_CAP = max(1, int(os.getenv("DEEPSEEKER_TOKEN_CONCURRENCY", "8")))
+
+# Per-token in-flight refcounts (per process; single event-loop worker). Every
+# send reserves one slot via acquire_token_slot() and releases it when the
+# request ends — success, upstream failure or client abort — mirroring the
+# ownership-transfer pattern of the per-chat locks.
+_in_flight = {}
+
+
+def _bump_in_flight(token_id, delta):
+    n = _in_flight.get(token_id, 0) + delta
+    if n > 0:
+        _in_flight[token_id] = n
+    else:
+        _in_flight.pop(token_id, None)
+
+
+class _TokenSlot:
+    """One in-flight reservation against a token. release() is once-only, so
+    transferring the slot to a streaming generator (exactly like the per-chat
+    lock owner) is safe by construction."""
+
+    __slots__ = ("token_id", "_held")
+
+    def __init__(self, token_id):
+        self.token_id = token_id
+        self._held = True
+        _bump_in_flight(token_id, +1)
+
+    def release(self):
+        if not self._held:
+            return
+        self._held = False
+        _bump_in_flight(self.token_id, -1)
+
+
+def acquire_token_slot(token_id):
+    """Reserve one in-flight slot for token_id; pair it with slot.release()."""
+    return _TokenSlot(token_id)
+
+
+def token_in_flight(token_id):
+    """Current in-flight request count for a token (selection signal)."""
+    return _in_flight.get(token_id, 0)
+
+
+def pick_token(exclude=None):
+    """Select the best available token (scheduler v2 — block comment above).
+
+    `exclude` (optional, B10) lists token ids the caller just saw fail: they
+    are avoided while ANY other token is available, so an empty-SSE retry
+    cannot land on the same poisoned token.
+    """
+    now = time.time()
     conn = get_db()
-    row = conn.execute("SELECT id FROM tokens WHERE status = 'ACTIVE' ORDER BY RANDOM() LIMIT 1").fetchone()
-    if row:
-        conn.close()
-        return row[0]
-    row = conn.execute("SELECT id FROM tokens ORDER BY id LIMIT 1").fetchone()
+    rows = conn.execute(
+        "SELECT id, status, rate_limited_until, last_used FROM tokens"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return None
+
+    excluded = set(exclude or ())
+    available = []
+    recovered = []
+    for tid, status, until, last_used in rows:
+        if status == "RATE_LIMITED" and until is not None and until > now:
+            continue  # still cooling down
+        if status == "RATE_LIMITED":
+            recovered.append(tid)  # cooldown expired -> auto-recover below
+        available.append((tid, last_used or 0.0))
+
+    pickable = [entry for entry in available if entry[0] not in excluded] or available
+    if pickable:
+        if recovered:
+            conn = get_db()
+            conn.executemany(
+                "UPDATE tokens SET status = 'ACTIVE', rate_limited_until = NULL WHERE id = ?",
+                [(tid,) for tid in recovered],
+            )
+            conn.commit()
+            conn.close()
+            logger.info("Token pool: cooldown expired, auto-recovered token(s) %s", recovered)
+
+        def _sort_key(entry):
+            tid, last_used = entry
+            in_flight = _in_flight.get(tid, 0)
+            # Soft cap: over-cap tokens sort behind every under-cap one.
+            over_cap = 1 if in_flight >= TOKEN_CONCURRENCY_CAP else 0
+            return (over_cap, in_flight, last_used, tid)
+
+        return min(pickable, key=_sort_key)[0]
+
+    # Every token is rate-limited and still cooling: pick the one that
+    # recovers first (bounded wait) instead of stampeding onto the lowest id
+    # with no backoff at all.
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id FROM tokens ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
+    ).fetchone()
     conn.close()
     return row[0] if row else None
 
 
 def mark_limited(token_id):
-    logger.warning("Token #%d marked RATE_LIMITED", token_id)
+    until = time.time() + TOKEN_COOLDOWN_SECONDS
+    logger.warning(
+        "Token #%d marked RATE_LIMITED for %ds (recovers automatically)",
+        token_id,
+        TOKEN_COOLDOWN_SECONDS,
+    )
     conn = get_db()
-    conn.execute("UPDATE tokens SET status = ? WHERE id = ?", ("RATE_LIMITED", token_id))
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = ? WHERE id = ?",
+        ("RATE_LIMITED", until, token_id),
+    )
     conn.commit()
     conn.close()
 
 
 def mark_active(token_id):
     conn = get_db()
-    conn.execute("UPDATE tokens SET status = ? WHERE id = ?", ("ACTIVE", token_id))
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL, last_used = ? WHERE id = ?",
+        ("ACTIVE", time.time(), token_id),
+    )
     conn.commit()
     conn.close()
 

@@ -52,6 +52,7 @@ from functions import (
     next_parent,
     parse_tools,
     pick_token,
+    acquire_token_slot,
     save_session,
     send_message,
     StreamToolParser,
@@ -313,7 +314,7 @@ async def _own_chat_lock(session_id):
     return token
 
 
-def _release_chat_lock_stream(gen, owner):
+def _release_chat_lock_stream(gen, owner, slot=None):
     """Wrap a streaming generator so the per-chat lock stays held until the
     stream completes (or the client aborts), then is released exactly once.
 
@@ -322,13 +323,18 @@ def _release_chat_lock_stream(gen, owner):
     ownership of the lock must transfer from handle_chat to the generator —
     releasing any earlier would reopen the parent_message_id race the lock
     exists to prevent. `owner` is a _OwnedChatLock token: its release() drops
-    ONLY this holder's acquisition, never a stranger's (PR #26 review, Medium)."""
+    ONLY this holder's acquisition, never a stranger's (PR #26 review, Medium).
+    `slot` (B3) is the request's in-flight token reservation: it transfers to
+    the generator alongside the lock so pick_token()'s least-in-flight view
+    stays correct for the whole stream duration."""
     async def _wrapped():
         try:
             async for chunk in gen:
                 yield chunk
         finally:
             owner.release()
+            if slot is not None:
+                slot.release()
     return _wrapped()
 
 
@@ -434,6 +440,7 @@ async def handle_chat(
                     # new chat's lock across its send -> save section so a
                     # concurrent same-signature request cannot race the swap.
                     rot_owner = None
+                    rot_slot = acquire_token_slot(new_token_id)  # B3: reservation follows the send
                     try:
                         delete_sessions_for_chat(token_id, session_id)
                         new_session_id = await create_new_chat(new_tok["token"])
@@ -452,12 +459,13 @@ async def handle_chat(
                     except Exception as e:
                         if rot_owner is not None:
                             rot_owner.release()
+                        rot_slot.release()
                         logger.exception("Token-rotation recovery failed (chat %s): %s", session_id, e)
                         if _retried:
                             return _api_error_response(e, is_anthropic)
                         return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
                     if stream:
-                        gen = _release_chat_lock_stream(gen, rot_owner)
+                        gen = _release_chat_lock_stream(gen, rot_owner, rot_slot)
                         if is_anthropic:
                             return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0, scope), media_type="text/event-stream")
                         return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0, scope), media_type="text/event-stream")
@@ -468,10 +476,12 @@ async def handle_chat(
                             logger.exception("Upstream failed during token-rotation request: %s", e)
                             if rot_owner is not None:
                                 rot_owner.release()
+                            rot_slot.release()
                             if _retried:
                                 return _api_error_response(e, is_anthropic)
                             return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
                         mark_active(new_token_id)
+                        rot_slot.release()
 
                         parsed_tools, clean_text = parse_tools(resp_text)
                         clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
@@ -548,6 +558,7 @@ async def handle_chat(
     # rolled the chat over (or advanced its parent) while this frame waited.
     lock_owner = await _own_chat_lock(session_id)
     lock_transferred = False
+    slot = None  # B3: in-flight token reservation for the send below
     try:
         fresh = find_session(sig)
         if fresh:
@@ -596,6 +607,13 @@ async def handle_chat(
             if fresh and fresh["session_id"] == session_id:
                 parent_message_id = fresh["parent_message_id"]
 
+        # B3: every send reserves one in-flight slot against its token —
+        # pick_token() balances by these counts, so the pairing must hold for
+        # both the freshly picked (create path) and the session-owned token.
+        # Streams take the slot with them via _release_chat_lock_stream; every
+        # other exit releases it in the finally below.
+        slot = acquire_token_slot(token_id)
+
         is_first = parent_message_id == 0
         # Stage 0.3: the lock is held across the whole send -> save critical
         # section; for streams, ownership transfers to the response generator
@@ -606,7 +624,7 @@ async def handle_chat(
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
         gen = await _preflight_stream(gen)
         if stream:
-            gen = _release_chat_lock_stream(gen, lock_owner)
+            gen = _release_chat_lock_stream(gen, lock_owner, slot)
             lock_transferred = True
             if is_anthropic:
                 return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id, scope), media_type="text/event-stream")
@@ -704,6 +722,8 @@ async def handle_chat(
     finally:
         if not lock_transferred:
             lock_owner.release()
+            if slot is not None:
+                slot.release()
 
 
 async def collect_response(gen):
@@ -1101,22 +1121,26 @@ async def files_upload(request: Request):
     if not tok:
         return JSONResponse({"error": "Token not found"}, status_code=503)
     _set_key_name(tok.get("alias"))
-    form = await request.form()
-    file_obj = form.get("file")
-    if not file_obj:
-        return JSONResponse({"error": "No file provided"}, status_code=400)
-    file_bytes = await file_obj.read(25 * 1024 * 1024 + 1)
-    if len(file_bytes) > 25 * 1024 * 1024:
-        return JSONResponse({"error": "File too large"}, status_code=413)
-    filename = getattr(file_obj, "filename", "file.bin")
-    content_type = getattr(file_obj, "content_type", "application/octet-stream")
-    file_info = None
-    async for status, data in upload_file(file_bytes, filename, content_type, tok["token"]):
-        if status == "success":
-            file_info = data
-            break
-    if not file_info:
-        return JSONResponse({"error": "Upload failed"}, status_code=500)
+    slot = acquire_token_slot(tok_id)  # B3: upload counts toward the token's in-flight load
+    try:
+        form = await request.form()
+        file_obj = form.get("file")
+        if not file_obj:
+            return JSONResponse({"error": "No file provided"}, status_code=400)
+        file_bytes = await file_obj.read(25 * 1024 * 1024 + 1)
+        if len(file_bytes) > 25 * 1024 * 1024:
+            return JSONResponse({"error": "File too large"}, status_code=413)
+        filename = getattr(file_obj, "filename", "file.bin")
+        content_type = getattr(file_obj, "content_type", "application/octet-stream")
+        file_info = None
+        async for status, data in upload_file(file_bytes, filename, content_type, tok["token"]):
+            if status == "success":
+                file_info = data
+                break
+        if not file_info:
+            return JSONResponse({"error": "Upload failed"}, status_code=500)
+    finally:
+        slot.release()
 
     if request.url.path.startswith("/v1/files/upload"):
         return {
@@ -1148,13 +1172,19 @@ async def files_content(file_id: str, request: Request):
     if not tok:
         return JSONResponse({"error": "Token not found"}, status_code=503)
     _set_key_name(tok.get("alias"))
-    gen = get_file_content(tok["token"], file_id)
+    slot = acquire_token_slot(tok_id)
     try:
-        mime = await gen.__anext__()
-    except StopAsyncIteration:
-        return JSONResponse({"error": "File not found"}, status_code=404)
-    except Exception:
-        return JSONResponse({"error": "File fetch failed"}, status_code=502)
+        gen = get_file_content(tok["token"], file_id)
+        try:
+            mime = await gen.__anext__()
+        except StopAsyncIteration:
+            return JSONResponse({"error": "File not found"}, status_code=404)
+        except Exception:
+            return JSONResponse({"error": "File fetch failed"}, status_code=502)
+    finally:
+        # Released once the fetch handshake is done; the download itself
+        # streams from the already-established upstream response.
+        slot.release()
     async def stream_chunks():
         async for chunk in gen:
             yield chunk
