@@ -1208,12 +1208,14 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
             pass
     finally:
         parsed_tools, clean_text = parse_tools(full_text)
-        # B7: usage on the cleaned completion, not raw full_text.
-        usage_out = _completion_usage_text(clean_text, parsed_tools)
-        out_tokens = count_tok(usage_out) if usage_out else 0
-
         clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
         clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+        # B7: usage on the cleaned completion, not raw full_text. Computed
+        # AFTER the strips above (mirrors stream_response): this path used to
+        # count tokens before them, so /v1/messages streams billed the whole
+        # <think> reasoning share as output_tokens (Stage 1 review, finding 1).
+        usage_out = _completion_usage_text(clean_text, parsed_tools)
+        out_tokens = count_tok(usage_out) if usage_out else 0
 
         if not failed:
             next_messages = messages.copy()

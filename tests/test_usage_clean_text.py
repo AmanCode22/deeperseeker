@@ -81,6 +81,62 @@ def test_stream_usage_chunk_excludes_think_tokens():
     assert got == expected, f"stream usage must exclude think tokens: {got} != {expected}"
 
 
+def test_anthropic_stream_usage_excludes_think_tokens():
+    """Stage 1 review finding 1: B7 must hold on the Anthropic path too.
+
+    stream_anthropic_response used to compute output_tokens at the top of the
+    finally, BEFORE the <think> strip — /v1/messages streams billed the whole
+    reasoning share (e.g. 405 tokens instead of the 2-token visible reply),
+    exactly the bug B7 fixed for the OpenAI path.
+    """
+    chunks = ["<think>", "deep reasoning " * 40, "</think>", "Visible ", "reply"]
+
+    async def gen():
+        for c in chunks:
+            yield c
+
+    lines = asyncio.run(_collect(app_module.stream_anthropic_response(
+        gen(), "v4.1flash", MESSAGES, 1, "sess", "sig", []
+    )))
+    deltas = []
+    for line in lines:
+        for seg in line.split("\n"):
+            if seg.startswith("data: "):
+                payload = json.loads(seg[len("data: "):])
+                if payload.get("type") == "message_delta":
+                    deltas.append(payload)
+    assert len(deltas) == 1, lines
+    expected = app_module.count_tok("Visible reply")
+    got = deltas[0]["usage"]["output_tokens"]
+    raw = app_module.count_tok("".join(chunks))
+    assert got == expected, f"anthropic stream usage must exclude think tokens: {got} != {expected}"
+    assert got < raw, "the think share must no longer be billed on /v1/messages streams"
+
+
+def test_anthropic_stream_usage_counts_tool_arguments():
+    """Same reorder must keep tool-call billing on the cleaned reply + arguments."""
+    chunks = ['<tool_call name="Bash">', '<parameter name="command">ls -la</parameter>']
+
+    async def gen():
+        for c in chunks:
+            yield c
+
+    lines = asyncio.run(_collect(app_module.stream_anthropic_response(
+        gen(), "v4.1flash", MESSAGES, 1, "sess", "sig", []
+    )))
+    deltas = []
+    for line in lines:
+        for seg in line.split("\n"):
+            if seg.startswith("data: "):
+                payload = json.loads(seg[len("data: "):])
+                if payload.get("type") == "message_delta":
+                    deltas.append(payload)
+    assert len(deltas) == 1, lines
+    assert deltas[0]["delta"].get("stop_reason") == "tool_use", deltas
+    got = deltas[0]["usage"]["output_tokens"]
+    assert got > 0, "tool_use streams must still bill the serialized arguments"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
