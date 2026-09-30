@@ -537,28 +537,69 @@ async def handle_chat(
         return JSONResponse({"error": "Token expired"}, status_code=503)
     _set_key_name(tok.get("alias"))
 
-    if parent_message_id != 0 and needs_rollover(messages):
-        logger.info(
-            "Context rollover: accumulated context over limit; purging session mappings for chat %s",
-            session_id,
-        )
-        delete_sessions_for_chat(token_id, session_id)
-        scratch_chat = await create_new_chat(tok["token"])
-        summary_gen = send_message(
-            scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
-        )
-        rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
-        session_id = await create_new_chat(tok["token"])
-        save_session(sig, token_id, session_id, 0)
-        parent_message_id = 0
-
-    is_first = parent_message_id == 0
-    # Stage 0.3: hold this chat's lock across the whole send -> save critical
-    # section; for streams, ownership transfers to the response generator via
-    # _release_chat_lock_stream (the final save_session happens there).
+    # B1 (Stage 1 audit): the accumulated-context rollover used to run BEFORE
+    # the per-chat lock was acquired — only first-time creation was guarded by
+    # the sig-lock — so two concurrent requests with the same signature could
+    # both decide "rollover", both delete the session rows and both create a
+    # fresh upstream chat (last save_session() wins; the loser chat leaks and
+    # parent ids diverge). The whole rollover decision now happens under the
+    # CURRENT chat's lock, and the stored session state is re-read once the
+    # lock is held: a concurrent same-signature request may have already
+    # rolled the chat over (or advanced its parent) while this frame waited.
     lock_owner = await _own_chat_lock(session_id)
     lock_transferred = False
     try:
+        fresh = find_session(sig)
+        if fresh:
+            if fresh["session_id"] != session_id:
+                # The chat moved under us (a concurrent request already rolled
+                # it over). Follow it and hold the NEW chat's lock instead.
+                lock_owner.release()
+                token_id = fresh["token_id"]
+                session_id = fresh["session_id"]
+                parent_message_id = fresh["parent_message_id"]
+                tok = get_token(token_id)
+                if not tok:
+                    return JSONResponse({"error": "Token expired"}, status_code=503)
+                _set_key_name(tok.get("alias"))
+                lock_owner = await _own_chat_lock(session_id)
+            else:
+                # Same chat: adopt the stored parent so a request that was
+                # queued behind a completed turn never re-sends a stale
+                # parent_message_id (which would fork the upstream exchange).
+                parent_message_id = fresh["parent_message_id"]
+
+        if parent_message_id != 0 and needs_rollover(messages):
+            logger.info(
+                "Context rollover: accumulated context over limit; purging session mappings for chat %s",
+                session_id,
+            )
+            delete_sessions_for_chat(token_id, session_id)
+            scratch_chat = await create_new_chat(tok["token"])
+            summary_gen = send_message(
+                scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
+            )
+            rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
+            session_id = await create_new_chat(tok["token"])
+            save_session(sig, token_id, session_id, 0)
+            parent_message_id = 0
+            # The rollover itself was serialized under the OLD chat's lock;
+            # the send -> save section below must hold the FRESH chat's lock.
+            # Queued same-signature requests re-derive the new mapping from
+            # the DB via the re-read above, so nobody double-rolls-over.
+            lock_owner.release()
+            lock_owner = await _own_chat_lock(session_id)
+            # A request that read the fresh mapping in the window between our
+            # save and our acquisition may have already appended to this
+            # chat; adopt the stored parent so we never fork it.
+            fresh = find_session(sig)
+            if fresh and fresh["session_id"] == session_id:
+                parent_message_id = fresh["parent_message_id"]
+
+        is_first = parent_message_id == 0
+        # Stage 0.3: the lock is held across the whole send -> save critical
+        # section; for streams, ownership transfers to the response generator
+        # via _release_chat_lock_stream (the final save_session happens there).
         file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
         prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
 
