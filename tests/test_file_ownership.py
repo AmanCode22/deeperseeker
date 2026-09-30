@@ -176,11 +176,88 @@ def test_chat_prefers_file_owner_token_on_first_turn():
         "the session must be saved against the owner token"
 
 
+def _files_content_scenario(calls, owner_id, owner_row_exists=True, register=True):
+    """Drive files_content with the ownership registry and upstream mocked."""
+    import app as app_module
+
+    _fresh_db()
+    if register:
+        functions.record_file("file-owned", owner_id)
+
+    class FakeSlot:
+        def release(self):
+            calls["released"] = True
+
+    def fake_get_token(tid):  # sync: _db runs helpers via asyncio.to_thread
+        calls["get_token"].append(tid)
+        if tid == owner_id and not owner_row_exists:
+            return None
+        return {"id": tid, "token": f"tok-{tid}", "status": "ACTIVE", "alias": None}
+
+    def fake_pick(*a, **k):
+        calls["pick_token"] += 1
+        return 1  # the scheduler always wants token 1
+
+    async def fake_get_file_content(fetch_token, fid):
+        calls["fetch_token"] = fetch_token
+        yield "text/plain"
+        yield b"data"
+
+    patches = [
+        ("check_key", lambda request: True),
+        ("get_token", fake_get_token),
+        ("pick_token", fake_pick),
+        ("get_file_content", fake_get_file_content),
+        ("acquire_token_slot", lambda tid: FakeSlot()),
+    ]
+    saved = [(name, getattr(app_module, name)) for name, _ in patches]
+    for name, fn in patches:
+        setattr(app_module, name, fn)
+    try:
+        return asyncio.run(app_module.files_content("file-owned", None))
+    finally:
+        for name, fn in saved:
+            setattr(app_module, name, fn)
+
+
+def test_files_content_prefers_owner_token():
+    """Stage 1 review finding 2: retrieval must run on the file-owner token.
+
+    Upstream files are account-scoped; a scheduler pick can land on any token,
+    so GET /v1/files/{id}/content 404ed whenever the picked token was not the
+    owner — the same broken flow B4 fixed for chat."""
+    calls = {"get_token": [], "pick_token": 0, "fetch_token": None, "released": False}
+    _files_content_scenario(calls, owner_id=2)
+    assert calls["fetch_token"] == "tok-2", \
+        f"content must be fetched with the OWNER token, got {calls['fetch_token']}"
+    assert calls["pick_token"] == 0, "the scheduler must not be consulted when an owner exists"
+    assert calls["released"], "the slot reservation must still be released"
+
+
+def test_files_content_falls_back_for_legacy_ids():
+    """Unregistered (legacy) ids keep the scheduler pick — nothing better exists."""
+    calls = {"get_token": [], "pick_token": 0, "fetch_token": None, "released": False}
+    _files_content_scenario(calls, owner_id=2, register=False)
+    assert calls["pick_token"] == 1, "legacy ids must fall back to the scheduler"
+    assert calls["fetch_token"] == "tok-1", calls
+
+
+def test_files_content_falls_back_when_owner_token_gone():
+    """A registered owner whose token row was deleted must not wedge retrieval."""
+    calls = {"get_token": [], "pick_token": 0, "fetch_token": None, "released": False}
+    _files_content_scenario(calls, owner_id=9, owner_row_exists=False)
+    assert calls["pick_token"] == 1, "a vanished owner token must fall back to the scheduler"
+    assert calls["fetch_token"] == "tok-1", calls
+
+
 TESTS = [
     test_record_and_lookup_first_owner_wins,
     test_referenced_file_ids_scan,
     test_rehome_replaces_foreign_and_keeps_owned,
     test_chat_prefers_file_owner_token_on_first_turn,
+    test_files_content_prefers_owner_token,
+    test_files_content_falls_back_for_legacy_ids,
+    test_files_content_falls_back_when_owner_token_gone,
 ]
 
 

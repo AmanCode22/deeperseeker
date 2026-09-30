@@ -1441,9 +1441,21 @@ async def files_upload(request: Request):
 async def files_content(file_id: str, request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
-    tok_id = await _db(pick_token)
-    if not tok_id:
-        return JSONResponse({"error": "No tokens available"}, status_code=503)
+    # B4 (Stage 1 review, finding 2): uploads are pinned to their token and
+    # upstream files are account-scoped, so fetching with a scheduler-picked
+    # token 404s whenever that token is not the owner — the same broken flow
+    # B4 already fixed for chat. Prefer the registered owner and fall back to
+    # the scheduler only for legacy/unregistered ids (or an owner whose token
+    # row has since been removed).
+    tok_id = await _db(get_file_token, file_id)
+    if tok_id is not None:
+        tok = await _db(get_token, tok_id)
+        if tok is None:
+            tok_id = None  # owner's token row is gone — degrade to the scheduler
+    if tok_id is None:
+        tok_id = await _db(pick_token)
+        if not tok_id:
+            return JSONResponse({"error": "No tokens available"}, status_code=503)
     tok = await _db(get_token, tok_id)
     if not tok:
         return JSONResponse({"error": "Token not found"}, status_code=503)
