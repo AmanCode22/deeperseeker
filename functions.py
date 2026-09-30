@@ -113,6 +113,9 @@ def init_db():
         conn.execute("ALTER TABLE tokens ADD COLUMN rate_limited_until REAL")
     if "last_used" not in existing_cols:
         conn.execute("ALTER TABLE tokens ADD COLUMN last_used REAL")
+    existing_session_cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+    if "last_used" not in existing_session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN last_used REAL")
     conn.commit()
     conn.close()
     try:
@@ -583,6 +586,12 @@ def mark_active(token_id):
 def find_session(sig):
     conn = get_db()
     row = conn.execute("SELECT token_id, deepseek_session_id, parent_message_id FROM sessions WHERE signature = ?", (sig,)).fetchone()
+    if row:
+        # B13: touch on read so pruning evicts by real recency of USE, not by
+        # insertion order — long-running chats get older rows every turn, and
+        # they are precisely the sessions pruning must protect.
+        conn.execute("UPDATE sessions SET last_used = ? WHERE signature = ?", (time.time(), sig))
+        conn.commit()
     conn.close()
     if row:
         return {"token_id": row[0], "session_id": row[1], "parent_message_id": row[2]}
@@ -593,7 +602,9 @@ def find_session(sig):
 # ever removed them, so after many chats the SQLite file (and its WAL) grew
 # unbounded — on volume-limited deployments a full disk freezes ALL requests,
 # including brand-new chats. PRUNE_EVERY saves trigger a prune that keeps the
-# newest MAX_SESSIONS rows (rowid order = insertion order).
+# MAX_SESSIONS MOST-RECENTLY-USED rows (B13: by last_used, not insertion
+# order — the old rowid policy evicted long-running chats, the most valuable
+# sessions, exactly because they hold the oldest rows).
 MAX_SESSIONS = int(os.getenv("DEEPSEEKER_MAX_SESSIONS", "20000"))
 PRUNE_EVERY = int(os.getenv("DEEPSEEKER_PRUNE_EVERY", "500"))
 _save_counter = {"n": 0}
@@ -602,11 +613,16 @@ _save_counter = {"n": 0}
 def prune_sessions():
     conn = get_db()
     try:
-        deleted = conn.execute(
-            "DELETE FROM sessions WHERE rowid NOT IN "
-            "(SELECT rowid FROM sessions ORDER BY rowid DESC LIMIT ?)",
-            (MAX_SESSIONS,),
-        ).rowcount
+        total = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        deleted = 0
+        if total > MAX_SESSIONS:
+            # B13: evict LEAST-RECENTLY-USED. NULL last_used (never re-hit)
+            # sorts as 0, i.e. evicted first; rowid breaks ties deterministically.
+            deleted = conn.execute(
+                "DELETE FROM sessions WHERE rowid IN "
+                "(SELECT rowid FROM sessions ORDER BY COALESCE(last_used, 0) ASC, rowid ASC LIMIT ?)",
+                (total - MAX_SESSIONS,),
+            ).rowcount
         deleted_map = conn.execute(
             "DELETE FROM session_map WHERE created_at < datetime('now', '-7 days')"
         ).rowcount
