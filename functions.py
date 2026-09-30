@@ -87,6 +87,11 @@ def init_db():
             token_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS files (
+            file_id TEXT PRIMARY KEY,
+            token_id INTEGER,
+            created_at REAL
+        );
     """)
     # B3 (Stage 1 audit) migration: pool cooldown + usage tracking. Older
     # databases miss the columns; the ALTERs are idempotent behind the
@@ -624,6 +629,39 @@ def delete_sessions_for_chat(token_id, session_id):
     conn.execute("DELETE FROM sessions WHERE token_id = ? AND deepseek_session_id = ?", (token_id, session_id))
     conn.commit()
     conn.close()
+
+
+# ==============================================================================
+# B4 (Stage 1 audit) — file ownership registry
+#
+# /v1/files uploads picked a RANDOM token and upstream files are
+# account-scoped, so a later /v1/chat/completions referencing that file_id
+# could pick a different token and get "file not found" — the OpenAI-style
+# upload->reference flow (Claude Code / Cline file flows) was broken by
+# design. Uploads are now pinned to their token; chat handlers prefer the
+# file-owner token on the first turn and re-home foreign references onto the
+# chat's own token on later turns.
+# ==============================================================================
+
+
+def record_file(file_id, token_id):
+    """Pin an upstream file_id to the token (account) that owns it.
+    First owner wins: INSERT OR IGNORE keeps the original mapping stable."""
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO files (file_id, token_id, created_at) VALUES (?, ?, ?)",
+        (file_id, token_id, time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_file_token(file_id):
+    """Return the token id that owns an uploaded file_id, or None."""
+    conn = get_db()
+    row = conn.execute("SELECT token_id FROM files WHERE file_id = ?", (file_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
 # DeepSeek now serves a single model (v4.1flash) as the website default. The

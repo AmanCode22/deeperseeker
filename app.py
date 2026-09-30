@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -53,6 +54,8 @@ from functions import (
     parse_tools,
     pick_token,
     acquire_token_slot,
+    record_file,
+    get_file_token,
     save_session,
     send_message,
     StreamToolParser,
@@ -385,6 +388,88 @@ def _api_error_response(e, is_anthropic=False):
     return JSONResponse(payload, status_code=code)
 
 
+def _referenced_file_ids(messages):
+    """File ids referenced by the conversation (uploaded earlier via /v1/files
+    or Anthropic file sources). Pure scan, no I/O — used to prefer the
+    file-owner token and to detect foreign-owned references (B4)."""
+    ids = []
+    for m in messages:
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        for part in c:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "file" and isinstance(part.get("file"), dict) and part["file"].get("file_id"):
+                ids.append(part["file"]["file_id"])
+            elif (
+                part.get("type") in ("document", "image")
+                and isinstance(part.get("source"), dict)
+                and part["source"].get("type") == "file"
+                and part["source"].get("file_id")
+            ):
+                ids.append(part["source"]["file_id"])
+    return ids
+
+
+async def _copy_file_to_token(file_id, fetch_token, target_token):
+    """Fetch a file's bytes with fetch_token and upload them to the account of
+    target_token (B4 re-home). Returns the new file_id, or None on failure."""
+    mime = None
+    chunks = []
+    size = 0
+    try:
+        gen = get_file_content(fetch_token, file_id)
+        mime = await gen.__anext__()  # first yield is the mime type
+        async for chunk in gen:
+            size += len(chunk)
+            if size > 25 * 1024 * 1024:
+                logger.warning("File ownership: re-home of %s aborted (over 25 MB)", file_id)
+                return None
+            chunks.append(chunk)
+    except StopAsyncIteration:
+        return None
+    except Exception:
+        logger.exception("File ownership: fetch of %s failed during re-home", file_id)
+        return None
+    ext = (mimetypes.guess_extension(mime) if mime else None) or ".bin"
+    filename = f"rehomed_{file_id}{ext}"
+    async for status, data in upload_file(b"".join(chunks), filename, mime or "application/octet-stream", target_token):
+        if status == "success":
+            return data["file_id"]
+    return None
+
+
+async def _rehome_foreign_files(file_ids, token_id, tok):
+    """Return file_ids usable by token_id's account (B4).
+
+    Uploads are pinned to their token and upstream files are account-scoped,
+    so a reference owned by another token would 404 at chat time. Foreign-owned
+    ids are copied onto this chat's token (fetch with the owner, upload with
+    the chat's token). Unknown (legacy, unregistered) ids pass through
+    unchanged — nothing better than the old behavior is possible for them."""
+    out = []
+    for fid in file_ids:
+        owner = get_file_token(fid)
+        if owner is None or owner == token_id:
+            out.append(fid)
+            continue
+        owner_tok = get_token(owner)
+        fetch_token = owner_tok["token"] if owner_tok else tok["token"]
+        new_id = await _copy_file_to_token(fid, fetch_token, tok["token"])
+        if new_id:
+            record_file(new_id, token_id)
+            logger.info(
+                "File ownership: re-uploaded file %s (token #%s) onto token #%s as %s",
+                fid, owner, token_id, new_id,
+            )
+            out.append(new_id)
+        else:
+            # Best effort: keep the original reference rather than dropping it.
+            out.append(fid)
+    return out
+
+
 def _replay_stream(gen, first):
     async def _wrapped():
         if first is not None:
@@ -423,6 +508,7 @@ async def handle_chat(
     sig = await generate_signature(messages, model, scope)
     sess = find_session(sig)
     rollover_summary = None
+    ref_ids = []  # B4: file ids referenced by the conversation (set by the create path)
 
     if sess:
 
@@ -454,6 +540,8 @@ async def handle_chat(
                         prompt = await build_prompt(messages, tools or [], model, is_first_message=True, rollover_summary=rollover_summary)
 
                         file_ids = await extract_and_upload_files(messages, new_tok["token"])
+                        for fid in file_ids:
+                            record_file(fid, new_token_id)
                         gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, file_ids)
                         gen = await _preflight_stream(gen)
                     except Exception as e:
@@ -510,6 +598,24 @@ async def handle_chat(
                 token_id = pick_token()
                 if not token_id:
                     return JSONResponse({"error": "No tokens available"}, status_code=503)
+                # B4: upstream files are account-scoped. If the conversation's
+                # first turn references uploaded files with a single known
+                # owner, run the chat on that token — a scheduler pick from a
+                # different account would get "file not found" upstream.
+                ref_ids = _referenced_file_ids(messages)
+                if ref_ids:
+                    owners = {get_file_token(fid) for fid in ref_ids}
+                    owners.discard(None)
+                    if len(owners) == 1:
+                        owner_id = owners.pop()
+                        if owner_id != token_id:
+                            owner_tok = get_token(owner_id)
+                            if owner_tok and owner_tok["status"] == "ACTIVE":
+                                logger.info(
+                                    "File ownership: chat references file(s) pinned to token #%s; using it",
+                                    owner_id,
+                                )
+                                token_id = owner_id
                 tok = get_token(token_id)
                 if not tok:
                     return JSONResponse({"error": "Token not found"}, status_code=503)
@@ -619,6 +725,16 @@ async def handle_chat(
         # section; for streams, ownership transfers to the response generator
         # via _release_chat_lock_stream (the final save_session happens there).
         file_ids = await extract_and_upload_files(messages, tok["token"], last_user_only=not is_first)
+        # B4: references pinned to another account would 404 upstream — copy
+        # them onto this chat's token. Fresh uploads from this request (and
+        # re-homed copies) are recorded; references that already have an owner
+        # keep it (first owner wins).
+        if file_ids:
+            ref_set = set(ref_ids)
+            file_ids = await _rehome_foreign_files(file_ids, token_id, tok)
+            for fid in file_ids:
+                if fid not in ref_set:
+                    record_file(fid, token_id)
         prompt = await build_prompt(messages, tools or [], model, is_first, rollover_summary=rollover_summary)
 
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, file_ids)
@@ -1141,6 +1257,9 @@ async def files_upload(request: Request):
             return JSONResponse({"error": "Upload failed"}, status_code=500)
     finally:
         slot.release()
+    # B4: pin the upload to the token that performed it so later chats can
+    # prefer (or re-home onto) the owning account.
+    record_file(file_info["file_id"], tok_id)
 
     if request.url.path.startswith("/v1/files/upload"):
         return {
