@@ -1006,7 +1006,10 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 # SDKs simply ignore it. Skipped on aborted/failed streams so a
                 # partial response never pollutes billing.
                 in_tokens = count_tok(_messages_text(messages))
-                out_tokens = count_tok(full_text)
+                # B7: usage on the cleaned completion, not raw full_text —
+                # think-tag reasoning and tool markup are not billed output.
+                usage_out = _completion_usage_text(clean_text, parsed_tools)
+                out_tokens = count_tok(usage_out) if usage_out else 0
                 yield f"data: {json.dumps({'choices': [], 'usage': {'prompt_tokens': in_tokens, 'completion_tokens': out_tokens, 'total_tokens': in_tokens + out_tokens}})}\n\n"
                 yield "data: [DONE]\n\n"
             except asyncio.CancelledError:
@@ -1099,7 +1102,9 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
             pass
     finally:
         parsed_tools, clean_text = parse_tools(full_text)
-        out_tokens = count_tok(full_text)
+        # B7: usage on the cleaned completion, not raw full_text.
+        usage_out = _completion_usage_text(clean_text, parsed_tools)
+        out_tokens = count_tok(usage_out) if usage_out else 0
 
         clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
         clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
@@ -1160,6 +1165,23 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                 pass
 
 
+def _completion_usage_text(clean_text, parsed_tools):
+    """Text whose token count is billed as completion tokens (B7, Stage 1 audit).
+
+    The cleaned reply — <think> reasoning and tool-call markup stripped — plus
+    the serialized tool-call arguments the client actually receives. Counting
+    the raw upstream text over-billed by the thinking+markup share, inflating
+    completion_tokens and every gateway cost derived from them."""
+    parts = [clean_text] if clean_text else []
+    for tc in parsed_tools or []:
+        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+        if fn.get("name"):
+            parts.append(str(fn["name"]))
+        if fn.get("arguments"):
+            parts.append(str(fn["arguments"]))
+    return "\n".join(parts)
+
+
 def format_response(text, model, messages, tools=None):
     from functions import DEEPSEEK_TARIFFS
     parsed_tools, clean_text = parse_tools(text)
@@ -1172,7 +1194,11 @@ def format_response(text, model, messages, tools=None):
     clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
 
     in_tokens = count_tok(_messages_text(messages))
-    out_tokens = count_tok(text)
+    # B7: bill the CLEANED completion (see _completion_usage_text), not the
+    # raw upstream text whose thinking + markup share the client never asked
+    # to pay for.
+    usage_text = _completion_usage_text(clean_text, parsed_tools)
+    out_tokens = count_tok(usage_text) if usage_text else 0
     tariff = DEEPSEEK_TARIFFS["deepseek-v4.1-flash"]
     cost = (in_tokens / 1_000_000 * tariff["cache_miss_input"]) + (out_tokens / 1_000_000 * tariff["output_generation"])
 
