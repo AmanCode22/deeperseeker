@@ -395,6 +395,91 @@ def test_handle_chat_rollover_seed_includes_tools_when_provided():
     assert "TOOL USE INSTRUCTIONS" in seed
 
 
+def test_chat_moved_branch_re_reads_parent_under_fresh_lock():
+    """Stage 1 review finding 3 (B1 residual): after FOLLOWING a moved chat,
+    the stored parent must be re-read under the NEW chat's lock.
+
+    The parent adopted in the moved branch was read while the OLD chat's lock
+    was still held; the awaits between that read and the new lock (get_token,
+    lock acquisition) open a window in which a same-signature request can
+    complete a turn on the moved chat. Sending with the stale parent forks
+    that turn — the exact bug class B1 closes. The rollover branch already
+    re-read after acquiring the fresh lock; the moved branch must too."""
+    import app
+
+    calls = {"sends": [], "created": []}
+    find_calls = {"n": 0}
+
+    def fake_find(sig):
+        find_calls["n"] += 1
+        if find_calls["n"] == 1:
+            return {"token_id": 1, "session_id": "chat-A", "parent_message_id": 5}
+        if find_calls["n"] == 2:
+            # a concurrent same-signature request rolled chat A over to chat B
+            return {"token_id": 1, "session_id": "chat-B", "parent_message_id": 0}
+        # ...and completed a turn on B while we waited for B's lock:
+        # the stored parent advanced to 7. Must be adopted, not 0.
+        return {"token_id": 1, "session_id": "chat-B", "parent_message_id": 7}
+
+    async def fake_sig(messages, model, scope=""):
+        return "sig-moved"
+
+    def fake_get_token(tid):
+        return {"id": tid, "token": f"tok-{tid}", "status": "ACTIVE"}
+
+    def fake_send(chat_id, token, message, parent, thinking=False, search=False, file_ids=None):
+        calls["sends"].append((chat_id, parent))
+
+        async def _gen():
+            yield "ok"
+        return _gen()
+
+    async def fake_create_chat(token):
+        calls["created"].append(1)
+        return f"chat-new-{len(calls['created'])}"
+
+    async def fake_files(messages, token, last_user_only=False):
+        return []
+
+    async def fake_prompt(messages, tools, model, is_first, rollover_summary=None):
+        return "prompt"
+
+    names = (
+        "get_auth_token", "generate_signature", "find_session", "get_token",
+        "send_message", "create_new_chat", "extract_and_upload_files",
+        "build_prompt", "save_session", "delete_sessions_for_chat",
+        "mark_active", "mark_limited", "parse_tools", "format_response",
+    )
+    originals = {n: getattr(app, n) for n in names}
+    try:
+        app.get_auth_token = lambda: "tok"
+        app.generate_signature = fake_sig
+        app.find_session = fake_find
+        app.get_token = fake_get_token
+        app.send_message = fake_send
+        app.create_new_chat = fake_create_chat
+        app.extract_and_upload_files = fake_files
+        app.build_prompt = fake_prompt
+        app.save_session = lambda *a, **k: None
+        app.delete_sessions_for_chat = lambda *a, **k: None
+        app.mark_active = lambda *a, **k: None
+        app.mark_limited = lambda *a, **k: None
+        app.parse_tools = lambda t: ([], t)
+        app.format_response = lambda text, model, messages, tools=None: text
+
+        app._chat_locks.clear()
+        result = asyncio.run(app.handle_chat([{"role": "user", "content": "hi"}], "v4.1flash"))
+    finally:
+        for n, fn in originals.items():
+            setattr(app, n, fn)
+        app._chat_locks.clear()
+
+    assert result == "ok"
+    assert calls["created"] == [], "following a moved chat must not create a new chat"
+    assert calls["sends"] == [("chat-B", 7)], \
+        f"send must target the moved chat with the RE-READ parent, got {calls['sends']}"
+
+
 TESTS = [
     test_small_conversation_no_rollover,
     test_large_accumulated_conversation_triggers_rollover,
@@ -415,6 +500,7 @@ TESTS = [
     test_env_formula_consistent,
     test_handle_chat_rollover_seeds_new_chat_with_summary,
     test_handle_chat_rollover_seed_includes_tools_when_provided,
+    test_chat_moved_branch_re_reads_parent_under_fresh_lock,
 ]
 
 

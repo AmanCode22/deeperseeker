@@ -800,6 +800,16 @@ async def handle_chat(
                     return JSONResponse({"error": "Token expired"}, status_code=503)
                 _set_key_name(tok.get("alias"))
                 lock_owner = await _own_chat_lock(session_id)
+                # B1 residual (Stage 1 review, finding 3): the parent adopted
+                # above was read while we still held the OLD chat's lock; the
+                # awaits since then (get_token, acquiring the NEW chat's lock)
+                # gave a same-signature request a window to complete a turn on
+                # this chat — sending with that stale parent would fork it,
+                # the exact bug class B1 closes. Re-read under the fresh lock,
+                # exactly like the rollover branch below.
+                fresh = await _db(find_session, sig)
+                if fresh and fresh["session_id"] == session_id:
+                    parent_message_id = fresh["parent_message_id"]
             else:
                 # Same chat: adopt the stored parent so a request that was
                 # queued behind a completed turn never re-sends a stale
