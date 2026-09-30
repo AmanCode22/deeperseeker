@@ -37,6 +37,7 @@ security = HTTPBasic()
 
 from functions import (
     CookieGenerationError,
+    UpstreamError,
     cookie_file_path,
     add_token,
     count_tokens,
@@ -382,8 +383,17 @@ def check_key(request: Request):
 
 
 def _upstream_http_code(exc):
-    m = re.match(r"HTTP (\d{3}):", str(exc))
-    return int(m.group(1)) if m else None
+    """HTTP status carried by an upstream failure (B6).
+
+    Typed UpstreamError exposes .status directly; anything else (connection-
+    level failures, cookie generation) maps to None and callers fall back to
+    502. The old str(e) regex parsing of the 'HTTP (\\d{3}):' prefix is gone —
+    any upstream wording change could silently disable token rotation and
+    rate-limit marking."""
+    status = getattr(exc, "status", None)
+    if isinstance(status, int) and 400 <= status <= 599:
+        return status
+    return None
 
 
 def _api_error_response(e, is_anthropic=False):

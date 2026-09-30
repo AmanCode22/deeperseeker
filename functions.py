@@ -186,7 +186,7 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
                 "Upstream POST %s -> HTTP %d on %s; failing over to fallback endpoint",
                 path, resp.status, base,
             )
-            last_exc = Exception(f"HTTP {resp.status}: {body[:200]}")
+            last_exc = UpstreamError(resp.status, body[:200])
             continue
         if attempt > 0:
             logger.info("Upstream POST %s succeeded on fallback endpoint %s", path, base)
@@ -235,6 +235,20 @@ _cookie_fail = {"until": 0.0, "error": ""}
 
 class CookieGenerationError(Exception):
     """Raised when the DeepSeek WAF cookie file cannot be produced."""
+
+
+class UpstreamError(Exception):
+    """Upstream DeepSeek failure carrying the HTTP status and body (B6).
+
+    Replaces the old Exception(f"HTTP {status}: ...") string protocol whose
+    'HTTP (\\d{3}):' regex parsing in app.py broke token rotation and error
+    mapping whenever a wording changed. Callers read .status directly; str()
+    keeps the familiar 'HTTP <status>: <body>' shape for logs."""
+
+    def __init__(self, status, body=""):
+        self.status = int(status)
+        self.body = str(body)
+        super().__init__(f"HTTP {self.status}: {self.body}")
 
 
 def _read_cookie_file():
@@ -1340,7 +1354,7 @@ def _raise_empty_sse_response(recent_lines, parsed_events):
             "DeepSeek SSE error event (not empty stream); last events: %s",
             recent_lines[-_SSE_RECENT_LINES:],
         )
-        raise Exception(f"HTTP {code}: {msg}")
+        raise UpstreamError(code, msg)
     if _sse_context_limit_hint(recent_lines, parsed_events):
         msg = _EMPTY_SSE_CONTEXT
     else:
@@ -1349,7 +1363,7 @@ def _raise_empty_sse_response(recent_lines, parsed_events):
         "DeepSeek SSE ended without assistant output; last events: %s",
         recent_lines[-_SSE_RECENT_LINES:],
     )
-    raise Exception(msg)
+    raise UpstreamError(502, msg)
 
 
 def _raise_sse_error_event(data, recent_lines):
@@ -1360,10 +1374,10 @@ def _raise_sse_error_event(data, recent_lines):
             "DeepSeek SSE error event (not empty stream); last events: %s",
             recent_lines[-_SSE_RECENT_LINES:],
         )
-        raise Exception(f"HTTP 429: {content}")
+        raise UpstreamError(429, content)
     if finish in ("permission_denied", "forbidden"):
-        raise Exception(f"HTTP 403: {content}")
-    raise Exception(f"HTTP 502: {content}")
+        raise UpstreamError(403, content)
+    raise UpstreamError(502, content)
 
 
 async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None):
@@ -1397,7 +1411,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
         if resp.status != 200:
             error_text = await resp.text()
             logger.warning("DeepSeek completion HTTP %d for chat %s: %s", resp.status, chat_id, error_text[:300])
-            raise Exception(f"HTTP {resp.status}: {error_text}")
+            raise UpstreamError(resp.status, error_text)
 
         recent_lines = []
         parsed_events = []

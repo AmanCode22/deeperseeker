@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import aiohttp
 
+import functions
 import middleware
 from middleware import (
     RecovererMiddleware,
@@ -800,7 +801,8 @@ def test_handle_chat_retry_surrenders_lock_before_recursing():
             # its body starts at the first __anext__ (inside _preflight_stream)
             calls["send"] += 1
             if calls["send"] == 1:
-                raise Exception("HTTP 503: upstream down")
+                # B6: typed upstream status — the old string protocol is gone
+                raise functions.UpstreamError(503, "upstream down")
 
             async def gen():
                 yield "hello "
