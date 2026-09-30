@@ -247,7 +247,7 @@ def test_handle_chat_rotates_to_another_token_on_429():
             return dict(session)
         return None
 
-    def fake_pick():
+    def fake_pick(*a, **k):
         return 2 if calls["send"] >= 1 else 1
 
     def fake_get_token(tid):

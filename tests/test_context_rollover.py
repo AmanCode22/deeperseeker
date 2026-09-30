@@ -305,7 +305,7 @@ def test_handle_chat_rollover_seeds_new_chat_with_summary():
     )}
     try:
         app.get_auth_token = lambda: "tok"
-        app.pick_token = lambda: 1
+        app.pick_token = lambda *a, **k: 1
         app.get_token = lambda tid: {"token": "tok", "status": "ACTIVE"}
         app.create_new_chat = fake_create_new_chat
         app.send_message = fake_send_message
@@ -371,7 +371,7 @@ def test_handle_chat_rollover_seed_includes_tools_when_provided():
     )}
     try:
         app.get_auth_token = lambda: "tok"
-        app.pick_token = lambda: 1
+        app.pick_token = lambda *a, **k: 1
         app.get_token = lambda tid: {"token": "tok", "status": "ACTIVE"}
         app.create_new_chat = fake_create_new_chat
         app.send_message = fake_send_message

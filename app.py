@@ -3,6 +3,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import secrets
 import time
@@ -223,7 +224,7 @@ def count_tok(text):
     return len(deepseek_tokenizer.ds_token.encode(text))
 
 
-async def _db(fn, *args):
+async def _db(fn, *args, **kwargs):
     """Run a blocking SQLite store helper off the event loop (B5, Stage 1 audit).
 
     Every sessions/tokens read + write used to run inline: under concurrent
@@ -232,7 +233,7 @@ async def _db(fn, *args):
     request (B5). to_thread keeps the store helpers sync (they are shared by
     CLI paths and tests) while the loop never blocks on disk I/O. The
     aiosqlite migration belongs to the store split (Stage 6)."""
-    return await asyncio.to_thread(fn, *args)
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 @asynccontextmanager
@@ -581,6 +582,14 @@ async def _preflight_stream(gen):
     return _replay_stream(gen, first)
 
 
+# B10 (Stage 1 audit): bounded retry budget for generic upstream failures
+# (empty SSE, transient 5xx, poisoned sessions): up to MAX_UPSTREAM_ATTEMPTS
+# total attempts, each preferring a DIFFERENT token than the one that just
+# failed, with jittered backoff between attempts. Exhausting the budget
+# returns the upstream error (502-class) with the redacted trace.
+MAX_UPSTREAM_ATTEMPTS = max(1, int(os.getenv("DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS", "3")))
+
+
 async def handle_chat(
     messages,
     model,
@@ -591,8 +600,9 @@ async def handle_chat(
     is_anthropic=False,
     req_model=None,
     scope="",
-    _retried=False,
+    _attempt=0,
     _auth_rotated=False,
+    _exclude_token=None,
 ):
     auth_token = await _db(get_auth_token)
     if not auth_token:
@@ -642,9 +652,9 @@ async def handle_chat(
                             rot_owner.release()
                         rot_slot.release()
                         logger.exception("Token-rotation recovery failed (chat %s): %s", session_id, e)
-                        if _retried:
+                        if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS:
                             return _api_error_response(e, is_anthropic)
-                        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
+                        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _attempt=_attempt + 1)
                     if stream:
                         gen = _release_chat_lock_stream(gen, rot_owner, rot_slot)
                         if is_anthropic:
@@ -658,9 +668,9 @@ async def handle_chat(
                             if rot_owner is not None:
                                 rot_owner.release()
                             rot_slot.release()
-                            if _retried:
+                            if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS:
                                 return _api_error_response(e, is_anthropic)
-                            return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
+                            return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _attempt=_attempt + 1)
                         await _db(mark_active, new_token_id)
                         rot_slot.release()
 
@@ -688,7 +698,13 @@ async def handle_chat(
         async with create_lock:
             sess = await _db(find_session, sig)
             if not sess:
-                token_id = await _db(pick_token)
+                # B10: the retry budget passes the id of the token that just
+                # failed so pick_token() rotates off it while any other token
+                # is available.
+                token_id = await _db(
+                    pick_token,
+                    exclude={_exclude_token} if _exclude_token is not None else None,
+                )
                 if not token_id:
                     return JSONResponse({"error": "No tokens available"}, status_code=503)
                 # B4: upstream files are account-scoped. If the conversation's
@@ -890,8 +906,9 @@ async def handle_chat(
                         is_anthropic,
                         req_model,
                         scope,
-                        _retried=_retried,
+                        _attempt=_attempt,
                         _auth_rotated=True,
+                        _exclude_token=token_id,
                     )
             logger.warning(
                 "Chat request rejected by upstream (session %s, parent %s): %s",
@@ -903,7 +920,9 @@ async def handle_chat(
 
         logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
         await _db(delete_sessions_for_chat, token_id, session_id)
-        if _retried:
+        if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS:
+            # B10: budget exhausted — surface the (already redacted/truncated)
+            # upstream error instead of retrying forever.
             return _api_error_response(e, is_anthropic)
         # PR #26 review fix (Blocker 2 — retry self-deadlock): the recursive
         # call can resolve to the SAME chat (the retry re-derives the session
@@ -915,6 +934,10 @@ async def handle_chat(
         # a no-op, the retry re-acquires cleanly, and queued same-chat requests
         # are no longer starved for the entire retry either.
         lock_owner.release()
+        # B10: jittered backoff, then retry on a DIFFERENT token — the old
+        # single retry re-entered pick_token()'s random draw and could land on
+        # the same poisoned token/session again (the #33 symptom persisting).
+        await asyncio.sleep(random.uniform(0.25, 0.75) * (1.5 ** _attempt))
         return await handle_chat(
             messages,
             model,
@@ -925,8 +948,9 @@ async def handle_chat(
             is_anthropic,
             req_model,
             scope,
-            _retried=True,
+            _attempt=_attempt + 1,
             _auth_rotated=_auth_rotated,
+            _exclude_token=token_id,
         )
     finally:
         if not lock_transferred:
