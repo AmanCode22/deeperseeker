@@ -21,23 +21,35 @@ except ImportError:
 
 logger = logging.getLogger("deeperseeker.functions")
 
-wasm_path = "wasm/deepseek_pow_solver.wasm"
+# B12 (Stage 1 audit): all relative runtime paths are anchored to the package
+# directory — the old global os.chdir(BASE_DIR) at import mutated process-wide
+# state (hostile to embedding, testing and PyPI packaging).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+wasm_path = os.path.join(BASE_DIR, "wasm", "deepseek_pow_solver.wasm")
 _session = None
-_db = os.getenv("DB_PATH", "deeperseeker.db")
+_db = os.getenv("DB_PATH") or os.path.join(BASE_DIR, "deeperseeker.db")
+
+
+def data_dir():
+    """Directory holding the SQLite database (and runtime files stored next to
+    it, e.g. the generated API key). Honors DB_PATH; anchored to the package
+    directory by default so nothing depends on the process CWD."""
+    return os.path.dirname(os.path.abspath(_db))
 
 
 def cookie_file_path():
     """Resolve where the DeepSeek cookie file lives.
 
     Order: DEEPSEEKER_COOKIE_PATH env > the target of a legacy Docker symlink
-    > next to the real DB file (which honors DB_PATH) > CWD. Writing goes to
-    the RESOLVED path so os.replace() can never destroy a symlink that bridges
-    the file into the persistent data volume.
+    > next to the real DB file (which honors DB_PATH) > the package directory.
+    Writing goes to the RESOLVED path so os.replace() can never destroy a
+    symlink that bridges the file into the persistent data volume.
     """
     p = os.getenv("DEEPSEEKER_COOKIE_PATH")
     if p:
         return p
-    p = "aws_cookies_deepseek.json"
+    p = os.path.join(BASE_DIR, "aws_cookies_deepseek.json")
     try:
         if os.path.islink(p):
             target = os.path.realpath(p)
