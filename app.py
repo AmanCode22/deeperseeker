@@ -1229,9 +1229,6 @@ def format_response(text, model, messages, tools=None):
     }
 
 
-format_openai_response = format_response
-
-
 def format_anthropic_response(result, model):
     choice = result["choices"][0]
     msg = choice["message"]
