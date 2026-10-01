@@ -5,6 +5,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import functions  # noqa: E402
+
 
 class _FakeStream:
     def __init__(self, chunks):
@@ -245,7 +247,7 @@ def test_handle_chat_rotates_to_another_token_on_429():
             return dict(session)
         return None
 
-    def fake_pick():
+    def fake_pick(*a, **k):
         return 2 if calls["send"] >= 1 else 1
 
     def fake_get_token(tid):
@@ -256,7 +258,8 @@ def test_handle_chat_rotates_to_another_token_on_429():
         if calls["send"] == 1:
 
             async def fail_gen():
-                raise Exception("HTTP 429: Messages too frequent. Try again later.")
+                # B6: typed upstream status — the old string protocol is gone
+                raise functions.UpstreamError(429, "Messages too frequent. Try again later.")
                 yield ""  # pragma: no cover
 
             return fail_gen()
