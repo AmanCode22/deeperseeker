@@ -85,8 +85,8 @@ def test_chunk_envelope_fields():
     lines = _run_stream()
     payloads = _data_payloads(lines)
     # Only choices-bearing chunks carry the envelope. The trailing usage chunk
-    # intentionally uses an empty choices array (see test_stream_usage.py) and is
-    # left untouched by this change.
+    # keeps the empty choices array (see test_stream_usage.py) while carrying
+    # the same shared id/created envelope as the rest of the stream.
     for p in payloads:
         if not p.get("choices"):
             continue
