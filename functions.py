@@ -21,23 +21,35 @@ except ImportError:
 
 logger = logging.getLogger("deeperseeker.functions")
 
-wasm_path = "wasm/deepseek_pow_solver.wasm"
+# B12 (Stage 1 audit): all relative runtime paths are anchored to the package
+# directory — the old global os.chdir(BASE_DIR) at import mutated process-wide
+# state (hostile to embedding, testing and PyPI packaging).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+wasm_path = os.path.join(BASE_DIR, "wasm", "deepseek_pow_solver.wasm")
 _session = None
-_db = os.getenv("DB_PATH", "deeperseeker.db")
+_db = os.getenv("DB_PATH") or os.path.join(BASE_DIR, "deeperseeker.db")
+
+
+def data_dir():
+    """Directory holding the SQLite database (and runtime files stored next to
+    it, e.g. the generated API key). Honors DB_PATH; anchored to the package
+    directory by default so nothing depends on the process CWD."""
+    return os.path.dirname(os.path.abspath(_db))
 
 
 def cookie_file_path():
     """Resolve where the DeepSeek cookie file lives.
 
     Order: DEEPSEEKER_COOKIE_PATH env > the target of a legacy Docker symlink
-    > next to the real DB file (which honors DB_PATH) > CWD. Writing goes to
-    the RESOLVED path so os.replace() can never destroy a symlink that bridges
-    the file into the persistent data volume.
+    > next to the real DB file (which honors DB_PATH) > the package directory.
+    Writing goes to the RESOLVED path so os.replace() can never destroy a
+    symlink that bridges the file into the persistent data volume.
     """
     p = os.getenv("DEEPSEEKER_COOKIE_PATH")
     if p:
         return p
-    p = "aws_cookies_deepseek.json"
+    p = os.path.join(BASE_DIR, "aws_cookies_deepseek.json")
     try:
         if os.path.islink(p):
             target = os.path.realpath(p)
@@ -87,7 +99,23 @@ def init_db():
             token_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS files (
+            file_id TEXT PRIMARY KEY,
+            token_id INTEGER,
+            created_at REAL
+        );
     """)
+    # B3 (Stage 1 audit) migration: pool cooldown + usage tracking. Older
+    # databases miss the columns; the ALTERs are idempotent behind the
+    # pragma check.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(tokens)").fetchall()}
+    if "rate_limited_until" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN rate_limited_until REAL")
+    if "last_used" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN last_used REAL")
+    existing_session_cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+    if "last_used" not in existing_session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN last_used REAL")
     conn.commit()
     conn.close()
     try:
@@ -107,6 +135,18 @@ async def get_session():
                 logger.info("Opening shared aiohttp ClientSession")
                 _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15, sock_read=600))
     return _session
+
+
+async def close_session():
+    """Close the shared aiohttp ClientSession (Stage 1 minor list).
+
+    Called from app lifespan shutdown: without it, every uvicorn reload/exit
+    leaked the session's connector sockets and logged 'Unclosed client
+    session' warnings."""
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+    _session = None
 
 
 # ==============================================================================
@@ -173,12 +213,20 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
                 "Upstream POST %s -> HTTP %d on %s; failing over to fallback endpoint",
                 path, resp.status, base,
             )
-            last_exc = Exception(f"HTTP {resp.status}: {body[:200]}")
+            last_exc = UpstreamError(resp.status, body[:200])
             continue
         if attempt > 0:
             logger.info("Upstream POST %s succeeded on fallback endpoint %s", path, base)
         return resp
     raise last_exc if last_exc is not None else RuntimeError("post_with_failover: no endpoints configured")
+
+
+# B11 (Stage 1 audit): the Android client identity used to be hardcoded to one
+# version for ALL tokens — when DeepSeek's app moves, a single stale string
+# degrades every account simultaneously, and identical fingerprints correlate
+# bans. The version is env-configurable now; per-token identity profiles
+# (rotating UA/version/locale) remain a P1.
+DEEPSEEKER_CLIENT_VERSION = os.getenv("DEEPSEEKER_CLIENT_VERSION", "2.4.5")
 
 
 def get_headers(auth_token, pow=None):
@@ -190,7 +238,7 @@ def get_headers(auth_token, pow=None):
         "referer": "https://chat.deepseek.com/",
         "user-agent": "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 7)",
         "x-client-platform": "android",
-        "x-client-version": "2.4.5",
+        "x-client-version": DEEPSEEKER_CLIENT_VERSION,
         "x-client-locale": "en_US",
         "x-client-bundle-id": "com.deepseek.chat",
         "x-client-timezone-offset": _TZ_OFFSET,
@@ -222,6 +270,20 @@ _cookie_fail = {"until": 0.0, "error": ""}
 
 class CookieGenerationError(Exception):
     """Raised when the DeepSeek WAF cookie file cannot be produced."""
+
+
+class UpstreamError(Exception):
+    """Upstream DeepSeek failure carrying the HTTP status and body (B6).
+
+    Replaces the old Exception(f"HTTP {status}: ...") string protocol whose
+    'HTTP (\\d{3}):' regex parsing in app.py broke token rotation and error
+    mapping whenever a wording changed. Callers read .status directly; str()
+    keeps the familiar 'HTTP <status>: <body>' shape for logs."""
+
+    def __init__(self, status, body=""):
+        self.status = int(status)
+        self.body = str(body)
+        super().__init__(f"HTTP {self.status}: {self.body}")
 
 
 def _read_cookie_file():
@@ -384,28 +446,151 @@ def delete_token(token_id):
     conn.close()
 
 
-def pick_token():
+# ==============================================================================
+# B3 (Stage 1 audit) — token pool scheduler v2
+#
+# The old pool selected ACTIVE tokens with ORDER BY RANDOM() and, when every
+# token was RATE_LIMITED, fell back to the FIRST token by id. Consequences
+# (root cause of issue #32): a limited token never recovered while any other
+# token stayed ACTIVE, a single-token pool had no backoff at all, and
+# concurrent requests stampeded onto one account — uneven wear and a
+# ban-ladder accelerator. The scheduler now provides:
+#   * a rate_limited_until cooldown with automatic RATE_LIMITED -> ACTIVE
+#     recovery once the cooldown expires (flipped back on the next pick),
+#   * least-in-flight selection (spreads load instead of RANDOM()),
+#   * an idle-oldest tie-break (the never/least-recently-used token leads),
+#   * a soft per-token concurrency cap: capped tokens are only used when
+#     nothing else is free,
+#   * a soonest-to-recover fallback when every token is still cooling down.
+# ==============================================================================
+
+TOKEN_COOLDOWN_SECONDS = max(1, int(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "60")))
+TOKEN_CONCURRENCY_CAP = max(1, int(os.getenv("DEEPSEEKER_TOKEN_CONCURRENCY", "8")))
+
+# Per-token in-flight refcounts (per process; single event-loop worker). Every
+# send reserves one slot via acquire_token_slot() and releases it when the
+# request ends — success, upstream failure or client abort — mirroring the
+# ownership-transfer pattern of the per-chat locks.
+_in_flight = {}
+
+
+def _bump_in_flight(token_id, delta):
+    n = _in_flight.get(token_id, 0) + delta
+    if n > 0:
+        _in_flight[token_id] = n
+    else:
+        _in_flight.pop(token_id, None)
+
+
+class _TokenSlot:
+    """One in-flight reservation against a token. release() is once-only, so
+    transferring the slot to a streaming generator (exactly like the per-chat
+    lock owner) is safe by construction."""
+
+    __slots__ = ("token_id", "_held")
+
+    def __init__(self, token_id):
+        self.token_id = token_id
+        self._held = True
+        _bump_in_flight(token_id, +1)
+
+    def release(self):
+        if not self._held:
+            return
+        self._held = False
+        _bump_in_flight(self.token_id, -1)
+
+
+def acquire_token_slot(token_id):
+    """Reserve one in-flight slot for token_id; pair it with slot.release()."""
+    return _TokenSlot(token_id)
+
+
+def token_in_flight(token_id):
+    """Current in-flight request count for a token (selection signal)."""
+    return _in_flight.get(token_id, 0)
+
+
+def pick_token(exclude=None):
+    """Select the best available token (scheduler v2 — block comment above).
+
+    `exclude` (optional, B10) lists token ids the caller just saw fail: they
+    are avoided while ANY other token is available, so an empty-SSE retry
+    cannot land on the same poisoned token.
+    """
+    now = time.time()
     conn = get_db()
-    row = conn.execute("SELECT id FROM tokens WHERE status = 'ACTIVE' ORDER BY RANDOM() LIMIT 1").fetchone()
-    if row:
-        conn.close()
-        return row[0]
-    row = conn.execute("SELECT id FROM tokens ORDER BY id LIMIT 1").fetchone()
+    rows = conn.execute(
+        "SELECT id, status, rate_limited_until, last_used FROM tokens"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return None
+
+    excluded = set(exclude or ())
+    available = []
+    recovered = []
+    for tid, status, until, last_used in rows:
+        if status == "RATE_LIMITED" and until is not None and until > now:
+            continue  # still cooling down
+        if status == "RATE_LIMITED":
+            recovered.append(tid)  # cooldown expired -> auto-recover below
+        available.append((tid, last_used or 0.0))
+
+    pickable = [entry for entry in available if entry[0] not in excluded] or available
+    if pickable:
+        if recovered:
+            conn = get_db()
+            conn.executemany(
+                "UPDATE tokens SET status = 'ACTIVE', rate_limited_until = NULL WHERE id = ?",
+                [(tid,) for tid in recovered],
+            )
+            conn.commit()
+            conn.close()
+            logger.info("Token pool: cooldown expired, auto-recovered token(s) %s", recovered)
+
+        def _sort_key(entry):
+            tid, last_used = entry
+            in_flight = _in_flight.get(tid, 0)
+            # Soft cap: over-cap tokens sort behind every under-cap one.
+            over_cap = 1 if in_flight >= TOKEN_CONCURRENCY_CAP else 0
+            return (over_cap, in_flight, last_used, tid)
+
+        return min(pickable, key=_sort_key)[0]
+
+    # Every token is rate-limited and still cooling: pick the one that
+    # recovers first (bounded wait) instead of stampeding onto the lowest id
+    # with no backoff at all.
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id FROM tokens ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
+    ).fetchone()
     conn.close()
     return row[0] if row else None
 
 
 def mark_limited(token_id):
-    logger.warning("Token #%d marked RATE_LIMITED", token_id)
+    until = time.time() + TOKEN_COOLDOWN_SECONDS
+    logger.warning(
+        "Token #%d marked RATE_LIMITED for %ds (recovers automatically)",
+        token_id,
+        TOKEN_COOLDOWN_SECONDS,
+    )
     conn = get_db()
-    conn.execute("UPDATE tokens SET status = ? WHERE id = ?", ("RATE_LIMITED", token_id))
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = ? WHERE id = ?",
+        ("RATE_LIMITED", until, token_id),
+    )
     conn.commit()
     conn.close()
 
 
 def mark_active(token_id):
     conn = get_db()
-    conn.execute("UPDATE tokens SET status = ? WHERE id = ?", ("ACTIVE", token_id))
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL, last_used = ? WHERE id = ?",
+        ("ACTIVE", time.time(), token_id),
+    )
     conn.commit()
     conn.close()
 
@@ -413,6 +598,12 @@ def mark_active(token_id):
 def find_session(sig):
     conn = get_db()
     row = conn.execute("SELECT token_id, deepseek_session_id, parent_message_id FROM sessions WHERE signature = ?", (sig,)).fetchone()
+    if row:
+        # B13: touch on read so pruning evicts by real recency of USE, not by
+        # insertion order — long-running chats get older rows every turn, and
+        # they are precisely the sessions pruning must protect.
+        conn.execute("UPDATE sessions SET last_used = ? WHERE signature = ?", (time.time(), sig))
+        conn.commit()
     conn.close()
     if row:
         return {"token_id": row[0], "session_id": row[1], "parent_message_id": row[2]}
@@ -423,7 +614,9 @@ def find_session(sig):
 # ever removed them, so after many chats the SQLite file (and its WAL) grew
 # unbounded — on volume-limited deployments a full disk freezes ALL requests,
 # including brand-new chats. PRUNE_EVERY saves trigger a prune that keeps the
-# newest MAX_SESSIONS rows (rowid order = insertion order).
+# MAX_SESSIONS MOST-RECENTLY-USED rows (B13: by last_used, not insertion
+# order — the old rowid policy evicted long-running chats, the most valuable
+# sessions, exactly because they hold the oldest rows).
 MAX_SESSIONS = int(os.getenv("DEEPSEEKER_MAX_SESSIONS", "20000"))
 PRUNE_EVERY = int(os.getenv("DEEPSEEKER_PRUNE_EVERY", "500"))
 _save_counter = {"n": 0}
@@ -432,11 +625,16 @@ _save_counter = {"n": 0}
 def prune_sessions():
     conn = get_db()
     try:
-        deleted = conn.execute(
-            "DELETE FROM sessions WHERE rowid NOT IN "
-            "(SELECT rowid FROM sessions ORDER BY rowid DESC LIMIT ?)",
-            (MAX_SESSIONS,),
-        ).rowcount
+        total = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        deleted = 0
+        if total > MAX_SESSIONS:
+            # B13: evict LEAST-RECENTLY-USED. NULL last_used (never re-hit)
+            # sorts as 0, i.e. evicted first; rowid breaks ties deterministically.
+            deleted = conn.execute(
+                "DELETE FROM sessions WHERE rowid IN "
+                "(SELECT rowid FROM sessions ORDER BY COALESCE(last_used, 0) ASC, rowid ASC LIMIT ?)",
+                (total - MAX_SESSIONS,),
+            ).rowcount
         deleted_map = conn.execute(
             "DELETE FROM session_map WHERE created_at < datetime('now', '-7 days')"
         ).rowcount
@@ -493,6 +691,39 @@ def delete_sessions_for_chat(token_id, session_id):
     conn.execute("DELETE FROM sessions WHERE token_id = ? AND deepseek_session_id = ?", (token_id, session_id))
     conn.commit()
     conn.close()
+
+
+# ==============================================================================
+# B4 (Stage 1 audit) — file ownership registry
+#
+# /v1/files uploads picked a RANDOM token and upstream files are
+# account-scoped, so a later /v1/chat/completions referencing that file_id
+# could pick a different token and get "file not found" — the OpenAI-style
+# upload->reference flow (Claude Code / Cline file flows) was broken by
+# design. Uploads are now pinned to their token; chat handlers prefer the
+# file-owner token on the first turn and re-home foreign references onto the
+# chat's own token on later turns.
+# ==============================================================================
+
+
+def record_file(file_id, token_id):
+    """Pin an upstream file_id to the token (account) that owns it.
+    First owner wins: INSERT OR IGNORE keeps the original mapping stable."""
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO files (file_id, token_id, created_at) VALUES (?, ?, ?)",
+        (file_id, token_id, time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_file_token(file_id):
+    """Return the token id that owns an uploaded file_id, or None."""
+    conn = get_db()
+    row = conn.execute("SELECT token_id FROM files WHERE file_id = ?", (file_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
 # DeepSeek now serves a single model (v4.1flash) as the website default. The
@@ -584,7 +815,7 @@ def parse_tools(text):
         return any(s <= pos < e for s, e in fence_spans)
 
     param_names = {"command", "description", "file_path", "content", "path", "prompt", "query", "subject", "old_string", "new_string", "url", "input"}
-    tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_call|invoke|function_call)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
+    tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|invoke|function_calls?)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
     real_tool_matches = [tm for tm in tool_matches if not fenced(tm.start())]
 
     if real_tool_matches:
@@ -764,7 +995,7 @@ def parse_tools(text):
             clean_text = re.sub(json_pattern, "", clean_text, flags=re.DOTALL).strip()
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
-    clean_text = re.sub(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+    clean_text = _strip_wrapper_tags(clean_text).strip()
     return tools, clean_text
 
 
@@ -773,7 +1004,7 @@ def parse_tools(text):
 # StreamToolParser so a mismatched closer closes the open block instead of
 # hanging until flush(). [FIX 3]
 _TOOL_END_TAG_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call)\s*>",
+    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_calls?)\s*>",
     re.IGNORECASE,
 )
 
@@ -783,19 +1014,68 @@ _TOOL_END_TAG_RE = re.compile(
 # substring start tags; this regex accepts bars, the DSML marker and the
 # space in any combination.
 _STREAM_ENTRY_RE = re.compile(
-    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_call|invoke)\b[^>]*>",
+    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
     re.IGNORECASE,
 )
 
 # Orphan closers trailing a block already closed by the per-tag or family
 # fallback (e.g. "</｜｜DSML｜｜ calls>" after the inner invoke was flushed).
 _ORPHAN_CLOSER_RE = re.compile(
-    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_call|invoke)\s*[｜\|]{0,2}>",
+    r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_calls?|invoke)\s*[｜\|]{0,2}>",
     re.IGNORECASE,
 )
 
+# [FIX 5] Bare DSML marker: a "<｜｜DSML｜｜>" / "</｜｜DSML｜｜>" whose tag-name
+# slot is empty (nothing between the DSML marker and ">"). Every other cleanup
+# regex in this module requires an actual tag name (tool_calls/calls/invoke/
+# function_call/parameter), so these bare markers used to slip through and get
+# streamed to the client as literal text. Note the tag-name slot is required to
+# be EMPTY: "<｜｜DSML｜｜ invoke ...>" does not match and is left for the entry
+# regex.
+_BARE_DSML_MARKER_RE = re.compile(
+    r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*>",
+    re.IGNORECASE,
+)
+
+
+# Full wrapper-tag family (open or close, with an optional tag name). Used on
+# the non-streaming path and on flush() to strip wrapper noise; unlike
+# _ORPHAN_CLOSER_RE it also removes stray OPEN tags.
+_WRAPPER_TAG_RE = re.compile(
+    r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|function_calls?|invoke|parameter)[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def _strip_stray_markers(text: str) -> str:
+    """Prose path: drop bare DSML markers + orphan closers only.
+
+    Open tags are left untouched here so literal prose mentioning e.g.
+    "" is not silently deleted mid-stream.
+    """
+    if not text:
+        return text
+    text = _BARE_DSML_MARKER_RE.sub("", text)
+    return _ORPHAN_CLOSER_RE.sub("", text)
+
+
+def _strip_wrapper_tags(text: str) -> str:
+    """Wrapper path: drop the whole tag family (open or close) + bare markers."""
+    if not text:
+        return text
+    text = _BARE_DSML_MARKER_RE.sub("", text)
+    return _WRAPPER_TAG_RE.sub("", text)
+
+
+def _append_clean_text(results, text: str) -> None:
+    """Append cleaned prose, skipping empty deltas after marker stripping."""
+    cleaned = _strip_stray_markers(text)
+    if cleaned:
+        results.append({"text": cleaned})
+
+
 # Tag names _STREAM_ENTRY_RE can open on.
-_STREAM_ENTRY_TAGS = ("tool_calls", "tool_call", "function_call", "invoke", "calls")
+_STREAM_ENTRY_TAGS = ("tool_calls", "tool_call", "function_calls", "function_call", "invoke", "calls")
 
 def _skip_bars(text, pos):
     for _ in range(2):
@@ -892,7 +1172,7 @@ class StreamToolParser:
                 if m:
                     start = m.start()
                     if start > 0:
-                        results.append({"text": _ORPHAN_CLOSER_RE.sub("", self.buffer[:start])})
+                        _append_clean_text(results, self.buffer[:start])
                     self.buffer = self.buffer[start:]
                     tag_name = m.group(1).lower()
                     self._end_re = re.compile(
@@ -913,11 +1193,11 @@ class StreamToolParser:
                 )
                 if last_lt != -1 and hold:
                     if last_lt > 0:
-                        results.append({"text": _ORPHAN_CLOSER_RE.sub("", self.buffer[:last_lt])})
+                        _append_clean_text(results, self.buffer[:last_lt])
                     self.buffer = tail
                     break
                 if self.buffer:
-                    results.append({"text": _ORPHAN_CLOSER_RE.sub("", self.buffer)})
+                    _append_clean_text(results, self.buffer)
                 self.buffer = ""
                 break
         return results
@@ -925,7 +1205,7 @@ class StreamToolParser:
     def flush(self):
         out = []
         if self.buffer and not self.in_tool:
-            out.append({"text": self.buffer})
+            _append_clean_text(out, self.buffer)
         elif self.in_tool:
             # [FIX 1] Recover the tool before stripping: if the stream was cut
             # off before the closing tag arrived but the payload itself is
@@ -936,12 +1216,7 @@ class StreamToolParser:
                 for item in parsed:
                     out.append({"tool": item})
             elif not self.json_done:
-                stripped = re.sub(
-                    r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls|invoke|function_call|parameter)[^>]*>",
-                    "",
-                    self.buffer,
-                    flags=re.IGNORECASE,
-                ).strip()
+                stripped = _strip_wrapper_tags(self.buffer).strip()
                 if stripped:
                     out.append({"text": stripped})
             # With json_done set, whatever is left after the consumed JSON
@@ -1127,7 +1402,7 @@ def _raise_empty_sse_response(recent_lines, parsed_events):
             "DeepSeek SSE error event (not empty stream); last events: %s",
             recent_lines[-_SSE_RECENT_LINES:],
         )
-        raise Exception(f"HTTP {code}: {msg}")
+        raise UpstreamError(code, msg)
     if _sse_context_limit_hint(recent_lines, parsed_events):
         msg = _EMPTY_SSE_CONTEXT
     else:
@@ -1136,7 +1411,7 @@ def _raise_empty_sse_response(recent_lines, parsed_events):
         "DeepSeek SSE ended without assistant output; last events: %s",
         recent_lines[-_SSE_RECENT_LINES:],
     )
-    raise Exception(msg)
+    raise UpstreamError(502, msg)
 
 
 def _raise_sse_error_event(data, recent_lines):
@@ -1147,10 +1422,10 @@ def _raise_sse_error_event(data, recent_lines):
             "DeepSeek SSE error event (not empty stream); last events: %s",
             recent_lines[-_SSE_RECENT_LINES:],
         )
-        raise Exception(f"HTTP 429: {content}")
+        raise UpstreamError(429, content)
     if finish in ("permission_denied", "forbidden"):
-        raise Exception(f"HTTP 403: {content}")
-    raise Exception(f"HTTP 502: {content}")
+        raise UpstreamError(403, content)
+    raise UpstreamError(502, content)
 
 
 async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None):
@@ -1184,7 +1459,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
         if resp.status != 200:
             error_text = await resp.text()
             logger.warning("DeepSeek completion HTTP %d for chat %s: %s", resp.status, chat_id, error_text[:300])
-            raise Exception(f"HTTP {resp.status}: {error_text}")
+            raise UpstreamError(resp.status, error_text)
 
         recent_lines = []
         parsed_events = []

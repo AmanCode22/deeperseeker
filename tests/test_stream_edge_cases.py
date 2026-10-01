@@ -19,7 +19,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from functions import StreamToolParser, _is_plausible_stream_entry_prefix  # noqa: E402
+from functions import StreamToolParser, parse_tools  # noqa: E402
+from functions import _is_plausible_stream_entry_prefix  # noqa: E402
 from functions import _is_plausible_stream_closer_prefix  # noqa: E402
 
 OPEN = "<"  # guard against editor/tooling eating angle-bracket literals
@@ -296,6 +297,100 @@ def test_dsml_openers_parse_when_split_across_chunks():
             assert flush_tools == [] and streamed + flush_text == "", where
 
 
+def test_fix5_bare_dsml_markers_are_stripped():
+    """FIX 5: bare DSML markers (empty tag-name slot, e.g. </｜｜DSML｜｜>) used to
+    slip through every cleanup regex and leak as literal prose. They must be
+    dropped across any chunking, in opener/closer/paired shapes."""
+    fullwidth_bar = "\uff5c"
+    marker = fullwidth_bar * 2 + "DSML" + fullwidth_bar * 2
+    bare_open = "<" + marker + ">"
+    bare_close = "</" + marker + ">"
+    cases = [
+        ("bare_closer", "hello" + bare_close + "world", "helloworld"),
+        ("bare_opener", "a" + bare_open + "b", "ab"),
+        ("paired_bare", "x" + bare_open + bare_close + "y", "xy"),
+        ("closer_then_prose", bare_close + "just text", "just text"),
+    ]
+    for label, corpus, expected in cases:
+        for chunk_size in (1, 2, 3, len(corpus)):
+            where = f"{label} chunk={chunk_size}"
+            parser = StreamToolParser()
+            streamed, tools = feed_all(parser, corpus, chunk_size)
+            flush_text, flush_tools = flush_all(parser)
+            leaked = streamed + flush_text
+            assert tools == [] and flush_tools == [], where
+            assert leaked == expected, f"{where}: {leaked!r}"
+            assert "DSML" not in leaked, where
+
+
+def test_fix5_bare_markers_do_not_break_real_tool_calls():
+    """FIX 5: stray bare markers around a genuine invoke block are dropped
+    without disturbing the tool call or leaking wrapper text."""
+    fullwidth_bar = "\uff5c"
+    marker = fullwidth_bar * 2 + "DSML" + fullwidth_bar * 2
+    bare_noise = "</" + marker + ">"
+    param = xml('[LT]parameter name="command" string="true"[GT]ls -la[LT]/parameter[GT]')
+    tool = "<" + marker + 'invoke name="Bash">' + param + "</" + marker + "invoke>"
+    corpus = "intro" + bare_noise + tool + "outro"
+    for chunk_size in (1, 4, len(corpus)):
+        where = f"chunk={chunk_size}"
+        parser = StreamToolParser()
+        streamed, tools = feed_all(parser, corpus, chunk_size)
+        flush_text, flush_tools = flush_all(parser)
+        all_tools = tools + flush_tools
+        assert names(all_tools) == ["Bash"], f"{where}: {all_tools}"
+        assert args_of(all_tools) == {"command": "ls -la"}, where
+        leaked = streamed + flush_text
+        assert "DSML" not in leaked, f"{where}: {leaked!r}"
+
+
+def test_fix6_plural_function_calls_container_streams_clean():
+    """FIX 6: the plural wrapper <｜｜DSML｜｜ function_calls> (and its closer)
+    used to slip past every regex that only listed function_call (singular),
+    leaking the container tags as prose. The enclosed invoke must still parse
+    and no DSML text may leak."""
+    fullwidth_bar = "\uff5c"
+    marker = fullwidth_bar * 2 + "DSML" + fullwidth_bar * 2
+    param = xml('[LT]parameter name="command" string="true"[GT]ls -la[LT]/parameter[GT]')
+    tool = "<" + marker + 'invoke name="Bash">' + param + "</" + marker + "invoke>"
+    corpus = (
+        "<" + marker + " function_calls>"
+        + tool
+        + "</" + marker + " function_calls>"
+    )
+    for chunk_size in (1, 2, 5, len(corpus)):
+        where = f"chunk={chunk_size}"
+        parser = StreamToolParser()
+        streamed, tools = feed_all(parser, corpus, chunk_size)
+        flush_text, flush_tools = flush_all(parser)
+        all_tools = tools + flush_tools
+        assert names(all_tools) == ["Bash"], f"{where}: {all_tools}"
+        assert args_of(all_tools) == {"command": "ls -la"}, where
+        leaked = streamed + flush_text
+        assert "DSML" not in leaked, f"{where}: {leaked!r}"
+        assert "function_calls" not in leaked, f"{where}: {leaked!r}"
+
+
+def test_fix6_plural_function_calls_parse_tools():
+    """FIX 6: non-streaming parse_tools also handles the plural container and
+    removes it from the companion text."""
+    fullwidth_bar = "\uff5c"
+    marker = fullwidth_bar * 2 + "DSML" + fullwidth_bar * 2
+    param = xml('[LT]parameter name="command" string="true"[GT]ls -la[LT]/parameter[GT]')
+    tool = "<" + marker + 'invoke name="Bash">' + param + "</" + marker + "invoke>"
+    corpus = (
+        "before <" + marker + " function_calls>"
+        + tool
+        + "</" + marker + " function_calls> after"
+    )
+    parsed, clean = parse_tools(corpus)
+    assert names(parsed) == ["Bash"], parsed
+    assert args_of(parsed) == {"command": "ls -la"}, parsed
+    assert "DSML" not in clean, clean
+    assert "function_calls" not in clean, clean
+    assert clean == "before  after", repr(clean)
+
+
 TESTS = [
     test_fix1_flush_salvages_attribute_style_tool,
     test_fix1_flush_salvages_truncated_json_tool,
@@ -310,6 +405,10 @@ TESTS = [
     test_flush_is_terminal_and_resets_state,
     test_complete_blocks_unchanged,
     test_dsml_openers_parse_when_split_across_chunks,
+    test_fix5_bare_dsml_markers_are_stripped,
+    test_fix5_bare_markers_do_not_break_real_tool_calls,
+    test_fix6_plural_function_calls_container_streams_clean,
+    test_fix6_plural_function_calls_parse_tools,
 ]
 
 

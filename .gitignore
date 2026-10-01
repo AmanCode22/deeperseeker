@@ -5,3 +5,6 @@ deeperseeker.db
 .venv/
 .env
 .omo/
+api_key.txt
+deeperseeker.db-wal
+deeperseeker.db-shm
