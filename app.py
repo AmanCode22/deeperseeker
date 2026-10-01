@@ -1017,17 +1017,24 @@ async def _hold_think_tags(gen):
         yield carry
 
 
-def _chat_chunk(choices, cid=None, created=None):
+def _chat_chunk(choices, cid, created, model):
     """Build an OpenAI chat.completion.chunk with all fields strict clients require.
 
     Some clients (Vercel AI SDK used by Trilium, Zed) validate every streamed
     chunk against OpenAI's schema and reject frames missing `index` (and often
     `id`/`object`/`created`). Emit them all so the stream is spec-conformant.
+
+    cid/created are REQUIRED on purpose: one completion must be exactly one
+    id/created, generated once per stream and threaded through every chunk.
+    A silent `cid or ("chatcmpl-" + uuid4())` fallback minted a fresh id per
+    chunk (the Stage 2 bug) — a call site that forgets to pass cid must now
+    fail loudly instead of corrupting the stream.
     """
     return {
-        "id": cid or ("chatcmpl-" + uuid.uuid4().hex),
+        "id": cid,
         "object": "chat.completion.chunk",
-        "created": created or int(time.time()),
+        "created": created,
+        "model": model,
         "choices": choices,
     }
 
@@ -1067,10 +1074,10 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 think_part = parts[0]
                 chunk = parts[1].lstrip("\n") if len(parts) > 1 else ""
                 if think_part:
-                    yield f"data: {json.dumps(_chat_chunk([_choice({'reasoning_content': think_part})], cid=cid, created=created))}\n\n"
+                    yield f"data: {json.dumps(_chat_chunk([_choice({'reasoning_content': think_part})], cid=cid, created=created, model=model))}\n\n"
 
             if is_thinking and chunk:
-                yield f"data: {json.dumps(_chat_chunk([_choice({'reasoning_content': chunk})], cid=cid, created=created))}\n\n"
+                yield f"data: {json.dumps(_chat_chunk([_choice({'reasoning_content': chunk})], cid=cid, created=created, model=model))}\n\n"
                 continue
 
             if end_thinking and not chunk:
@@ -1078,7 +1085,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
 
             for r in parser.feed(chunk):
                 if "text" in r:
-                    yield f"data: {json.dumps(_chat_chunk([_choice({'content': r['text']})], cid=cid, created=created))}\n\n"
+                    yield f"data: {json.dumps(_chat_chunk([_choice({'content': r['text']})], cid=cid, created=created, model=model))}\n\n"
         await _db(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
         aborted = True
@@ -1131,16 +1138,16 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 if not parsed_tools:
                     for r in parser.flush():
                         if "text" in r:
-                            yield f"data: {json.dumps(_chat_chunk([_choice({'content': r['text']})], cid=cid, created=created))}\n\n"
+                            yield f"data: {json.dumps(_chat_chunk([_choice({'content': r['text']})], cid=cid, created=created, model=model))}\n\n"
 
                 if parsed_tools:
                     for i, tc in enumerate(parsed_tools):
                         delta_tc = {"index": i, "id": tc["id"], "type": "function",
                                     "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
-                        yield f"data: {json.dumps(_chat_chunk([_choice({'tool_calls': [delta_tc]})], cid=cid, created=created))}\n\n"
-                    yield f"data: {json.dumps(_chat_chunk([_choice({}, finish_reason='tool_calls')], cid=cid, created=created))}\n\n"
+                        yield f"data: {json.dumps(_chat_chunk([_choice({'tool_calls': [delta_tc]})], cid=cid, created=created, model=model))}\n\n"
+                    yield f"data: {json.dumps(_chat_chunk([_choice({}, finish_reason='tool_calls')], cid=cid, created=created, model=model))}\n\n"
                 else:
-                    yield f"data: {json.dumps(_chat_chunk([_choice({}, finish_reason='stop')], cid=cid, created=created))}\n\n"
+                    yield f"data: {json.dumps(_chat_chunk([_choice({}, finish_reason='stop')], cid=cid, created=created, model=model))}\n\n"
                 # OpenAI-compatible gateways (New API, sub2api, ...) read billing
                 # usage from the trailing usage chunk. Always emit it here so
                 # clients that omit stream_options.include_usage still get counted:
@@ -1152,7 +1159,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 # think-tag reasoning and tool markup are not billed output.
                 usage_out = _completion_usage_text(clean_text, parsed_tools)
                 out_tokens = count_tok(usage_out) if usage_out else 0
-                usage_chunk = _chat_chunk([], cid=cid, created=created)
+                usage_chunk = _chat_chunk([], cid=cid, created=created, model=model)
                 usage_chunk["usage"] = {"prompt_tokens": in_tokens, "completion_tokens": out_tokens, "total_tokens": in_tokens + out_tokens}
                 yield f"data: {json.dumps(usage_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
