@@ -187,50 +187,29 @@ dependencies = [
     { name = "wasmtime" },
 ]
 
-[package.dev-dependencies]
+[package.optional-dependencies]
 dev = [
+    { name = "httpx" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.metadata]
+requires-dist = [
     { name = "aiohttp" },
     { name = "deepseek-tokenizer" },
     { name = "fastapi" },
-    { name = "httpx" },
+    { name = "httpx", marker = "extra == 'dev'" },
     { name = "jinja2" },
     { name = "playwright" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
+    { name = "pytest", marker = "extra == 'dev'" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'" },
     { name = "python-dotenv" },
     { name = "python-multipart" },
     { name = "uvicorn" },
     { name = "wasmtime" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.14.3" },
-    { name = "deepseek-tokenizer", specifier = ">=0.3.0" },
-    { name = "fastapi", specifier = ">=0.142.2" },
-    { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "playwright", specifier = ">=1.63.0" },
-    { name = "python-dotenv", specifier = ">=1.2.4" },
-    { name = "python-multipart", specifier = ">=0.0.32" },
-    { name = "uvicorn", specifier = ">=0.54.0" },
-    { name = "wasmtime", specifier = ">=49.0.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "aiohttp", specifier = ">=3.14.3" },
-    { name = "deepseek-tokenizer", specifier = ">=0.3.0" },
-    { name = "fastapi", specifier = ">=0.142.2" },
-    { name = "httpx", specifier = ">=0.28.1" },
-    { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "playwright", specifier = ">=1.63.0" },
-    { name = "pytest", specifier = ">=9.1.1" },
-    { name = "pytest-asyncio", specifier = ">=1.4.0" },
-    { name = "python-dotenv", specifier = ">=1.2.4" },
-    { name = "python-multipart", specifier = ">=0.0.32" },
-    { name = "uvicorn", specifier = ">=0.54.0" },
-    { name = "wasmtime", specifier = ">=49.0.0" },
-]
+provides-extras = ["dev"]
 
 [[package]]
 name = "deepseek-tokenizer"
