@@ -7,8 +7,6 @@ authors = [
     { name = "AmanCode22", email = "amanady125@gmail.com" }
 ]
 requires-python = ">=3.13"
-
-
 dynamic = ["dependencies", "optional-dependencies"]
 
 [project.scripts]
@@ -23,10 +21,48 @@ dev = ["requirements-dev.txt"]
 [tool.hatch.metadata.hooks.requirements_txt.options]
 pip_strict = false
 
-
 [tool.hatch.build.targets.wheel]
-packages = ["app.py", "functions.py", "middleware.py", "plugin_helper.py"]
+only-include = [
+    "app.py",
+    "functions.py",
+    "middleware.py",
+    "plugin_helper.py",
+    "static",
+    "templates",
+    "wasm",
+]
 
 [build-system]
 requires = ["hatchling", "hatch-requirements-txt"]
 build-backend = "hatchling.build"
+[tool.ruff]
+exclude = [
+    "__pycache__",
+    ".venv",
+    ".git",
+    ".ruff_cache",
+    "deeperseeker_env",
+    "deeperseeker-stages",
+    "wasm",
+]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",
+    "E402",
+    "BLE001",
+    "TRY002",
+    "TRY203",
+    "TRY401",
+    "S110",
+    "ASYNC230",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "RUF059",
+    "RUF015",
+]

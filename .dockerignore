@@ -8,5 +8,6 @@ __pycache__
 *.db
 *.db.bak
 aws_cookies_deepseek.json
-.codegraph
-.opencode
+.python-version
+.pytest_cache/
+.ruff_cache
