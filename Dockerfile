@@ -31,5 +31,6 @@ ENV HOST=0.0.0.0
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl -sf http://localhost:4000/health || exit 1
 
-
+# If reverting to backup Playwright cookie generation, run under xvfb:
+# CMD ["sh", "-c", "xvfb-run -a -s '-screen 0 1280x720x24' python3 app.py"]
 CMD ["python3", "app.py"]
