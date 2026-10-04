@@ -1,0 +1,8 @@
+wasmtime
+aiohttp
+uvicorn
+fastapi
+python-multipart
+jinja2
+deepseek-tokenizer
+python-dotenv

@@ -13,10 +13,12 @@ dynamic = ["dependencies", "optional-dependencies"]
 deeperseeker = "app:main"
 
 [tool.hatch.metadata.hooks.requirements_txt]
-files = ["requirements.txt"]
+files = ["requirements.in"]
 
 [tool.hatch.metadata.hooks.requirements_txt.optional-dependencies]
-dev = ["requirements-dev.txt"]
+waf-backup = ["requirements-waf-backup.in"]
+tests = ["requirements-tests.in"]
+dev = ["requirements-dev.in"]
 
 [tool.hatch.metadata.hooks.requirements_txt.options]
 pip_strict = false
@@ -35,6 +37,7 @@ only-include = [
 [build-system]
 requires = ["hatchling", "hatch-requirements-txt"]
 build-backend = "hatchling.build"
+
 [tool.ruff]
 exclude = [
     "__pycache__",
