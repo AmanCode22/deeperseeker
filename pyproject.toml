@@ -1,0 +1,43 @@
+[project]
+name = "deeperseeker"
+version = "6.0"
+description = "DeepSeek website reverse-proxy server with FastAPI, supporting OpenAI & Anthropic API standards."
+readme = "README.md"
+authors = [
+    { name = "AmanCode22", email = "amanady125@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "aiohttp>=3.14.3",
+    "deepseek-tokenizer>=0.3.0",
+    "fastapi>=0.142.2",
+    "jinja2>=3.1.6",
+    "playwright>=1.63.0",
+    "python-dotenv>=1.2.4",
+    "python-multipart>=0.0.32",
+    "uvicorn>=0.54.0",
+    "wasmtime>=49.0.0",
+]
+
+[project.scripts]
+deeperseeker = "app:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "aiohttp>=3.14.3",
+    "deepseek-tokenizer>=0.3.0",
+    "fastapi>=0.142.2",
+    "httpx>=0.28.1",
+    "jinja2>=3.1.6",
+    "playwright>=1.63.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "python-dotenv>=1.2.4",
+    "python-multipart>=0.0.32",
+    "uvicorn>=0.54.0",
+    "wasmtime>=49.0.0",
+]

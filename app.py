@@ -2032,6 +2032,14 @@ async def health(request: Request):
         data["cookies_valid"] = cookies_valid
     return JSONResponse(data, status_code=200 if ok else 503)
 
+def main():
+    """Entry point for the console script."""
+    uvicorn.run(
+        "app:app",
+        host=os.getenv("HOST", "127.0.0.1"),
+        port=int(os.getenv("PORT", "4000")),
+    )
+
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "4000")))
+    main()
