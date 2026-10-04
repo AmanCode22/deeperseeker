@@ -46,6 +46,7 @@ exclude = [
     ".ruff_cache",
     "deeperseeker_env",
     "deeperseeker-stages",
+    ".github",
     "wasm",
 ]
 line-length = 88
