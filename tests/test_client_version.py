@@ -6,6 +6,7 @@ version now comes from DEEPSEEKER_CLIENT_VERSION.
 
 Run:  python tests/test_client_version.py   (pytest-compatible)
 """
+
 import os
 import sys
 import unittest.mock as mock
@@ -28,12 +29,15 @@ def test_version_env_override():
         assert os.getenv("DEEPSEEKER_CLIENT_VERSION") == "9.9.9-test"
     with mock.patch.object(functions, "DEEPSEEKER_CLIENT_VERSION", "9.9.9-test"):
         headers = functions.get_headers("tok")
-    assert headers["x-client-version"] == "9.9.9-test", \
+    assert headers["x-client-version"] == "9.9.9-test", (
         "get_headers must read the module constant, not a hardcoded literal"
+    )
 
 
 def main():
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    tests = [
+        v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)
+    ]
     failed = 0
     for t in tests:
         try:

@@ -1,4 +1,3 @@
-
 import asyncio
 import copy
 import logging
@@ -8,10 +7,12 @@ import subprocess
 import sys
 import time
 import unicodedata
+
 import httpx
 import pytest
 import uvicorn
 from uvicorn.logging import AccessFormatter
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import (
@@ -23,15 +24,18 @@ from app import (
     lifespan,
 )
 
+
 # Test only routes so the e2e tests can record an alias without a real token.
 @app.get("/_test/alias-echo")
 async def _test_alias_echo(alias: str = ""):
     _set_key_name(alias)
     return {"ok": True}
 
+
 @app.get("/_test/no-alias")
 async def _test_no_alias():
     return {"ok": True}
+
 
 # sanitize_alias
 class TestSanitizeAlias:
@@ -85,8 +89,19 @@ class TestSanitizeAlias:
         # soft hyphen) plus the non Cf default ignorables and the noncharacters.
         spoofing = (
             [cp for cp in range(0x110000) if unicodedata.category(chr(cp)) == "Cf"]
-            + [0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D,
-               0x2800, 0x3164, 0xFFA0]
+            + [
+                0x034F,
+                0x115F,
+                0x1160,
+                0x17B4,
+                0x17B5,
+                0x180B,
+                0x180C,
+                0x180D,
+                0x2800,
+                0x3164,
+                0xFFA0,
+            ]
             + list(range(0xFE00, 0xFE10))
             + list(range(0xE0100, 0xE01F0))
             + list(range(0xFDD0, 0xFDF0))
@@ -123,6 +138,7 @@ class TestSanitizeAlias:
 
 # set_key_name
 
+
 class TestSetKeyName:
     def test_noop_when_no_holder_bound(self):
         # Background tasks etc. run outside the middleware - must not raise.
@@ -147,7 +163,11 @@ class TestSetKeyName:
             _set_key_name("evil\r\n\u0085\u2028\u2029\u202e\u200dINFO: forged")
             stored = _key_holder.get()["name"]
             assert "\n" not in stored and "\r" not in stored
-            assert "\u0085" not in stored and "\u2028" not in stored and "\u2029" not in stored
+            assert (
+                "\u0085" not in stored
+                and "\u2028" not in stored
+                and "\u2029" not in stored
+            )
             assert "\u202e" not in stored and "\u200d" not in stored
             assert stored == "evilINFO: forged"
         finally:
@@ -162,10 +182,15 @@ class TestSetKeyName:
         finally:
             _key_holder.reset(token)
 
+
 # KeyAccessFormatter
-def _make_access_record(client_addr="127.0.0.1:56744", method="POST",
-                         path="/v1/chat/completions", http_version="1.1",
-                         status_code=200):
+def _make_access_record(
+    client_addr="127.0.0.1:56744",
+    method="POST",
+    path="/v1/chat/completions",
+    http_version="1.1",
+    status_code=200,
+):
     return logging.LogRecord(
         name="uvicorn.access",
         level=logging.INFO,
@@ -175,6 +200,8 @@ def _make_access_record(client_addr="127.0.0.1:56744", method="POST",
         args=(client_addr, method, path, http_version, status_code),
         exc_info=None,
     )
+
+
 ACCESS_FMT = '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
 
 
@@ -216,16 +243,22 @@ class TestKeyAccessFormatter:
             line = self.formatter.format(_make_access_record())
             assert line.count("\n") == 0
             assert "\r" not in line
-            assert "\u0085" not in line and "\u2028" not in line and "\u2029" not in line
-            assert "\u202e" not in line and "\u2066" not in line and "\u200d" not in line
+            assert (
+                "\u0085" not in line and "\u2028" not in line and "\u2029" not in line
+            )
+            assert (
+                "\u202e" not in line and "\u2066" not in line and "\u200d" not in line
+            )
             assert line.endswith("key: evilINFO: forged")
         finally:
             _key_holder.reset(token)
+
 
 # No global monkeypatch left on the base class
 class TestNoGlobalMonkeypatch:
     def test_base_access_formatter_is_untouched(self):
         from uvicorn.logging import AccessFormatter
+
         # Must be a subclass, not a patch on the shared base class.
         assert KeyAccessFormatter is not AccessFormatter
         assert issubclass(KeyAccessFormatter, AccessFormatter)
@@ -237,6 +270,7 @@ class TestNoGlobalMonkeypatch:
     def test_unrelated_access_formatter_instance_unaffected(self):
         # Other AccessFormatter instances must not show our alias.
         from uvicorn.logging import AccessFormatter
+
         token = _key_holder.set({"name": "personal"})
         try:
             other = AccessFormatter(fmt=ACCESS_FMT, use_colors=False)
@@ -296,6 +330,7 @@ class TestStartupInstallsFormatter:
             pass
         assert self.handler.formatter is custom
 
+
 # The core assumption: a mutable dict survives BaseHTTPMiddleware's
 # separate task. If _key_holder ever stops being a dict, these tests fail.
 class TestContextPropagationAcrossTask:
@@ -303,6 +338,7 @@ class TestContextPropagationAcrossTask:
     async def test_mutation_in_child_task_visible_in_parent(self):
         token = _key_holder.set({})
         try:
+
             async def child():
                 # New asyncio Task = copied context, like call_next() does.
                 _set_key_name("personal")
@@ -318,6 +354,7 @@ class TestContextPropagationAcrossTask:
         # the same object does - hence _key_holder must stay a dict.
         token = _key_holder.set({"name": "original"})
         try:
+
             async def child():
                 _key_holder.set({"name": "replaced"})  # rebinding, not mutating
 
@@ -327,6 +364,7 @@ class TestContextPropagationAcrossTask:
         finally:
             _key_holder.reset(token)
 
+
 class _ListHandler(logging.Handler):
     def __init__(self):
         super().__init__()
@@ -335,10 +373,12 @@ class _ListHandler(logging.Handler):
     def emit(self, record):
         self.lines.append(self.format(record))
 
+
 def _free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
 
 @pytest.mark.asyncio
 async def test_end_to_end_real_access_log_shows_alias():
@@ -348,8 +388,9 @@ async def test_end_to_end_real_access_log_shows_alias():
     port = _free_port()
     # Stock uvicorn logging: no KeyAccessFormatter anywhere.
     log_config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
-    config = uvicorn.Config(app, host="127.0.0.1", port=port,
-                             log_config=log_config, log_level="info")
+    config = uvicorn.Config(
+        app, host="127.0.0.1", port=port, log_config=log_config, log_level="info"
+    )
     server = uvicorn.Server(config)
 
     handler = _ListHandler()
@@ -366,18 +407,23 @@ async def test_end_to_end_real_access_log_shows_alias():
         for h in access_logger.handlers:
             if h is handler or h in before:
                 continue
-            assert isinstance(h.formatter, KeyAccessFormatter), \
+            assert isinstance(h.formatter, KeyAccessFormatter), (
                 "uvicorn's own access handler must be upgraded at startup"
+            )
 
         async with httpx.AsyncClient() as client:
-            await client.get(f"http://127.0.0.1:{port}/_test/alias-echo",
-                              params={"alias": "personal"})
+            await client.get(
+                f"http://127.0.0.1:{port}/_test/alias-echo",
+                params={"alias": "personal"},
+            )
             await client.get(f"http://127.0.0.1:{port}/_test/no-alias")
             # Injection attempt: CRLF plus NEL/U+2028/U+2029 try to forge a
             # second log line.
             await client.get(
                 f"http://127.0.0.1:{port}/_test/alias-echo",
-                params={"alias": "evil\r\n\u0085\u2028\u2029\u202e\u200d\u2066\u00ad127.0.0.1:1 - \"GET /admin HTTP/1.1\" 200 OK"},
+                params={
+                    "alias": 'evil\r\n\u0085\u2028\u2029\u202e\u200d\u2066\u00ad127.0.0.1:1 - "GET /admin HTTP/1.1" 200 OK'
+                },
             )
     finally:
         server.should_exit = True
@@ -400,6 +446,7 @@ async def test_end_to_end_real_access_log_shows_alias():
         'key: evil127.0.0.1:1 - "GET /admin HTTP/1.1" 200 OK'
     )
 
+
 CLI_PROBE_SOURCE = """\
 from app import app, _set_key_name
 @app.get("/_probe")
@@ -407,6 +454,7 @@ async def _probe(alias: str = "cli"):
     _set_key_name(alias)
     return {"ok": True}
 """
+
 
 def test_cli_entrypoint_shows_alias(tmp_path):
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -421,10 +469,21 @@ def test_cli_entrypoint_shows_alias(tmp_path):
     env["PYTHONPATH"] = os.pathsep.join(path_parts)
 
     proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "cli_probe_app:app",
-         "--host", "127.0.0.1", "--port", str(port)],
-        cwd=repo_root, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "cli_probe_app:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
 
     response = None
@@ -432,8 +491,11 @@ def test_cli_entrypoint_shows_alias(tmp_path):
         deadline = time.time() + 20
         while time.time() < deadline and proc.poll() is None:
             try:
-                response = httpx.get(f"http://127.0.0.1:{port}/_probe",
-                                      params={"alias": "cli-probe"}, timeout=1)
+                response = httpx.get(
+                    f"http://127.0.0.1:{port}/_probe",
+                    params={"alias": "cli-probe"},
+                    timeout=1,
+                )
                 if response.status_code == 200:
                     break
             except httpx.TransportError:
@@ -470,6 +532,7 @@ class TestFilesRoutesStaleToken:
     @pytest.mark.asyncio
     async def test_files_upload_stale_token_returns_503(self, monkeypatch):
         import app as app_module
+
         monkeypatch.setattr(app_module, "pick_token", lambda: 1)
         monkeypatch.setattr(app_module, "get_token", lambda tid: None)
         request = _FakeRequest({"authorization": f"Bearer {app_module.API_KEY}"})
@@ -480,6 +543,7 @@ class TestFilesRoutesStaleToken:
     @pytest.mark.asyncio
     async def test_files_content_stale_token_returns_503(self, monkeypatch):
         import app as app_module
+
         monkeypatch.setattr(app_module, "pick_token", lambda: 1)
         monkeypatch.setattr(app_module, "get_token", lambda tid: None)
         request = _FakeRequest({"authorization": f"Bearer {app_module.API_KEY}"})

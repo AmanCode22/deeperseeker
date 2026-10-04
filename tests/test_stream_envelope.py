@@ -16,6 +16,7 @@ into the repo root.
 
 Run:  python tests/test_stream_envelope.py   (pytest-compatible)
 """
+
 import asyncio
 import json
 import os
@@ -46,9 +47,11 @@ def _stream(gen):
         generate_signature_sync=mock.DEFAULT,
         delete_sessions_for_chat=mock.DEFAULT,
     ):
-        return asyncio.run(_collect(app_module.stream_response(
-            gen, MODEL, MESSAGES, 1, "sess", "sig", []
-        )))
+        return asyncio.run(
+            _collect(
+                app_module.stream_response(gen, MODEL, MESSAGES, 1, "sess", "sig", [])
+            )
+        )
 
 
 def _payloads(chunks):
@@ -60,7 +63,7 @@ def _payloads(chunks):
     out = []
     for line in lines:
         if line.startswith("data: ") and line.strip() != "data: [DONE]":
-            out.append(json.loads(line[len("data: "):]))
+            out.append(json.loads(line[len("data: ") :]))
     return out
 
 
@@ -70,12 +73,18 @@ def test_stream_chunks_share_one_id_and_created():
     ids = {p["id"] for p in payloads}
     created = {p["created"] for p in payloads}
     assert len(ids) == 1, f"every chunk of a completion must share one id: {ids}"
-    assert len(created) == 1, f"every chunk of a completion must share one created: {created}"
+    assert len(created) == 1, (
+        f"every chunk of a completion must share one created: {created}"
+    )
     assert ids.pop().startswith("chatcmpl-")
     assert all(p["object"] == "chat.completion.chunk" for p in payloads), payloads
     assert all(p["model"] == MODEL for p in payloads), payloads
     # the finish chunk still terminates the choices array properly
-    finish = [p for p in payloads if p["choices"] and p["choices"][0]["finish_reason"] == "stop"]
+    finish = [
+        p
+        for p in payloads
+        if p["choices"] and p["choices"][0]["finish_reason"] == "stop"
+    ]
     assert len(finish) == 1, payloads
 
 
@@ -83,8 +92,14 @@ def test_think_and_content_chunks_share_the_envelope():
     payloads = _payloads(["<think>", "reasoning ", "</think>", "Visible ", "reply"])
     ids = {p["id"] for p in payloads}
     assert len(ids) == 1, ids
-    reasoning = [p for p in payloads if p["choices"] and "reasoning_content" in p["choices"][0]["delta"]]
-    content = [p for p in payloads if p["choices"] and "content" in p["choices"][0]["delta"]]
+    reasoning = [
+        p
+        for p in payloads
+        if p["choices"] and "reasoning_content" in p["choices"][0]["delta"]
+    ]
+    content = [
+        p for p in payloads if p["choices"] and "content" in p["choices"][0]["delta"]
+    ]
     assert reasoning and content, payloads
     assert reasoning[0]["id"] == content[0]["id"]
     assert reasoning[0]["model"] == content[0]["model"] == MODEL
@@ -96,7 +111,9 @@ def test_usage_chunk_carries_the_same_envelope():
     assert len(usage) == 1, payloads
     assert usage[0]["choices"] == [], "usage chunk must keep the empty choices array"
     first = [p for p in payloads if p["choices"]][0]
-    assert usage[0]["id"] == first["id"], "gateways match the usage chunk to the stream by id"
+    assert usage[0]["id"] == first["id"], (
+        "gateways match the usage chunk to the stream by id"
+    )
     assert usage[0]["created"] == first["created"]
     assert usage[0]["model"] == MODEL
 
@@ -110,7 +127,7 @@ def test_error_payload_is_not_enveloped():
     errors = []
     for line in lines:
         if line.startswith("data: ") and line.strip() != "data: [DONE]":
-            p = json.loads(line[len("data: "):])
+            p = json.loads(line[len("data: ") :])
             if "error" in p:
                 errors.append(p)
     assert len(errors) == 1, lines

@@ -12,6 +12,7 @@ test locks in that all chunks now include `index` (plus id/object/created).
 
 Run with pytest, or directly: python tests/test_chat_chunk_index.py
 """
+
 import asyncio
 import json
 import os
@@ -37,7 +38,7 @@ def _data_payloads(lines):
     for line in lines:
         if not line.startswith("data: "):
             continue
-        body = line[len("data: "):].strip()
+        body = line[len("data: ") :].strip()
         if body == "[DONE]":
             continue
         payloads.append(json.loads(body))
@@ -56,9 +57,11 @@ def _run_stream():
         generate_signature_sync=mock.DEFAULT,
     ):
         return asyncio.run(
-            _collect(app_module.stream_response(
-                _gen(CHUNKS), "v4.1flash", MESSAGES, 1, "sess", "sig", []
-            ))
+            _collect(
+                app_module.stream_response(
+                    _gen(CHUNKS), "v4.1flash", MESSAGES, 1, "sess", "sig", []
+                )
+            )
         )
 
 
@@ -75,7 +78,8 @@ def test_every_choice_has_index():
 
     # Content deltas that carry text must have an index too.
     text_chunks = [
-        p for p in payloads
+        p
+        for p in payloads
         if p.get("choices") and c_get(p["choices"][0]["delta"], "content")
     ]
     assert text_chunks, f"expected text deltas, got {payloads}"
@@ -100,8 +104,9 @@ def c_get(d, k):
 
 
 def main():
-    tests = [v for k, v in sorted(globals().items())
-             if k.startswith("test_") and callable(v)]
+    tests = [
+        v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)
+    ]
     failed = 0
     for t in tests:
         try:

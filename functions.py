@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import mimetypes
@@ -9,11 +10,12 @@ import re
 import sqlite3
 import string
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import aiohttp
 import deepseek_tokenizer
 import wasmtime
+
 try:
     from playwright.async_api import async_playwright
 except ImportError:
@@ -62,6 +64,7 @@ def cookie_file_path():
         return os.path.join(d, "aws_cookies_deepseek.json")
     return p
 
+
 try:
     _TZ_OFFSET = str(int(datetime.now().astimezone().utcoffset().total_seconds()))
 except Exception:
@@ -71,10 +74,8 @@ except Exception:
 def get_db():
     conn = sqlite3.connect(_db, timeout=30)
     conn.row_factory = sqlite3.Row
-    try:
+    with contextlib.suppress(Exception):
         conn.execute("PRAGMA journal_mode=WAL")
-    except Exception:
-        pass
     return conn
 
 
@@ -108,12 +109,16 @@ def init_db():
     # B3 (Stage 1 audit) migration: pool cooldown + usage tracking. Older
     # databases miss the columns; the ALTERs are idempotent behind the
     # pragma check.
-    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(tokens)").fetchall()}
+    existing_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(tokens)").fetchall()
+    }
     if "rate_limited_until" not in existing_cols:
         conn.execute("ALTER TABLE tokens ADD COLUMN rate_limited_until REAL")
     if "last_used" not in existing_cols:
         conn.execute("ALTER TABLE tokens ADD COLUMN last_used REAL")
-    existing_session_cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+    existing_session_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+    }
     if "last_used" not in existing_session_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN last_used REAL")
     conn.commit()
@@ -133,7 +138,9 @@ async def get_session():
         async with _session_lock:
             if _session is None or _session.closed:
                 logger.info("Opening shared aiohttp ClientSession")
-                _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15, sock_read=600))
+                _session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=None, connect=15, sock_read=600)
+                )
     return _session
 
 
@@ -163,8 +170,13 @@ async def close_session():
 #   DEEPSEEKER_UPSTREAM_FALLBACK fallback  (default: none; single-endpoint mode)
 # ==============================================================================
 
+
 def _build_upstream_bases():
-    primary = (os.getenv("DEEPSEEKER_UPSTREAM_BASE") or "https://chat.deepseek.com").strip().rstrip("/")
+    primary = (
+        (os.getenv("DEEPSEEKER_UPSTREAM_BASE") or "https://chat.deepseek.com")
+        .strip()
+        .rstrip("/")
+    )
     fallback = (os.getenv("DEEPSEEKER_UPSTREAM_FALLBACK") or "").strip().rstrip("/")
     return [primary] + ([fallback] if fallback else [])
 
@@ -194,7 +206,7 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
         is_last = attempt == len(UPSTREAM_BASES) - 1
         try:
             resp = await session.post(base + path, headers=headers, **kwargs)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             logger.warning("Upstream POST %s failed on %s: %s", path, base, e)
             last_exc = e
             if is_last:
@@ -203,7 +215,7 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
         if resp.status >= 500 and not is_last:
             try:
                 body = await resp.text()
-            except (aiohttp.ClientError, asyncio.TimeoutError):
+            except (TimeoutError, aiohttp.ClientError):
                 body = ""
             # PR #26 review fix (Medium): hand the failed connection back to
             # the pool. Without this, repeated failovers leak responses and
@@ -211,14 +223,22 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
             resp.release()
             logger.warning(
                 "Upstream POST %s -> HTTP %d on %s; failing over to fallback endpoint",
-                path, resp.status, base,
+                path,
+                resp.status,
+                base,
             )
             last_exc = UpstreamError(resp.status, body[:200])
             continue
         if attempt > 0:
-            logger.info("Upstream POST %s succeeded on fallback endpoint %s", path, base)
+            logger.info(
+                "Upstream POST %s succeeded on fallback endpoint %s", path, base
+            )
         return resp
-    raise last_exc if last_exc is not None else RuntimeError("post_with_failover: no endpoints configured")
+    raise (
+        last_exc
+        if last_exc is not None
+        else RuntimeError("post_with_failover: no endpoints configured")
+    )
 
 
 # B11 (Stage 1 audit): the Android client identity used to be hardcoded to one
@@ -315,7 +335,8 @@ async def get_cookies():
 
     def _cooldown_error():
         return CookieGenerationError(
-            _cookie_fail["error"] + " (cooling down; will retry automatically — try again shortly)"
+            _cookie_fail["error"]
+            + " (cooling down; will retry automatically — try again shortly)"
         )
 
     if time.time() < _cookie_fail["until"]:
@@ -335,17 +356,30 @@ async def get_cookies():
         last_err = None
         for attempt in range(1, COOKIE_REGEN_ATTEMPTS + 1):
             try:
-                logger.info("Generating DeepSeek cookies (attempt %d/%d)...", attempt, COOKIE_REGEN_ATTEMPTS)
-                await asyncio.wait_for(_generate_cookies(), timeout=COOKIE_REGEN_TIMEOUT)
+                logger.info(
+                    "Generating DeepSeek cookies (attempt %d/%d)...",
+                    attempt,
+                    COOKIE_REGEN_ATTEMPTS,
+                )
+                await asyncio.wait_for(
+                    _generate_cookies(), timeout=COOKIE_REGEN_TIMEOUT
+                )
                 cookies = _read_cookie_file()
                 if cookies:
                     _cookie_fail["until"] = 0.0
                     _cookie_fail["error"] = ""
                     return cookies
-                last_err = CookieGenerationError("cookie file missing/invalid after generation")
+                last_err = CookieGenerationError(
+                    "cookie file missing/invalid after generation"
+                )
             except Exception as e:
                 last_err = e
-                logger.warning("DeepSeek cookie generation attempt %d/%d failed: %s", attempt, COOKIE_REGEN_ATTEMPTS, e)
+                logger.warning(
+                    "DeepSeek cookie generation attempt %d/%d failed: %s",
+                    attempt,
+                    COOKIE_REGEN_ATTEMPTS,
+                    e,
+                )
             if attempt < COOKIE_REGEN_ATTEMPTS:
                 await asyncio.sleep(min(5 * attempt, 10))
         _cookie_fail["until"] = time.time() + COOKIE_FAIL_COOLDOWN
@@ -353,7 +387,9 @@ async def get_cookies():
         logger.error("%s", _cookie_fail["error"])
         stale = _read_stale_cookie_file()
         if stale:
-            logger.warning("Serving STALE DeepSeek cookies after generation failure (upstream may reject them)")
+            logger.warning(
+                "Serving STALE DeepSeek cookies after generation failure (upstream may reject them)"
+            )
             return stale
         raise CookieGenerationError(_cookie_fail["error"])
 
@@ -369,12 +405,14 @@ async def _generate_cookies():
         try:
             context = await browser.new_context()
             page = await context.new_page()
-            await page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded", timeout=45000)
+            await page.goto(
+                "https://chat.deepseek.com/",
+                wait_until="domcontentloaded",
+                timeout=45000,
+            )
             await page.wait_for_selector("body", timeout=30000)
-            try:
+            with contextlib.suppress(Exception):
                 await page.wait_for_url("**/sign_in*", timeout=30000)
-            except Exception:
-                pass
             cookies = await context.cookies()
         finally:
             await browser.close()
@@ -384,7 +422,9 @@ async def _generate_cookies():
         if i.get("name") == "aws-waf-token":
             expiry = i.get("expires")
         final_cookies[i["name"]] = i["value"]
-    final_cookies["ds_cookie_preference"] = "%257B%2522level%2522%253A%2522all%2522%257D"
+    final_cookies["ds_cookie_preference"] = (
+        "%257B%2522level%2522%253A%2522all%2522%257D"
+    )
     if not expiry or expiry < 0:
         expiry = time.time() + 1800
     target = cookie_file_path()
@@ -394,7 +434,11 @@ async def _generate_cookies():
     with open(tmp_path, "w") as f:
         f.write(json.dumps({"cookie": final_cookies, "expiry": expiry}))
     os.replace(tmp_path, target)
-    logger.info("DeepSeek cookies saved to %s (expires %s)", target, datetime.fromtimestamp(expiry) if expiry else "n/a")
+    logger.info(
+        "DeepSeek cookies saved to %s (expires %s)",
+        target,
+        datetime.fromtimestamp(expiry) if expiry else "n/a",
+    )
 
 
 def get_auth_token():
@@ -418,7 +462,10 @@ def add_token(token, alias=None):
             WHERE t2.id IS NULL
         """).fetchone()
         next_id = row[0] if row and row[0] else 1
-    conn.execute("INSERT INTO tokens (id, alias, token, status) VALUES (?, ?, ?, 'ACTIVE')", (next_id, alias, token))
+    conn.execute(
+        "INSERT INTO tokens (id, alias, token, status) VALUES (?, ?, ?, 'ACTIVE')",
+        (next_id, alias, token),
+    )
     conn.commit()
     conn.close()
 
@@ -432,7 +479,9 @@ def get_tokens():
 
 def get_token(token_id):
     conn = get_db()
-    row = conn.execute("SELECT id, alias, token, status FROM tokens WHERE id = ?", (token_id,)).fetchone()
+    row = conn.execute(
+        "SELECT id, alias, token, status FROM tokens WHERE id = ?", (token_id,)
+    ).fetchone()
     conn.close()
     if row:
         return {"id": row[0], "alias": row[1], "token": row[2], "status": row[3]}
@@ -547,7 +596,9 @@ def pick_token(exclude=None):
             )
             conn.commit()
             conn.close()
-            logger.info("Token pool: cooldown expired, auto-recovered token(s) %s", recovered)
+            logger.info(
+                "Token pool: cooldown expired, auto-recovered token(s) %s", recovered
+            )
 
         def _sort_key(entry):
             tid, last_used = entry
@@ -597,12 +648,17 @@ def mark_active(token_id):
 
 def find_session(sig):
     conn = get_db()
-    row = conn.execute("SELECT token_id, deepseek_session_id, parent_message_id FROM sessions WHERE signature = ?", (sig,)).fetchone()
+    row = conn.execute(
+        "SELECT token_id, deepseek_session_id, parent_message_id FROM sessions WHERE signature = ?",
+        (sig,),
+    ).fetchone()
     if row:
         # B13: touch on read so pruning evicts by real recency of USE, not by
         # insertion order — long-running chats get older rows every turn, and
         # they are precisely the sessions pruning must protect.
-        conn.execute("UPDATE sessions SET last_used = ? WHERE signature = ?", (time.time(), sig))
+        conn.execute(
+            "UPDATE sessions SET last_used = ? WHERE signature = ?", (time.time(), sig)
+        )
         conn.commit()
     conn.close()
     if row:
@@ -640,7 +696,11 @@ def prune_sessions():
         ).rowcount
         conn.commit()
         if deleted or deleted_map:
-            logger.info("Pruned %d session signature(s) and %d stale session_map row(s)", deleted, deleted_map)
+            logger.info(
+                "Pruned %d session signature(s) and %d stale session_map row(s)",
+                deleted,
+                deleted_map,
+            )
     finally:
         conn.close()
 
@@ -688,7 +748,10 @@ def next_parent(parent_message_id):
 
 def delete_sessions_for_chat(token_id, session_id):
     conn = get_db()
-    conn.execute("DELETE FROM sessions WHERE token_id = ? AND deepseek_session_id = ?", (token_id, session_id))
+    conn.execute(
+        "DELETE FROM sessions WHERE token_id = ? AND deepseek_session_id = ?",
+        (token_id, session_id),
+    )
     conn.commit()
     conn.close()
 
@@ -721,7 +784,9 @@ def record_file(file_id, token_id):
 def get_file_token(file_id):
     """Return the token id that owns an uploaded file_id, or None."""
     conn = get_db()
-    row = conn.execute("SELECT token_id FROM files WHERE file_id = ?", (file_id,)).fetchone()
+    row = conn.execute(
+        "SELECT token_id FROM files WHERE file_id = ?", (file_id,)
+    ).fetchone()
     conn.close()
     return row[0] if row else None
 
@@ -755,10 +820,32 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
         if "function" in tool_data and isinstance(tool_data["function"], dict):
             fn = tool_data["function"]
             name = fn.get("name") or tool_data.get("name")
-            args = fn.get("arguments") or fn.get("parameters") or fn.get("input") or fn.get("args") or fn.get("params") or {}
+            args = (
+                fn.get("arguments")
+                or fn.get("parameters")
+                or fn.get("input")
+                or fn.get("args")
+                or fn.get("params")
+                or {}
+            )
         else:
-            name = tool_data.get("name") or tool_data.get("tool") or tool_data.get("tool_name") or tool_data.get("function") or tool_data.get("action")
-            args = tool_data.get("arguments") or tool_data.get("parameters") or tool_data.get("input") or tool_data.get("args") or tool_data.get("params") or tool_data.get("tool_input") or tool_data.get("action_input") or {}
+            name = (
+                tool_data.get("name")
+                or tool_data.get("tool")
+                or tool_data.get("tool_name")
+                or tool_data.get("function")
+                or tool_data.get("action")
+            )
+            args = (
+                tool_data.get("arguments")
+                or tool_data.get("parameters")
+                or tool_data.get("input")
+                or tool_data.get("args")
+                or tool_data.get("params")
+                or tool_data.get("tool_input")
+                or tool_data.get("action_input")
+                or {}
+            )
     else:
         return None
 
@@ -774,7 +861,9 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
             args_str = json.dumps(args_str)
     else:
         args_str = json.dumps({})
-    call_id = "call_" + "".join(random.choices(string.ascii_letters + string.digits, k=8))
+    call_id = "call_" + "".join(
+        random.choices(string.ascii_letters + string.digits, k=8)
+    )
     return {
         "id": call_id,
         "type": "function",
@@ -803,7 +892,9 @@ def _code_fence_spans(text):
     actual tool call, so matches falling inside these spans are ignored.
     Unclosed fences extend to end-of-text.
     """
-    return [(m.start(), m.end()) for m in re.finditer(r"```.*?(?:```|$)", text, re.DOTALL)]
+    return [
+        (m.start(), m.end()) for m in re.finditer(r"```.*?(?:```|$)", text, re.DOTALL)
+    ]
 
 
 def parse_tools(text):
@@ -814,32 +905,73 @@ def parse_tools(text):
     def fenced(pos):
         return any(s <= pos < e for s, e in fence_spans)
 
-    param_names = {"command", "description", "file_path", "content", "path", "prompt", "query", "subject", "old_string", "new_string", "url", "input"}
-    tool_matches = list(re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|invoke|function_calls?)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>", text, re.IGNORECASE))
+    param_names = {
+        "command",
+        "description",
+        "file_path",
+        "content",
+        "path",
+        "prompt",
+        "query",
+        "subject",
+        "old_string",
+        "new_string",
+        "url",
+        "input",
+    }
+    tool_matches = list(
+        re.finditer(
+            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|invoke|function_calls?)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>",
+            text,
+            re.IGNORECASE,
+        )
+    )
     real_tool_matches = [tm for tm in tool_matches if not fenced(tm.start())]
 
     if real_tool_matches:
         for i, tm in enumerate(real_tool_matches):
             candidate_name = tm.group(1).strip()
             start_idx = tm.end()
-            end_idx = real_tool_matches[i+1].start() if i + 1 < len(real_tool_matches) else len(text)
+            end_idx = (
+                real_tool_matches[i + 1].start()
+                if i + 1 < len(real_tool_matches)
+                else len(text)
+            )
             body = text[start_idx:end_idx]
             args = {}
-            p_matches = re.finditer(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)", body, flags=re.DOTALL | re.IGNORECASE)
+            p_matches = re.finditer(
+                r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)",
+                body,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
             for pm in p_matches:
                 p_name = pm.group(1).strip()
                 p_val = pm.group(2).strip()
-                p_val = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>", "", p_val, flags=re.IGNORECASE).strip()
+                p_val = re.sub(
+                    r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>",
+                    "",
+                    p_val,
+                    flags=re.IGNORECASE,
+                ).strip()
                 try:
                     args[p_name] = json.loads(p_val)
                 except Exception:
                     args[p_name] = p_val
-            tag_param_matches = re.finditer(r"<([A-Za-z0-9_\-]+)>(.*?)(?:</\1>|$)", body, flags=re.DOTALL | re.IGNORECASE)
+            tag_param_matches = re.finditer(
+                r"<([A-Za-z0-9_\-]+)>(.*?)(?:</\1>|$)",
+                body,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
             for pm in tag_param_matches:
                 t_name = pm.group(1).strip().lower()
                 if t_name in param_names:
                     t_val = pm.group(2).strip()
-                    t_val = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>", "", t_val, flags=re.IGNORECASE).strip()
+                    t_val = re.sub(
+                        r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>",
+                        "",
+                        t_val,
+                        flags=re.IGNORECASE,
+                    ).strip()
                     try:
                         args[t_name] = json.loads(t_val)
                     except Exception:
@@ -850,12 +982,28 @@ def parse_tools(text):
                     tools.append(norm)
 
     if tools:
-        clean_text = re.sub(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
-        clean_text = re.sub(r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        clean_text = re.sub(
+            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|calls)>|$)",
+            "",
+            clean_text,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+        clean_text = re.sub(
+            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)>|$)",
+            "",
+            clean_text,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
 
     if not tools and "DSML" in text:
-        dsml_block_pattern = re.compile(r"<[｜\|]{2}DSML[｜\|]{2}([A-Za-z0-9_]+)>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}\1>|$)", re.DOTALL | re.IGNORECASE)
-        param_pattern_b = re.compile(r"<[｜\|]{2}DSML[｜\|]{2}B([A-Za-z0-9_]+)[^>]*>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}B.*?>|$)", re.DOTALL | re.IGNORECASE)
+        dsml_block_pattern = re.compile(
+            r"<[｜\|]{2}DSML[｜\|]{2}([A-Za-z0-9_]+)>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}\1>|$)",
+            re.DOTALL | re.IGNORECASE,
+        )
+        param_pattern_b = re.compile(
+            r"<[｜\|]{2}DSML[｜\|]{2}B([A-Za-z0-9_]+)[^>]*>(.*?)(?:</[｜\|]{2}DSML[｜\|]{2}B.*?>|$)",
+            re.DOTALL | re.IGNORECASE,
+        )
         for m in dsml_block_pattern.finditer(text):
             if fenced(m.start()):
                 continue
@@ -873,28 +1021,59 @@ def parse_tools(text):
             if norm:
                 tools.append(norm)
         if not tools:
-            tool_match = re.search(r"[｜\|]{2}DSML[｜\|]{2}(Bash|Read|Write|Edit|Agent|TaskList|TaskCreate|WebSearch|[A-Za-z0-9_]+)", text, re.IGNORECASE)
+            tool_match = re.search(
+                r"[｜\|]{2}DSML[｜\|]{2}(Bash|Read|Write|Edit|Agent|TaskList|TaskCreate|WebSearch|[A-Za-z0-9_]+)",
+                text,
+                re.IGNORECASE,
+            )
             if tool_match and not fenced(tool_match.start()):
                 candidate = tool_match.group(1).strip()
-                tool_name = "Bash" if candidate.lower().startswith("b") and candidate.lower() not in ["bdescription", "bparam"] else candidate
+                tool_name = (
+                    "Bash"
+                    if candidate.lower().startswith("b")
+                    and candidate.lower() not in ["bdescription", "bparam"]
+                    else candidate
+                )
                 args = {}
-                cmd_match = re.search(r"[｜\|]{2}B[\x22\x27]?command[\x22\x27]?[^>]*>(.*?)(?:</[｜\|]{2}B|$)", text, re.DOTALL | re.IGNORECASE)
-                desc_match = re.search(r"[｜\|]{2}B[\x22\x27]?description[\x22\x27]?[^>]*>(.*?)(?:</[｜\|]{2}B|$)", text, re.DOTALL | re.IGNORECASE)
+                cmd_match = re.search(
+                    r"[｜\|]{2}B[\x22\x27]?command[\x22\x27]?[^>]*>(.*?)(?:</[｜\|]{2}B|$)",
+                    text,
+                    re.DOTALL | re.IGNORECASE,
+                )
+                desc_match = re.search(
+                    r"[｜\|]{2}B[\x22\x27]?description[\x22\x27]?[^>]*>(.*?)(?:</[｜\|]{2}B|$)",
+                    text,
+                    re.DOTALL | re.IGNORECASE,
+                )
                 if cmd_match:
-                    clean_cmd = re.sub(r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", cmd_match.group(1)).strip("\x22\x27() ")
+                    clean_cmd = re.sub(
+                        r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", cmd_match.group(1)
+                    ).strip("\x22\x27() ")
                     args["command"] = clean_cmd
                 if desc_match:
-                    clean_desc = re.sub(r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", desc_match.group(1)).strip("\x22\x27() ")
+                    clean_desc = re.sub(
+                        r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", desc_match.group(1)
+                    ).strip("\x22\x27() ")
                     args["description"] = clean_desc
                 norm = normalize_tool_call(tool_name, args)
                 if norm:
                     tools.append(norm)
         if tools:
-            clean_text = re.sub(r"<[｜\|]{2}DSML[｜\|]{2}[^>]*>.*?(?:</[｜\|]{2}DSML[｜\|]{2}[^>]*>|$)", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
-            clean_text = re.sub(r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
+            clean_text = re.sub(
+                r"<[｜\|]{2}DSML[｜\|]{2}[^>]*>.*?(?:</[｜\|]{2}DSML[｜\|]{2}[^>]*>|$)",
+                "",
+                clean_text,
+                flags=re.DOTALL | re.IGNORECASE,
+            ).strip()
+            clean_text = re.sub(
+                r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", clean_text, flags=re.IGNORECASE
+            ).strip()
 
     if not tools:
-        fn_call_pattern = re.compile(r"<function_call>\s*<name>([^<]+)</name>\s*<arguments>(.*?)</arguments>\s*</function_call>", re.DOTALL | re.IGNORECASE)
+        fn_call_pattern = re.compile(
+            r"<function_call>\s*<name>([^<]+)</name>\s*<arguments>(.*?)</arguments>\s*</function_call>",
+            re.DOTALL | re.IGNORECASE,
+        )
         for m in fn_call_pattern.finditer(text):
             if fenced(m.start()):
                 continue
@@ -908,55 +1087,91 @@ def parse_tools(text):
             if norm:
                 tools.append(norm)
         if tools:
-            clean_text = re.sub(r"<function_call>.*?</function_call>", "", clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+            clean_text = re.sub(
+                r"<function_call>.*?</function_call>",
+                "",
+                clean_text,
+                flags=re.DOTALL | re.IGNORECASE,
+            ).strip()
 
     if not tools:
-        tag_regex = re.compile(r"<(?:tool_call|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>", re.IGNORECASE)
+        tag_regex = re.compile(
+            r"<(?:tool_call|function_call)(?:\s+(?:name|tool|function)=[\x27\x22]([^\x27\x22]+)[\x27\x22])?\s*>",
+            re.IGNORECASE,
+        )
         decoder = json.JSONDecoder()
         matches = [m for m in tag_regex.finditer(text) if not fenced(m.start())]
         if matches:
             for m in matches:
                 tag_name = m.group(1)
-                after_tag = text[m.end():]
+                after_tag = text[m.end() :]
                 brace_pos = after_tag.find("{")
                 if brace_pos != -1:
                     json_substr = after_tag[brace_pos:]
                     data = None
-                    try:
+                    with contextlib.suppress(Exception):
                         data, _ = decoder.raw_decode(json_substr)
-                    except Exception:
-                        pass
                     if not data:
-                        cleaned_json = re.sub(r"</?(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*", "", json_substr, flags=re.DOTALL).strip()
+                        cleaned_json = re.sub(
+                            r"</?(?:tool_call|function_call|tool_calls|invoke)[^>]*>.*",
+                            "",
+                            json_substr,
+                            flags=re.DOTALL,
+                        ).strip()
                         open_b = cleaned_json.count("{")
                         close_b = cleaned_json.count("}")
                         if open_b > close_b:
                             cleaned_json += "}" * (open_b - close_b)
-                        try:
+                        with contextlib.suppress(Exception):
                             data = json.loads(cleaned_json)
-                        except Exception:
-                            pass
                     if isinstance(data, dict):
                         if tag_name:
                             name = tag_name
-                            if "arguments" in data and isinstance(data["arguments"], dict):
+                            if "arguments" in data and isinstance(
+                                data["arguments"], dict
+                            ):
                                 args = data["arguments"]
-                            elif "parameters" in data and isinstance(data["parameters"], dict):
+                            elif "parameters" in data and isinstance(
+                                data["parameters"], dict
+                            ):
                                 args = data["parameters"]
                             elif "input" in data and isinstance(data["input"], dict):
                                 args = data["input"]
                             else:
-                                args = {k: v for k, v in data.items() if k not in ["name", "tool", "function"]}
+                                args = {
+                                    k: v
+                                    for k, v in data.items()
+                                    if k not in ["name", "tool", "function"]
+                                }
                         else:
-                            name = data.get("name") or data.get("tool") or data.get("tool_name") or data.get("function") or data.get("action")
-                            args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or data.get("params") or data.get("tool_input") or data.get("action_input")
+                            name = (
+                                data.get("name")
+                                or data.get("tool")
+                                or data.get("tool_name")
+                                or data.get("function")
+                                or data.get("action")
+                            )
+                            args = (
+                                data.get("arguments")
+                                or data.get("parameters")
+                                or data.get("input")
+                                or data.get("args")
+                                or data.get("params")
+                                or data.get("tool_input")
+                                or data.get("action_input")
+                            )
                             if args is None:
                                 args = {}
                         if name:
                             norm = normalize_tool_call(name, args)
                             if norm:
                                 tools.append(norm)
-            clean_text = re.sub(r"<(?:tool_call|function_call)[^>]*>.*?(?:</(?:tool_call|function_call)>|$)", "", text, flags=re.DOTALL).strip()
+            clean_text = re.sub(
+                r"<(?:tool_call|function_call)[^>]*>.*?(?:</(?:tool_call|function_call)>|$)",
+                "",
+                text,
+                flags=re.DOTALL,
+            ).strip()
 
     if not tools:
         codeblock_pattern = r"```(?:tool_call|function_call)\s*(.*?)\s*```"
@@ -966,15 +1181,28 @@ def parse_tools(text):
             try:
                 data = json.loads(cleaned)
                 if isinstance(data, dict):
-                    name = data.get("name") or data.get("tool") or data.get("function") or data.get("action")
-                    args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or {}
+                    name = (
+                        data.get("name")
+                        or data.get("tool")
+                        or data.get("function")
+                        or data.get("action")
+                    )
+                    args = (
+                        data.get("arguments")
+                        or data.get("parameters")
+                        or data.get("input")
+                        or data.get("args")
+                        or {}
+                    )
                     norm = normalize_tool_call(name, args)
                     if norm:
                         tools.append(norm)
             except Exception:
                 pass
         if tools:
-            clean_text = re.sub(codeblock_pattern, "", clean_text, flags=re.DOTALL).strip()
+            clean_text = re.sub(
+                codeblock_pattern, "", clean_text, flags=re.DOTALL
+            ).strip()
 
     if not tools:
         json_pattern = r"```json\s*(\{.*?\})\s*```"
@@ -983,9 +1211,22 @@ def parse_tools(text):
             cleaned = clean_json_str(m.group(1))
             try:
                 data = json.loads(cleaned)
-                if isinstance(data, dict) and ("name" in data or "tool" in data or "function" in data):
-                    name = data.get("name") or data.get("tool") or data.get("function") or data.get("action")
-                    args = data.get("arguments") or data.get("parameters") or data.get("input") or data.get("args") or {}
+                if isinstance(data, dict) and (
+                    "name" in data or "tool" in data or "function" in data
+                ):
+                    name = (
+                        data.get("name")
+                        or data.get("tool")
+                        or data.get("function")
+                        or data.get("action")
+                    )
+                    args = (
+                        data.get("arguments")
+                        or data.get("parameters")
+                        or data.get("input")
+                        or data.get("args")
+                        or {}
+                    )
                     norm = normalize_tool_call(name, args)
                     if norm:
                         tools.append(norm)
@@ -1075,13 +1316,22 @@ def _append_clean_text(results, text: str) -> None:
 
 
 # Tag names _STREAM_ENTRY_RE can open on.
-_STREAM_ENTRY_TAGS = ("tool_calls", "tool_call", "function_calls", "function_call", "invoke", "calls")
+_STREAM_ENTRY_TAGS = (
+    "tool_calls",
+    "tool_call",
+    "function_calls",
+    "function_call",
+    "invoke",
+    "calls",
+)
+
 
 def _skip_bars(text, pos):
     for _ in range(2):
         if pos < len(text) and text[pos] in "|｜":
             pos += 1
     return pos
+
 
 def _is_plausible_stream_entry_prefix(segment: str) -> bool:
     if not segment.startswith("<") or ">" in segment:
@@ -1107,13 +1357,16 @@ def _is_plausible_stream_entry_prefix(segment: str) -> bool:
         if tag.startswith(remainder_lower):
             return True
         if remainder_lower.startswith(tag):
-            suffix = remainder[len(tag):]
+            suffix = remainder[len(tag) :]
             if not suffix or not (suffix[0].isalnum() or suffix[0] == "_"):
                 return True
     return False
 
+
 def _is_plausible_stream_closer_prefix(segment: str) -> bool:
-    return segment.startswith("</") and _is_plausible_stream_entry_prefix("<" + segment[2:])
+    return segment.startswith("</") and _is_plausible_stream_entry_prefix(
+        "<" + segment[2:]
+    )
 
 
 class StreamToolParser:
@@ -1146,7 +1399,7 @@ class StreamToolParser:
                         parsed, _ = parse_tools(tool_xml)
                         for item in parsed:
                             results.append({"tool": item})
-                    self.buffer = self.buffer[end_match.end():]
+                    self.buffer = self.buffer[end_match.end() :]
                     self.in_tool = False
                     self.json_done = False
                     self._end_re = None
@@ -1160,7 +1413,7 @@ class StreamToolParser:
                         if norm:
                             results.append({"tool": norm})
                             self.json_done = True
-                            self.buffer = self.buffer[brace_idx + consumed:]
+                            self.buffer = self.buffer[brace_idx + consumed :]
                             continue
                     except Exception:
                         pass
@@ -1176,7 +1429,9 @@ class StreamToolParser:
                     self.buffer = self.buffer[start:]
                     tag_name = m.group(1).lower()
                     self._end_re = re.compile(
-                        r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*" + re.escape(tag_name) + r"[｜\|]{0,2}\s*>",
+                        r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*"
+                        + re.escape(tag_name)
+                        + r"[｜\|]{0,2}\s*>",
                         re.IGNORECASE,
                     )
                     self.in_tool = True
@@ -1236,7 +1491,9 @@ def summarize_messages(messages, max_tokens=500):
         role = msg.get("role", "unknown")
         content = msg.get("content", "")
         if isinstance(content, list):
-            content = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
+            content = " ".join(
+                c.get("text", "") for c in content if c.get("type") == "text"
+            )
         if content:
             parts.append(f"{role}: {content[:200]}")
     summary = "\n".join(parts)
@@ -1268,9 +1525,21 @@ def _find_pow_answer_blocking(challange_data):
     memory = instance.exports(store)["memory"]
     alloc_func = instance.exports(store)["alloc"]
     solve_func = instance.exports(store)["solve_pow"]
-    ch_ptr, ch_len = write_string_pow(challange_data["challenge"], alloc_func, memory, store)
-    salt_ptr, salt_len = write_string_pow(challange_data["salt"], alloc_func, memory, store)
-    result = solve_func(store, ch_ptr, ch_len, salt_ptr, salt_len, challange_data["expire_at"], challange_data["difficulty"])
+    ch_ptr, ch_len = write_string_pow(
+        challange_data["challenge"], alloc_func, memory, store
+    )
+    salt_ptr, salt_len = write_string_pow(
+        challange_data["salt"], alloc_func, memory, store
+    )
+    result = solve_func(
+        store,
+        ch_ptr,
+        ch_len,
+        salt_ptr,
+        salt_len,
+        challange_data["expire_at"],
+        challange_data["difficulty"],
+    )
     if result < 0:
         result = result + 0x10000000000000000
     return result if result != 0xFFFFFFFFFFFFFFFF else None
@@ -1282,7 +1551,8 @@ async def create_challange_pow(target_path, auth_token):
     # cookie = await get_cookies()
     response = await post_with_failover(
         "/api/v0/chat/create_pow_challenge",
-        headers=headers, json={"target_path": target_path},
+        headers=headers,
+        json={"target_path": target_path},
         # cookies=cookie,  # Backup WAF fallback
         timeout=aiohttp.ClientTimeout(total=20),
     )
@@ -1373,10 +1643,7 @@ def _sse_context_limit_hint(recent_lines, parsed_events):
             blob = str(obj)
         if _CONTEXT_LIMIT_HINT_RE.search(blob):
             return True
-    for line in recent_lines:
-        if _CONTEXT_LIMIT_HINT_RE.search(line):
-            return True
-    return False
+    return any(_CONTEXT_LIMIT_HINT_RE.search(line) for line in recent_lines)
 
 
 def _scan_recent_sse_errors(parsed_events):
@@ -1428,14 +1695,24 @@ def _raise_sse_error_event(data, recent_lines):
     raise UpstreamError(502, content)
 
 
-async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None):
+async def send_message(
+    chat_id,
+    auth_token,
+    message,
+    parent_message_id,
+    thinking=False,
+    search=False,
+    file_ids_=None,
+):
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
     if parent_message_id == 0:
         parent_message_id = None
     file_ids = file_ids_ or []
 
-    headers = get_headers(auth_token, await solve_create_pow("/api/v0/chat/completion", auth_token))
+    headers = get_headers(
+        auth_token, await solve_create_pow("/api/v0/chat/completion", auth_token)
+    )
     json_data = {
         "chat_session_id": chat_id,
         "parent_message_id": parent_message_id,
@@ -1452,13 +1729,19 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
     got_output = False
     resp = await post_with_failover(
         "/api/v0/chat/completion",
-        headers=headers, json=json_data,
+        headers=headers,
+        json=json_data,
         # cookies=cookie,  # Backup WAF fallback
     )
     async with resp:
         if resp.status != 200:
             error_text = await resp.text()
-            logger.warning("DeepSeek completion HTTP %d for chat %s: %s", resp.status, chat_id, error_text[:300])
+            logger.warning(
+                "DeepSeek completion HTTP %d for chat %s: %s",
+                resp.status,
+                chat_id,
+                error_text[:300],
+            )
             raise UpstreamError(resp.status, error_text)
 
         recent_lines = []
@@ -1583,27 +1866,29 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
     session = await get_session()
-    url = "https://chat.deepseek.com/api/v0/file/upload_file"
     file_size = len(file_bytes)
     pow_response = await solve_create_pow("/api/v0/file/upload_file", auth_token)
     boundary = b"----WebKitFormBoundaryTB0pXOQR2RL219Hu"
     safe_name = re.sub(r"[^ -~]", "_", file_name).replace('"', "_") or "file.bin"
     body_parts = [
         b"--" + boundary + b"\r\n",
-        f'Content-Disposition: form-data; name="file"; filename="{safe_name}"\r\n'.encode("utf-8"),
-        f"Content-Type: {file_content_type}\r\n\r\n".encode("utf-8"),
+        f'Content-Disposition: form-data; name="file"; filename="{safe_name}"\r\n'.encode(),
+        f"Content-Type: {file_content_type}\r\n\r\n".encode(),
         file_bytes,
         b"\r\n--" + boundary + b"--\r\n",
     ]
     reconstructed_body = b"".join(body_parts)
     headers = get_headers(auth_token, pow_response)
-    headers.update({
-        "content-type": f"multipart/form-data; boundary={boundary.decode('utf-8')}",
-        "x-file-size": str(file_size),
-    })
+    headers.update(
+        {
+            "content-type": f"multipart/form-data; boundary={boundary.decode('utf-8')}",
+            "x-file-size": str(file_size),
+        }
+    )
     response = await post_with_failover(
         "/api/v0/file/upload_file",
-        data=reconstructed_body, headers=headers,
+        data=reconstructed_body,
+        headers=headers,
         # cookies=cookie,  # Backup WAF fallback
         timeout=aiohttp.ClientTimeout(total=120),
     )
@@ -1627,13 +1912,16 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
             js_data = (await resp.json())["data"]["biz_data"]["files"][0]
         status = js_data["status"]
     if status == "SUCCESS":
-        tp_data = datetime.fromtimestamp(js_data["updated_at"], timezone.utc)
-        yield ("success", {
-            "file_id": file_id,
-            "openai_timestamp": int(js_data["updated_at"]),
-            "size": js_data["file_size"],
-            "anthropic_timestamp": tp_data.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        })
+        tp_data = datetime.fromtimestamp(js_data["updated_at"], UTC)
+        yield (
+            "success",
+            {
+                "file_id": file_id,
+                "openai_timestamp": int(js_data["updated_at"]),
+                "size": js_data["file_size"],
+                "anthropic_timestamp": tp_data.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
     else:
         yield ("error", file_id)
 
@@ -1653,7 +1941,11 @@ async def get_file_content(auth_token, file_id):
     js_data = resp_json["data"]["biz_data"]["files"][0]
     yield mimetypes.guess_type(js_data["file_name"])[0]
     deadline = time.time() + 60
-    while js_data.get("status") in ("PENDING", "PARSING") and time.time() < deadline and not js_data.get("signed_path"):
+    while (
+        js_data.get("status") in ("PENDING", "PARSING")
+        and time.time() < deadline
+        and not js_data.get("signed_path")
+    ):
         await asyncio.sleep(0.5)
         async with session.get(
             "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,

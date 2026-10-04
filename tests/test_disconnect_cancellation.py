@@ -17,16 +17,15 @@ teardown either. Now the guarantee is locked by tests:
 
 Run:  python tests/test_disconnect_cancellation.py   (pytest-compatible)
 """
+
 import asyncio
-import json
 import os
 import sys
-import unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import functions  # noqa: E402
 import app as app_module  # noqa: E402
+import functions  # noqa: E402
 
 
 class _FakeStream:
@@ -66,7 +65,8 @@ def _sse_body(lines=500):
     # No FINISHED event: the stream never completes, so teardown below happens
     # strictly mid-stream.
     return (
-        'data: {"p":"response/fragments","o":"APPEND","v":[{"type":"RESPONSE","content":"mid"}]}\n\n' * lines
+        'data: {"p":"response/fragments","o":"APPEND","v":[{"type":"RESPONSE","content":"mid"}]}\n\n'
+        * lines
     ).encode("utf-8")
 
 
@@ -121,13 +121,20 @@ def test_cancelling_stream_consumer_purges_session_rows():
         app_module.save_session = fake_save
         app_module.delete_sessions_for_chat = fake_delete
         try:
+
             async def slow_gen():
                 for i in range(200):
                     yield f"piece {i} "
                     await asyncio.sleep(0.001)
 
             gen = app_module.stream_response(
-                slow_gen(), "v4.1flash", [{"role": "user", "content": "hi"}], 1, "sess-cancel", "sig", []
+                slow_gen(),
+                "v4.1flash",
+                [{"role": "user", "content": "hi"}],
+                1,
+                "sess-cancel",
+                "sig",
+                [],
             )
             received = 0
             async for _chunk in gen:
@@ -169,7 +176,9 @@ def test_stream_wrapper_releases_transferred_lock_and_slot():
 
         assert not owner.owned, "the transferred lock must be released on teardown"
         assert not lock.locked()
-        assert functions.token_in_flight(1) == 0, "the transferred slot must be released on teardown"
+        assert functions.token_in_flight(1) == 0, (
+            "the transferred slot must be released on teardown"
+        )
 
     asyncio.run(run())
 
