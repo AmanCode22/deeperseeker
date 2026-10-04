@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml uv.lock requirements.txt ./
 
 
-RUN uv pip install --system --no-cache -r requirements.txt
+RUN uv sync
 
 COPY . .
 
@@ -33,4 +33,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl 
 
 # If reverting to backup Playwright cookie generation, run under xvfb:
 # CMD ["sh", "-c", "xvfb-run -a -s '-screen 0 1280x720x24' python3 app.py"]
+# might also need requirements-waf-backup edition
 CMD ["python3", "app.py"]
