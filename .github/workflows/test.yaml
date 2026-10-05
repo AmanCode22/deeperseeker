@@ -21,6 +21,6 @@ jobs:
       - name: Install dependencies [dev] using uv
         run: uv sync --all-extras
       - name: Run Pytest
-        run: pytest
+        run: .venv/bin/pytest
       - name: Run ruff check
-        run: ruff check
+        run: .venv/bin/ruff check
