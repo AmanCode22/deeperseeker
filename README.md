@@ -18,7 +18,7 @@ A kind request: do not spam the server, respect DeepSeek's limits, and use it fo
 
 ## Quickstart
 
-### Local Python[UV]
+### Local Python[UV, Recommended]
 Needs uv first
 
 for linux/macos
@@ -36,6 +36,14 @@ source .venv/bin/activate # or activate.fish or activate.zsh
 cp .env.example .env
 uv run deeperseeker
 ```
+### Local Python[Non UV, Not usually recommended]
+```bash
+python3 -m venv .venv
+pip install -r requirements.txt 
+cp .env.example .env 
+python3 app.py
+```
+
 
 > **Note:** Thanks to PR https://github.com/AmanCode22/deeperseeker/pull/16 by [@alan7383](https://github.com/alan7383), Playwright and Chromium are deprecated and kept as backup (DeepSeek does not enforce AWS WAF on requests using Android client headers). You no longer need to run `playwright install chromium` or `xvfb-run` unless reverting to the backup cookie mechanism. And it now saves ram also and is much stable than cookie harvesting.
 
