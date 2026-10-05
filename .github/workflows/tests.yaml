@@ -21,7 +21,7 @@ jobs:
           python-version: "3.13"
           enable-cache: true
       - name: Install dependencies [dev] using uv
-        run: uv sync --all-extras
+        run: uv sync --extra dev --extra tests
       - name: Run Pytest
         run: .venv/bin/pytest
       - name: Run ruff check
