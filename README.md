@@ -1,5 +1,5 @@
 # DeeperSeeker
-
+[![CI Pipeline](https://github.com/AmanCode22/deeperseeker/actions/workflows/tests.yml/badge.svg)](https://github.com/AmanCode22/deeperseeker/actions/workflows/tests.yml)
 DeepSeek website reverse-proxy server with FastAPI, supporting OpenAI & Anthropic API standards.
 
 If you want to use deeperseeker with claude desktop app see [Claude Desktop Setup Guide](CLAUDE_DESKTOP_SETUP.md)
