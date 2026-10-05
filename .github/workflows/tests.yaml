@@ -1,0 +1,28 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test-ruff-pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Install uv
+        uses:  astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+        with:
+          version: "latest"
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install dependencies [dev] using uv
+        run: uv sync --extra dev --extra tests
+      - name: Run Pytest
+        run: .venv/bin/pytest
+      - name: Run ruff check
+        run: .venv/bin/ruff check

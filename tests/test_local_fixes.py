@@ -3,6 +3,7 @@
 Run with the repo venv:  deeperseeker_env/Scripts/python.exe tests/test_local_fixes.py
 (also pytest-compatible).
 """
+
 import asyncio
 import os
 import sys
@@ -18,8 +19,10 @@ def test_api_key_never_empty():
     assert API_KEY, "API_KEY must never be empty (fail-open)"
     import importlib
     import unittest.mock as mock
+
     with mock.patch.dict(os.environ, {"DEEPSEEKER_API_KEY": ""}):
         import app
+
         importlib.reload(app)
         assert app.API_KEY, "empty DEEPSEEKER_API_KEY must fall back to the default"
     importlib.reload(app)
@@ -28,16 +31,33 @@ def test_api_key_never_empty():
 def test_tool_result_becomes_tool_role():
     msgs = [
         {"role": "user", "content": "run it"},
-        {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}},
-        ]},
-        {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "file.txt"},
-        ]},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Bash",
+                    "input": {"command": "ls"},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "file.txt",
+                },
+            ],
+        },
     ]
     out = convert_anthropic_messages(msgs)
     assert out[1]["tool_calls"][0]["function"]["name"] == "Bash"
-    assert out[2]["role"] == "tool", "tool_result must become a role=tool message, not user text"
+    assert out[2]["role"] == "tool", (
+        "tool_result must become a role=tool message, not user text"
+    )
     assert out[2]["tool_call_id"] == "toolu_1"
     assert out[2]["content"] == "file.txt"
 
@@ -54,42 +74,83 @@ def test_signature_matches_server_reconstruction():
     # What an Anthropic client echoes back on the next turn
     client_msgs = [
         {"role": "user", "content": "run it"},
-        {"role": "assistant", "content": [
-            {"type": "text", "text": "Working on it."},
-            {"type": "tool_use", "id": "toolu_abc", "name": "Bash", "input": {"command": "ls -la"}},
-        ]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Working on it."},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_abc",
+                    "name": "Bash",
+                    "input": {"command": "ls -la"},
+                },
+            ],
+        },
     ]
     converted = convert_anthropic_messages(client_msgs)
-    assert generate_signature_sync(server_msgs, "v4.1flash") == generate_signature_sync(converted, "v4.1flash"), \
-        "signature cache must hit when the client echoes the assistant tool turn"
+    assert generate_signature_sync(server_msgs, "v4.1flash") == generate_signature_sync(
+        converted, "v4.1flash"
+    ), "signature cache must hit when the client echoes the assistant tool turn"
 
 
 def test_tool_results_reach_build_prompt():
     msgs = [
         {"role": "user", "content": "run it"},
-        {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}},
-        ]},
-        {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "file.txt"},
-        ]},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Bash",
+                    "input": {"command": "ls"},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "file.txt",
+                },
+            ],
+        },
     ]
     converted = convert_anthropic_messages(msgs)
-    prompt = asyncio.run(build_prompt(converted, [], "v4.1flash", is_first_message=False))
-    assert "[TOOL RESULTS]" in prompt, "tool results must appear in the [TOOL RESULTS] section"
+    prompt = asyncio.run(
+        build_prompt(converted, [], "v4.1flash", is_first_message=False)
+    )
+    assert "[TOOL RESULTS]" in prompt, (
+        "tool results must appear in the [TOOL RESULTS] section"
+    )
     assert "file.txt" in prompt
-    assert "[USER]" not in prompt, "the original question must not be re-sent on follow-up turns"
+    assert "[USER]" not in prompt, (
+        "the original question must not be re-sent on follow-up turns"
+    )
 
 
 def test_user_text_after_tool_result_preserved():
     msgs = [
-        {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}},
-        ]},
-        {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt"},
-            {"type": "text", "text": "now list the hidden files"},
-        ]},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Bash",
+                    "input": {"command": "ls"},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt"},
+                {"type": "text", "text": "now list the hidden files"},
+            ],
+        },
     ]
     out = convert_anthropic_messages(msgs)
     assert out[0]["role"] == "assistant" and out[0]["tool_calls"]
@@ -101,12 +162,22 @@ def test_user_text_after_tool_result_preserved():
 def test_single_model_resolution():
     # DeepSeek now serves only v4.1flash; every requested model name must
     # normalize to it so legacy clients (instant/expert/vision/claude-*) work.
-    for legacy in ("instant", "expert", "vision", "anthropic/claude-expert", "gpt-4o", "", None):
+    for legacy in (
+        "instant",
+        "expert",
+        "vision",
+        "anthropic/claude-expert",
+        "gpt-4o",
+        "",
+        None,
+    ):
         assert resolve_model(legacy) == SINGLE_MODEL == "v4.1flash"
 
 
 def main():
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    tests = [
+        v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)
+    ]
     failed = 0
     for t in tests:
         try:

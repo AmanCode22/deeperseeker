@@ -8,13 +8,13 @@ the failed token id as an exclude set so pick_token() rotates off it.
 
 Run:  python tests/test_retry_rotation.py   (pytest-compatible)
 """
+
 import asyncio
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import functions  # noqa: E402
 import app as app_module  # noqa: E402
 
 
@@ -49,16 +49,29 @@ def test_retry_excludes_failed_token():
         def fake_get_token(tid):
             return {"id": tid, "token": f"tok-{tid}", "status": "ACTIVE"}
 
-        def fake_send(chat_id, auth_token, message, parent, thinking=False, search=False, file_ids_=None):
+        def fake_send(
+            chat_id,
+            auth_token,
+            message,
+            parent,
+            thinking=False,
+            search=False,
+            file_ids_=None,
+        ):
             calls["send"] += 1
             if calls["send"] == 1:
+
                 async def fail_gen():
-                    raise RuntimeError("Empty response from DeepSeek (no parseable SSE content)")
+                    raise RuntimeError(
+                        "Empty response from DeepSeek (no parseable SSE content)"
+                    )
                     yield ""  # pragma: no cover
+
                 return fail_gen()
 
             async def ok_gen():
                 yield "recovered on token 2"
+
             return ok_gen()
 
         async def fake_files(messages, token, last_user_only=False):
@@ -87,7 +100,9 @@ def test_retry_excludes_failed_token():
         ]
         saved = _patch(patches)
         try:
-            return await app_module.handle_chat([{"role": "user", "content": "hi"}], "test-model")
+            return await app_module.handle_chat(
+                [{"role": "user", "content": "hi"}], "test-model"
+            )
         finally:
             _restore(saved)
             app_module._chat_locks.clear()
@@ -96,7 +111,9 @@ def test_retry_excludes_failed_token():
     assert result == "recovered on token 2"
     assert calls["send"] == 2
     assert calls["picks"][0] is None, "the first pick must not exclude anything"
-    assert calls["picks"][1] == {1}, f"the retry must exclude the failed token: {calls['picks']}"
+    assert calls["picks"][1] == {1}, (
+        f"the retry must exclude the failed token: {calls['picks']}"
+    )
 
 
 def test_retry_budget_is_bounded():
@@ -117,11 +134,23 @@ def test_retry_budget_is_bounded():
         def fake_get_token(tid):
             return {"id": tid, "token": "tok", "status": "ACTIVE"}
 
-        def fake_send(chat_id, auth_token, message, parent, thinking=False, search=False, file_ids_=None):
+        def fake_send(
+            chat_id,
+            auth_token,
+            message,
+            parent,
+            thinking=False,
+            search=False,
+            file_ids_=None,
+        ):
             calls["send"] += 1
+
             async def fail_gen():
-                raise RuntimeError("Empty response from DeepSeek (no parseable SSE content)")
+                raise RuntimeError(
+                    "Empty response from DeepSeek (no parseable SSE content)"
+                )
                 yield ""  # pragma: no cover
+
             return fail_gen()
 
         async def fake_files(messages, token, last_user_only=False):
@@ -150,7 +179,9 @@ def test_retry_budget_is_bounded():
         ]
         saved = _patch(patches)
         try:
-            return await app_module.handle_chat([{"role": "user", "content": "hi"}], "test-model")
+            return await app_module.handle_chat(
+                [{"role": "user", "content": "hi"}], "test-model"
+            )
         finally:
             _restore(saved)
             app_module._chat_locks.clear()
@@ -178,6 +209,7 @@ def main():
             print(f"PASS {t.__name__}")
         except Exception as e:
             import traceback
+
             failed += 1
             print(f"FAIL {t.__name__}: {type(e).__name__}: {e}")
             traceback.print_exc()

@@ -4,7 +4,9 @@ deeperseeker.db
 *.db.bak
 .venv/
 .env
-.omo/
 api_key.txt
 deeperseeker.db-wal
 deeperseeker.db-shm
+.python-version
+.pytest_cache/
+.ruff_cache

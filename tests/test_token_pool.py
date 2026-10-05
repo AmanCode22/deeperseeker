@@ -10,6 +10,7 @@ exclude set for retry rotation (B10).
 
 Run:  python tests/test_token_pool.py   (pytest-compatible)
 """
+
 import os
 import sys
 import time
@@ -40,23 +41,36 @@ def test_cooldown_auto_recovery(tmpdir=None):
     past = time.time() - 5
     future = time.time() + 3600
     conn = fns.get_db()
-    conn.execute("UPDATE tokens SET status='RATE_LIMITED', rate_limited_until=? WHERE id=1", (past,))
-    conn.execute("UPDATE tokens SET status='RATE_LIMITED', rate_limited_until=? WHERE id=2", (future,))
+    conn.execute(
+        "UPDATE tokens SET status='RATE_LIMITED', rate_limited_until=? WHERE id=1",
+        (past,),
+    )
+    conn.execute(
+        "UPDATE tokens SET status='RATE_LIMITED', rate_limited_until=? WHERE id=2",
+        (future,),
+    )
     conn.commit()
     conn.close()
 
     assert fns.pick_token() == 1, "the token whose cooldown expired must be picked"
     row = fns.get_token(1)
-    assert row["status"] == "ACTIVE", "picking a recovered token must flip it back to ACTIVE"
+    assert row["status"] == "ACTIVE", (
+        "picking a recovered token must flip it back to ACTIVE"
+    )
 
     # Still-cooling tokens are never "available", but the soonest-to-recover
     # one is returned as a bounded-wait fallback (the old code returned the
     # first token by id with no backoff logic at all).
     conn = fns.get_db()
-    conn.execute("UPDATE tokens SET status='RATE_LIMITED', rate_limited_until=? WHERE id=1", (future,))
+    conn.execute(
+        "UPDATE tokens SET status='RATE_LIMITED', rate_limited_until=? WHERE id=1",
+        (future,),
+    )
     conn.commit()
     conn.close()
-    assert fns.pick_token() == 1, "with every token cooling, the soonest-to-recover token must be returned"
+    assert fns.pick_token() == 1, (
+        "with every token cooling, the soonest-to-recover token must be returned"
+    )
     # An empty pool still yields None.
     fns.delete_token(1)
     fns.delete_token(2)
@@ -70,7 +84,9 @@ def test_mark_limited_sets_and_clears_cooldown(tmpdir=None):
     fns = _fresh_pool(tmpdir, ["a", "b"])
     fns.mark_limited(1)
     conn = fns.get_db()
-    status, until = conn.execute("SELECT status, rate_limited_until FROM tokens WHERE id=1").fetchone()
+    status, until = conn.execute(
+        "SELECT status, rate_limited_until FROM tokens WHERE id=1"
+    ).fetchone()
     conn.close()
     assert status == "RATE_LIMITED" and until is not None and until > time.time()
 
@@ -81,7 +97,9 @@ def test_mark_limited_sets_and_clears_cooldown(tmpdir=None):
     ).fetchone()
     conn.close()
     assert status == "ACTIVE" and until is None
-    assert last_used is not None and abs(last_used - time.time()) < 60, "mark_active must refresh last_used"
+    assert last_used is not None and abs(last_used - time.time()) < 60, (
+        "mark_active must refresh last_used"
+    )
 
 
 def test_least_in_flight_and_idle_oldest_selection(tmpdir=None):
@@ -112,7 +130,9 @@ def test_least_in_flight_and_idle_oldest_selection(tmpdir=None):
     conn.execute("UPDATE tokens SET last_used=? WHERE id=3", (time.time(),))
     conn.commit()
     conn.close()
-    assert fns.pick_token() == 2, "the least-recently-used token must lead on an in-flight tie"
+    assert fns.pick_token() == 2, (
+        "the least-recently-used token must lead on an in-flight tie"
+    )
 
 
 def test_soft_concurrency_cap_deprioritizes(tmpdir=None):
@@ -123,7 +143,9 @@ def test_soft_concurrency_cap_deprioritizes(tmpdir=None):
     # Saturate token 1 up to the cap; token 2 must take over.
     for _ in range(fns.TOKEN_CONCURRENCY_CAP):
         fns.acquire_token_slot(1)
-    assert fns.pick_token() == 2, "an at-cap token must only be used when nothing else is free"
+    assert fns.pick_token() == 2, (
+        "an at-cap token must only be used when nothing else is free"
+    )
     fns._in_flight.clear()
     # No alternative: the capped token is still usable (soft cap, no starvation).
     fns.delete_token(2)
@@ -136,7 +158,9 @@ def test_exclude_rotates_away_from_failed_token(tmpdir=None):
     tmpdir = tmpdir or tempfile.mkdtemp()
     fns = _fresh_pool(tmpdir, ["a", "b"])
     assert fns.pick_token(exclude={1}) == 2, "the excluded token must be skipped"
-    assert fns.pick_token(exclude={1, 2}) in (1, 2), "excluding everything must still return a token (fallback)"
+    assert fns.pick_token(exclude={1, 2}) in (1, 2), (
+        "excluding everything must still return a token (fallback)"
+    )
 
 
 def test_token_slot_release_is_once_only(tmpdir=None):

@@ -20,6 +20,7 @@ Covers:
 
 Run:  python tests/test_context_rollover.py   (pytest-compatible)
 """
+
 import asyncio
 import os
 import sys
@@ -29,24 +30,25 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import plugin_helper
 from plugin_helper import (
+    _cap_parts,
+    _capped_text,
     build_prompt,
     build_summary_request_prompt,
     build_summary_seed_prompt,
     estimate_conversation_tokens,
     needs_rollover,
     strip_summary_tags,
-    _cap_parts,
-    _capped_text,
 )
 
+
 def big_text(words):
-    return " ".join(["tokenword%d" % i for i in range(words)])
+    return " ".join([f"tokenword{i}" for i in range(words)])
 
 
 def big_history(num_pairs):
     """A conversation of num_pairs user/assistant exchanges, ~250 words each."""
     msgs = [{"role": "user", "content": big_text(250)}]
-    for i in range(num_pairs):
+    for _i in range(num_pairs):
         msgs.append({"role": "assistant", "content": big_text(250)})
         msgs.append({"role": "user", "content": big_text(250)})
     return msgs
@@ -58,21 +60,29 @@ from contextlib import ExitStack
 def low_limit():
     """Context manager patching the rollover limit down to ~90 tokens."""
     stack = ExitStack()
-    stack.enter_context(mock.patch.object(plugin_helper, "OBSERVED_MEMORY_LIMIT_TOKENS", 100))
+    stack.enter_context(
+        mock.patch.object(plugin_helper, "OBSERVED_MEMORY_LIMIT_TOKENS", 100)
+    )
     stack.enter_context(mock.patch.object(plugin_helper, "ROLLOVER_SAFETY_TOKENS", 10))
     return stack
 
 
 def test_small_conversation_no_rollover():
     msgs = big_history(2)
-    assert not needs_rollover(msgs), "small accumulated context must keep the current chat"
+    assert not needs_rollover(msgs), (
+        "small accumulated context must keep the current chat"
+    )
 
 
 def test_large_accumulated_conversation_triggers_rollover():
     msgs = big_history(3)
     with low_limit():
-        assert estimate_conversation_tokens(msgs) > plugin_helper.context_window_tokens()
-        assert needs_rollover(msgs), "accumulated context past the (patched) limit must roll over"
+        assert (
+            estimate_conversation_tokens(msgs) > plugin_helper.context_window_tokens()
+        )
+        assert needs_rollover(msgs), (
+            "accumulated context past the (patched) limit must roll over"
+        )
 
 
 def test_rollover_trigger_is_far_above_legacy_24k_cap():
@@ -80,7 +90,9 @@ def test_rollover_trigger_is_far_above_legacy_24k_cap():
     # the trigger, yet the legacy 24K history cap would have mangled it: the
     # new policy keeps the current chat where the old one truncated.
     msgs = big_history(35)
-    assert estimate_conversation_tokens(msgs) > 15000, "sanity: filler must exceed the old 24K-scale cap"
+    assert estimate_conversation_tokens(msgs) > 15000, (
+        "sanity: filler must exceed the old 24K-scale cap"
+    )
     assert estimate_conversation_tokens(msgs) < plugin_helper.context_window_tokens()
     assert not needs_rollover(msgs)
 
@@ -92,7 +104,9 @@ def test_first_exchange_with_leading_system_never_rolled_over():
         {"role": "system", "content": "you are helpful"},
         {"role": "user", "content": big_text(320000)},
     ]
-    assert not needs_rollover(msgs), "first exchange (with system lead) must not roll over"
+    assert not needs_rollover(msgs), (
+        "first exchange (with system lead) must not roll over"
+    )
 
 
 def test_first_exchange_with_reply_never_rolled_over():
@@ -128,7 +142,9 @@ def test_summary_request_prompt_shape():
 
 def test_summary_seed_prompt_preserves_newest_and_summary():
     summary = "Goal: deploy. Done: tests pass. Last request: fix the flaky test."
-    prompt = build_summary_seed_prompt(summary, current_user_message="run the suite again")
+    prompt = build_summary_seed_prompt(
+        summary, current_user_message="run the suite again"
+    )
     assert "[PREVIOUS CONVERSATION SUMMARY]" in prompt
     assert summary in prompt
     assert "[USER]\nrun the suite again" in prompt
@@ -139,7 +155,10 @@ def test_summary_seed_prompt_preserves_newest_and_summary():
 def test_build_prompt_rollover_restores_runtime_contract():
     """Issue #30: rollover must reinject system prompt, [TOOLS], and tool instructions."""
     msgs = [
-        {"role": "system", "content": "You are a coding agent. Always inspect files first."},
+        {
+            "role": "system",
+            "content": "You are a coding agent. Always inspect files first.",
+        },
         {"role": "user", "content": "old question"},
         {"role": "assistant", "content": "old answer"},
         {"role": "user", "content": "run ls again"},
@@ -150,13 +169,18 @@ def test_build_prompt_rollover_restores_runtime_contract():
             "function": {
                 "name": "Bash",
                 "description": "Run a shell command",
-                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                },
             },
         }
     ]
     summary = "Goal: list files. Last request: run ls again."
     prompt = asyncio.run(
-        build_prompt(msgs, tools, "v4.1flash", is_first_message=True, rollover_summary=summary)
+        build_prompt(
+            msgs, tools, "v4.1flash", is_first_message=True, rollover_summary=summary
+        )
     )
     tools_idx = prompt.find("[TOOLS]")
     system_idx = prompt.find("[SYSTEM]")
@@ -198,21 +222,47 @@ def test_build_prompt_rollover_branch_seeds_summary_and_preserves_newest():
     msgs = [
         {"role": "user", "content": "old question " + big_text(50)},
         {"role": "assistant", "content": "old answer"},
-        {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
-        ]},
-        {"role": "tool", "tool_call_id": "t1", "name": "Bash", "content": big_text(20000)},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "Bash",
+                    "input": {"command": "ls"},
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "t1",
+            "name": "Bash",
+            "content": big_text(20000),
+        },
         {"role": "user", "content": "now summarize what you found"},
     ]
     summary = "Goal: inspect files. Done: ran ls. Last request: summarize findings."
-    prompt = asyncio.run(build_prompt(msgs, [], "v4.1flash", is_first_message=True, rollover_summary=summary))
-    assert "[PREVIOUS CONVERSATION SUMMARY]" in prompt and summary in prompt, "seed must contain the summary"
-    assert "[USER]\nnow summarize what you found" in prompt, "newest user message must be kept"
-    assert "Bash" in prompt and "Call ID: t1" in prompt, "relevant newest tool result must be kept"
+    prompt = asyncio.run(
+        build_prompt(
+            msgs, [], "v4.1flash", is_first_message=True, rollover_summary=summary
+        )
+    )
+    assert "[PREVIOUS CONVERSATION SUMMARY]" in prompt and summary in prompt, (
+        "seed must contain the summary"
+    )
+    assert "[USER]\nnow summarize what you found" in prompt, (
+        "newest user message must be kept"
+    )
+    assert "Bash" in prompt and "Call ID: t1" in prompt, (
+        "relevant newest tool result must be kept"
+    )
     from functions import count_tokens
     from plugin_helper import MAX_TOOL_RESULTS_TOKENS
+
     assert count_tokens(prompt) < 20000 + MAX_TOOL_RESULTS_TOKENS + 2000
-    assert "old question" not in prompt, "old accumulated history must not be re-forwarded on rollover"
+    assert "old question" not in prompt, (
+        "old accumulated history must not be re-forwarded on rollover"
+    )
 
 
 def test_tool_results_capped():
@@ -222,8 +272,9 @@ def test_tool_results_capped():
 
 
 def test_trim_to_budget_never_exceeds_budget():
-    from plugin_helper import _trim_to_budget
     from functions import count_tokens
+    from plugin_helper import _trim_to_budget
+
     huge = big_text(20000)
     trimmed = _trim_to_budget(huge, 50)
     assert count_tokens(trimmed) <= 50
@@ -233,17 +284,25 @@ def test_trim_to_budget_never_exceeds_budget():
 
 def test_attachments_described_not_forwarded():
     msgs = [
-        {"role": "user", "content": [
-            {"type": "text", "text": "what does this chart show?"},
-            {"type": "image_url", "image_url": {"url": "https://example.com/chart.png"}},
-        ]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what does this chart show?"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/chart.png"},
+                },
+            ],
+        },
         {"role": "assistant", "content": "It shows a rising trend."},
         {"role": "user", "content": "elaborate"},
     ]
     described = plugin_helper._describe_attachments(msgs[0]["content"])
     assert "image" in described
     plain = plugin_helper._messages_plain_text(msgs)
-    assert "[attachment: image shared]" in plain, "attachment must be described in words"
+    assert "[attachment: image shared]" in plain, (
+        "attachment must be described in words"
+    )
     assert "data:image" not in plain
 
 
@@ -264,7 +323,9 @@ def test_cap_parts_keeps_newest():
 def test_env_formula_consistent():
     # Reload-free check: helpers are consistent with their constants.
     assert plugin_helper.context_window_tokens() == max(
-        1, plugin_helper.OBSERVED_MEMORY_LIMIT_TOKENS - plugin_helper.ROLLOVER_SAFETY_TOKENS
+        1,
+        plugin_helper.OBSERVED_MEMORY_LIMIT_TOKENS
+        - plugin_helper.ROLLOVER_SAFETY_TOKENS,
     )
     assert plugin_helper.max_output_tokens() == plugin_helper.OBSERVED_MAX_OUTPUT_TOKENS
 
@@ -285,7 +346,9 @@ def test_handle_chat_rollover_seeds_new_chat_with_summary():
         calls["chats"].append(1)
         return f"chat-{len(calls['chats']) - 1}"
 
-    def fake_send_message(chat_id, token, message, parent, thinking=False, search=False, file_ids=None):
+    def fake_send_message(
+        chat_id, token, message, parent, thinking=False, search=False, file_ids=None
+    ):
         calls["sends"].append((chat_id, message))
 
         async def _gen():
@@ -293,16 +356,27 @@ def test_handle_chat_rollover_seeds_new_chat_with_summary():
                 yield f"[SUMMARY] {SUMMARY_REPLY}"
             else:
                 yield FINAL_REPLY
+
         return _gen()
 
     async def fake_collect(gen):
         return "".join([c async for c in gen])
 
-    originals = {n: getattr(app, n) for n in (
-        "get_auth_token", "pick_token", "get_token", "create_new_chat",
-        "send_message", "save_session", "delete_sessions_for_chat",
-        "mark_active", "find_session", "collect_response",
-    )}
+    originals = {
+        n: getattr(app, n)
+        for n in (
+            "get_auth_token",
+            "pick_token",
+            "get_token",
+            "create_new_chat",
+            "send_message",
+            "save_session",
+            "delete_sessions_for_chat",
+            "mark_active",
+            "find_session",
+            "collect_response",
+        )
+    }
     try:
         app.get_auth_token = lambda: "tok"
         app.pick_token = lambda *a, **k: 1
@@ -317,20 +391,30 @@ def test_handle_chat_rollover_seeds_new_chat_with_summary():
 
         with low_limit():
             msgs = big_history(3)
-            result = asyncio.run(app.handle_chat(msgs, "v4.1flash", False, False, False, None))
+            result = asyncio.run(
+                app.handle_chat(msgs, "v4.1flash", False, False, False, None)
+            )
     finally:
         for n, fn in originals.items():
             setattr(app, n, fn)
 
     assert len(calls["chats"]) == 2, "scratch chat + real chat must be created"
-    summary_sends = [(cid, m) for cid, m in calls["sends"] if m.startswith("[SYSTEM]\nSummarize")]
-    real_sends = [(cid, m) for cid, m in calls["sends"] if not m.startswith("[SYSTEM]\nSummarize")]
+    summary_sends = [
+        (cid, m) for cid, m in calls["sends"] if m.startswith("[SYSTEM]\nSummarize")
+    ]
+    real_sends = [
+        (cid, m) for cid, m in calls["sends"] if not m.startswith("[SYSTEM]\nSummarize")
+    ]
     assert len(summary_sends) == 1, "exactly one scratch-chat summary request"
     assert len(real_sends) == 1, "exactly one real prompt send"
-    assert summary_sends[0][0] == "chat-0", "summary must be requested in the scratch chat"
+    assert summary_sends[0][0] == "chat-0", (
+        "summary must be requested in the scratch chat"
+    )
     assert real_sends[0][0] == "chat-1", "real prompt must go to the fresh chat"
     seed = real_sends[0][1]
-    assert "[PREVIOUS CONVERSATION SUMMARY]" in seed, "new chat must be seeded with the summary"
+    assert "[PREVIOUS CONVERSATION SUMMARY]" in seed, (
+        "new chat must be seeded with the summary"
+    )
     assert SUMMARY_REPLY in seed
     assert "[USER]" in seed, "newest user message must be present in the seed"
     assert result["choices"][0]["message"]["content"] == FINAL_REPLY
@@ -345,7 +429,9 @@ def test_handle_chat_rollover_seed_includes_tools_when_provided():
         calls["chats"].append(1)
         return f"chat-{len(calls['chats']) - 1}"
 
-    def fake_send_message(chat_id, token, message, parent, thinking=False, search=False, file_ids=None):
+    def fake_send_message(
+        chat_id, token, message, parent, thinking=False, search=False, file_ids=None
+    ):
         calls["sends"].append((chat_id, message))
 
         async def _gen():
@@ -353,6 +439,7 @@ def test_handle_chat_rollover_seed_includes_tools_when_provided():
                 yield f"[SUMMARY] {SUMMARY_REPLY}"
             else:
                 yield FINAL_REPLY
+
         return _gen()
 
     async def fake_collect(gen):
@@ -364,11 +451,21 @@ def test_handle_chat_rollover_seed_includes_tools_when_provided():
             "function": {"name": "Grep", "description": "search", "parameters": {}},
         }
     ]
-    originals = {n: getattr(app, n) for n in (
-        "get_auth_token", "pick_token", "get_token", "create_new_chat",
-        "send_message", "save_session", "delete_sessions_for_chat",
-        "mark_active", "find_session", "collect_response",
-    )}
+    originals = {
+        n: getattr(app, n)
+        for n in (
+            "get_auth_token",
+            "pick_token",
+            "get_token",
+            "create_new_chat",
+            "send_message",
+            "save_session",
+            "delete_sessions_for_chat",
+            "mark_active",
+            "find_session",
+            "collect_response",
+        )
+    }
     try:
         app.get_auth_token = lambda: "tok"
         app.pick_token = lambda *a, **k: 1
@@ -383,12 +480,16 @@ def test_handle_chat_rollover_seed_includes_tools_when_provided():
 
         with low_limit():
             msgs = big_history(3)
-            asyncio.run(app.handle_chat(msgs, "v4.1flash", False, False, False, tool_list))
+            asyncio.run(
+                app.handle_chat(msgs, "v4.1flash", False, False, False, tool_list)
+            )
     finally:
         for n, fn in originals.items():
             setattr(app, n, fn)
 
-    real_sends = [(cid, m) for cid, m in calls["sends"] if not m.startswith("[SYSTEM]\nSummarize")]
+    real_sends = [
+        (cid, m) for cid, m in calls["sends"] if not m.startswith("[SYSTEM]\nSummarize")
+    ]
     assert len(real_sends) == 1
     seed = real_sends[0][1]
     assert "[TOOLS]" in seed and "Tool: Grep" in seed
@@ -427,11 +528,14 @@ def test_chat_moved_branch_re_reads_parent_under_fresh_lock():
     def fake_get_token(tid):
         return {"id": tid, "token": f"tok-{tid}", "status": "ACTIVE"}
 
-    def fake_send(chat_id, token, message, parent, thinking=False, search=False, file_ids=None):
+    def fake_send(
+        chat_id, token, message, parent, thinking=False, search=False, file_ids=None
+    ):
         calls["sends"].append((chat_id, parent))
 
         async def _gen():
             yield "ok"
+
         return _gen()
 
     async def fake_create_chat(token):
@@ -445,10 +549,20 @@ def test_chat_moved_branch_re_reads_parent_under_fresh_lock():
         return "prompt"
 
     names = (
-        "get_auth_token", "generate_signature", "find_session", "get_token",
-        "send_message", "create_new_chat", "extract_and_upload_files",
-        "build_prompt", "save_session", "delete_sessions_for_chat",
-        "mark_active", "mark_limited", "parse_tools", "format_response",
+        "get_auth_token",
+        "generate_signature",
+        "find_session",
+        "get_token",
+        "send_message",
+        "create_new_chat",
+        "extract_and_upload_files",
+        "build_prompt",
+        "save_session",
+        "delete_sessions_for_chat",
+        "mark_active",
+        "mark_limited",
+        "parse_tools",
+        "format_response",
     )
     originals = {n: getattr(app, n) for n in names}
     try:
@@ -468,7 +582,9 @@ def test_chat_moved_branch_re_reads_parent_under_fresh_lock():
         app.format_response = lambda text, model, messages, tools=None: text
 
         app._chat_locks.clear()
-        result = asyncio.run(app.handle_chat([{"role": "user", "content": "hi"}], "v4.1flash"))
+        result = asyncio.run(
+            app.handle_chat([{"role": "user", "content": "hi"}], "v4.1flash")
+        )
     finally:
         for n, fn in originals.items():
             setattr(app, n, fn)
@@ -476,8 +592,9 @@ def test_chat_moved_branch_re_reads_parent_under_fresh_lock():
 
     assert result == "ok"
     assert calls["created"] == [], "following a moved chat must not create a new chat"
-    assert calls["sends"] == [("chat-B", 7)], \
+    assert calls["sends"] == [("chat-B", 7)], (
         f"send must target the moved chat with the RE-READ parent, got {calls['sends']}"
+    )
 
 
 TESTS = [

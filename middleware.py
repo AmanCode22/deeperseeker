@@ -43,6 +43,7 @@ logger = logging.getLogger("uvicorn.error")
 #   * A malformed/non-IP entry in the chain stops the walk (never skipped over).
 # ==============================================================================
 
+
 def parse_trusted_proxies(raw):
     """Parse a comma-separated CIDR list. Invalid entries are skipped with a
     warning (they simply grant no trust — failing closed, never open)."""
@@ -136,6 +137,7 @@ class RealIPMiddleware:
 # Stage 0.1 — RequestID: correlation id + access log
 # ==============================================================================
 
+
 class RequestIDMiddleware:
     """Attach a per-request id, echo it back as X-Request-ID, and emit one
     access-log line per request: request id, method, path, status, duration,
@@ -156,7 +158,9 @@ class RequestIDMiddleware:
             if key == b"x-request-id":
                 inbound = value.decode("latin-1").strip()
                 break
-        request_id = inbound if _REQUEST_ID_RE.match(inbound or "") else uuid.uuid4().hex
+        request_id = (
+            inbound if _REQUEST_ID_RE.match(inbound or "") else uuid.uuid4().hex
+        )
         state["request_id"] = request_id
 
         started = time.perf_counter()
@@ -165,7 +169,9 @@ class RequestIDMiddleware:
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
                 status_holder["status"] = message["status"]
-                message.setdefault("headers", []).append((b"x-request-id", request_id.encode("latin-1")))
+                message.setdefault("headers", []).append(
+                    (b"x-request-id", request_id.encode("latin-1"))
+                )
             await send(message)
 
         try:
@@ -177,7 +183,9 @@ class RequestIDMiddleware:
                 request_id,
                 scope.get("method", "-"),
                 scope.get("path", "-"),
-                status_holder["status"] if status_holder["status"] is not None else "ERR",
+                status_holder["status"]
+                if status_holder["status"] is not None
+                else "ERR",
                 duration_ms,
                 state.get("real_ip", "-"),
             )
@@ -186,6 +194,7 @@ class RequestIDMiddleware:
 # ==============================================================================
 # Stage 0.1 — Recoverer: last-resort exception barrier
 # ==============================================================================
+
 
 class RecovererMiddleware:
     """Catch any unhandled exception escaping the route stack, log it with the
@@ -225,12 +234,20 @@ class RecovererMiddleware:
             if response_started["v"]:
                 raise
             body = json.dumps(
-                {"error": {"message": "Internal server error", "type": "internal_error", "request_id": request_id}}
+                {
+                    "error": {
+                        "message": "Internal server error",
+                        "type": "internal_error",
+                        "request_id": request_id,
+                    }
+                }
             ).encode("utf-8")
             headers = [
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(body)).encode("latin-1")),
                 (b"x-request-id", request_id.encode("latin-1")),
             ]
-            await send({"type": "http.response.start", "status": 500, "headers": headers})
+            await send(
+                {"type": "http.response.start", "status": 500, "headers": headers}
+            )
             await send({"type": "http.response.body", "body": body})

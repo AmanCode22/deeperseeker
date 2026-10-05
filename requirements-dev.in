@@ -1,0 +1,3 @@
+-r requirements-tests.in
+ruff
+pip-tools

@@ -1,0 +1,4 @@
+-r requirements-waf-backup.in
+pytest
+pytest-asyncio
+httpx

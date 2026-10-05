@@ -14,14 +14,18 @@ Covers the review items on StreamToolParser:
 
 Run:  python tests/test_stream_edge_cases.py   (pytest-compatible)
 """
+
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from functions import StreamToolParser, parse_tools  # noqa: E402
-from functions import _is_plausible_stream_entry_prefix  # noqa: E402
-from functions import _is_plausible_stream_closer_prefix  # noqa: E402
+from functions import (  # noqa: E402
+    StreamToolParser,
+    _is_plausible_stream_closer_prefix,  # noqa: E402
+    _is_plausible_stream_entry_prefix,  # noqa: E402
+    parse_tools,
+)
 
 OPEN = "<"  # guard against editor/tooling eating angle-bracket literals
 CLOSE = ">"
@@ -65,7 +69,9 @@ def args_of(tools, index=0):
 def test_fix1_flush_salvages_attribute_style_tool():
     """Attribute-style tool cut off before the closer: flush() must emit the tool,
     not dump raw parameter values as chat text."""
-    corpus = xml('[LT]tool_call name="Bash"[GT][LT]parameter name="command"[GT]ls -la[LT]/parameter[GT]')
+    corpus = xml(
+        '[LT]tool_call name="Bash"[GT][LT]parameter name="command"[GT]ls -la[LT]/parameter[GT]'
+    )
     p = StreamToolParser()
     text, tools = feed_all(p, corpus, 7)
     assert tools == [] and text == "", "nothing should be emitted before flush"
@@ -100,7 +106,7 @@ def test_fix1_flush_drops_wrapper_noise_after_json():
 def test_fix1_flush_unparseable_still_strips_to_text():
     """When nothing parses (no name attribute, no JSON), legacy behaviour stands:
     strip wrapper tags, dump the remainder as text."""
-    corpus = xml('[LT]tool_call[GT]not a tool body')
+    corpus = xml("[LT]tool_call[GT]not a tool body")
     p = StreamToolParser()
     feed_all(p, corpus, 4)
     f_text, f_tools = flush_all(p)
@@ -127,7 +133,9 @@ def test_fix2_hold_and_flush_edge_cases():
         assert flush_tools == [] and flush_text == "", label
         prefix_parser = StreamToolParser()
         head, head_tools = feed_all(prefix_parser, corpus[:cutoff], chunk_size)
-        assert head_tools == [] and head == corpus[:cutoff] and prefix_parser.buffer == "", label
+        assert (
+            head_tools == [] and head == corpus[:cutoff] and prefix_parser.buffer == ""
+        ), label
     eof_parser = StreamToolParser()
     before_eof, before_tools = feed_all(eof_parser, "1 < c", 1)
     assert before_tools == [] and before_eof == "1 " and eof_parser.buffer == "< c"
@@ -135,9 +143,17 @@ def test_fix2_hold_and_flush_edge_cases():
     assert tail_tools == [] and before_eof + tail_text == "1 < c"
     closer_parser = StreamToolParser()
     streamed_before, before_closer_tools = feed_all(closer_parser, "a</tool", 1)
-    assert before_closer_tools == [] and streamed_before == "a" and closer_parser.buffer == "</tool"
+    assert (
+        before_closer_tools == []
+        and streamed_before == "a"
+        and closer_parser.buffer == "</tool"
+    )
     streamed_after, after_closer_tools = feed_all(closer_parser, "_x", 1)
-    assert after_closer_tools == [] and streamed_after == "</tool_x" and closer_parser.buffer == ""
+    assert (
+        after_closer_tools == []
+        and streamed_after == "</tool_x"
+        and closer_parser.buffer == ""
+    )
     closer_flush_text, closer_flush_tools = flush_all(closer_parser)
     assert closer_flush_tools == [] and closer_flush_text == ""
     empty_parser = StreamToolParser()
@@ -152,23 +168,70 @@ def test_fix2_hold_and_flush_edge_cases():
 
 def test_plausibility_helpers_track_entry_and_closer_grammar():
     entry_true = [
-        "<", "< ", "<|", "<||", "<||D", "<||DS", "<||DSM", "<||DSML",
-        "<||DSML|", "<||DSML||", "<||DSML|| ",
-        "<||DSML|| i", "<||DSML|| invo", "<||DSML|| invoke",
-        "<||DSML|| invoke ", "<||DSML|| invoke n", "<||DSML|| invoke na",
-        "<||DSML|| invoke name=", '<||DSML|| invoke name="',
-        '<||DSML|| invoke name="abc', '<||DSML|| invoke name="abc"',
-        "< c", "< ca", "< calls", "< t", "< to", "< too",
-        "<|invo", "<||dsml|| c", "<invoke ",
+        "<",
+        "< ",
+        "<|",
+        "<||",
+        "<||D",
+        "<||DS",
+        "<||DSM",
+        "<||DSML",
+        "<||DSML|",
+        "<||DSML||",
+        "<||DSML|| ",
+        "<||DSML|| i",
+        "<||DSML|| invo",
+        "<||DSML|| invoke",
+        "<||DSML|| invoke ",
+        "<||DSML|| invoke n",
+        "<||DSML|| invoke na",
+        "<||DSML|| invoke name=",
+        '<||DSML|| invoke name="',
+        '<||DSML|| invoke name="abc',
+        '<||DSML|| invoke name="abc"',
+        "< c",
+        "< ca",
+        "< calls",
+        "< t",
+        "< to",
+        "< too",
+        "<|invo",
+        "<||dsml|| c",
+        "<invoke ",
     ]
     entry_false = [
-        "", "x", "<b", "< b", "< cat", "< callsign", "< callsi", "< th",
-        "< invx", "< D", "< DSML", "<| D", "<|y|", "</", "</b", "</invoke",
-        "<||DSML|||", '<||DSML|| invoke name="abc">',
+        "",
+        "x",
+        "<b",
+        "< b",
+        "< cat",
+        "< callsign",
+        "< callsi",
+        "< th",
+        "< invx",
+        "< D",
+        "< DSML",
+        "<| D",
+        "<|y|",
+        "</",
+        "</b",
+        "</invoke",
+        "<||DSML|||",
+        '<||DSML|| invoke name="abc">',
     ]
     closer_true = [
-        "</", "</ ", "</i", "</inv", "</invo", "</invoke", "</invoke ",
-        "</tool", "</tool_", "</|", "</||DSML|| c", "</||DSML|| calls",
+        "</",
+        "</ ",
+        "</i",
+        "</inv",
+        "</invo",
+        "</invoke",
+        "</invoke ",
+        "</tool",
+        "</tool_",
+        "</|",
+        "</||DSML|| c",
+        "</||DSML|| calls",
     ]
     closer_false = ["", "</b", "</ cat", "</tool_x", "</||DSML|| calr", "</x"]
     checks = (
@@ -184,7 +247,9 @@ def test_plausibility_helpers_track_entry_and_closer_grammar():
 
 def test_fix3_mismatched_plain_closer():
     """</tool_calls> must close a <tool_call> block during feed (regression lock)."""
-    corpus = xml('[LT]tool_call[GT]{"name": "Bash", "arguments": {"command": "ls"}}[LT]/tool_calls[GT]')
+    corpus = xml(
+        '[LT]tool_call[GT]{"name": "Bash", "arguments": {"command": "ls"}}[LT]/tool_calls[GT]'
+    )
     p = StreamToolParser()
     text, tools = feed_all(p, corpus, 5)
     assert names(tools) == ["Bash"], f"mismatched closer must not hang, got {tools}"
@@ -194,7 +259,9 @@ def test_fix3_mismatched_plain_closer():
 
 def test_fix3_decorated_closer_halfwidth():
     """</|tool_call|> must close the block during feed, not just by JSON accident."""
-    corpus = xml('[LT]tool_call name="Bash"[GT][LT]parameter name="command"[GT]ls[LT]/parameter[GT][LT]/|tool_call[GT]')
+    corpus = xml(
+        '[LT]tool_call name="Bash"[GT][LT]parameter name="command"[GT]ls[LT]/parameter[GT][LT]/|tool_call[GT]'
+    )
     p = StreamToolParser()
     text, tools = feed_all(p, corpus, 6)
     assert names(tools) == ["Bash"], f"decorated closer must close block, got {tools}"
@@ -205,7 +272,9 @@ def test_fix3_decorated_closer_halfwidth():
 
 def test_fix3_decorated_closer_fullwidth():
     """</｜tool_call｜> (fullwidth bars) must also close the block during feed."""
-    corpus = xml('[LT]tool_call name="Read"[GT][LT]parameter name="path"[GT]/tmp/a[LT]/parameter[GT][LT]/｜tool_call[GT]')
+    corpus = xml(
+        '[LT]tool_call name="Read"[GT][LT]parameter name="path"[GT]/tmp/a[LT]/parameter[GT][LT]/｜tool_call[GT]'
+    )
     p = StreamToolParser()
     text, tools = feed_all(p, corpus, 4)
     assert names(tools) == ["Read"], tools
@@ -214,7 +283,9 @@ def test_fix3_decorated_closer_fullwidth():
 
 def test_fix3_cross_family_closer():
     """</invoke> must close a <function_call> block (family-wide fallback)."""
-    corpus = xml('[LT]function_call[GT]{"name": "Bash", "arguments": {}}[LT]/invoke[GT]')
+    corpus = xml(
+        '[LT]function_call[GT]{"name": "Bash", "arguments": {}}[LT]/invoke[GT]'
+    )
     p = StreamToolParser()
     text, tools = feed_all(p, corpus, 7)
     assert names(tools) == ["Bash"], tools
@@ -222,7 +293,13 @@ def test_fix3_cross_family_closer():
 
 def test_flush_is_terminal_and_resets_state():
     p = StreamToolParser()
-    feed_all(p, xml('[LT]tool_call name="Bash"[GT][LT]parameter name="command"[GT]ls[LT]/parameter[GT]'), 5)
+    feed_all(
+        p,
+        xml(
+            '[LT]tool_call name="Bash"[GT][LT]parameter name="command"[GT]ls[LT]/parameter[GT]'
+        ),
+        5,
+    )
     p.flush()
     assert p.buffer == "" and not p.in_tool and not p.json_done
     assert p.flush() == []
@@ -230,7 +307,9 @@ def test_flush_is_terminal_and_resets_state():
 
 def test_complete_blocks_unchanged():
     """Guard: happy-path behaviour is untouched."""
-    corpus = xml('Working.[LT]tool_call[GT]{"name": "Bash", "arguments": {"command": "ls -la"}}[LT]/tool_call[GT]Done.')
+    corpus = xml(
+        'Working.[LT]tool_call[GT]{"name": "Bash", "arguments": {"command": "ls -la"}}[LT]/tool_call[GT]Done.'
+    )
     p = StreamToolParser()
     text, tools = feed_all(p, corpus, 6)
     assert names(tools) == ["Bash"] and args_of(tools) == {"command": "ls -la"}
@@ -242,8 +321,17 @@ def test_complete_blocks_unchanged():
 def _build_block(decor, spacing, tool_name, params, nested=False):
     opener = "<" + decor + spacing + 'invoke name="' + tool_name + '">'
     body = "".join(
-        "<" + decor + spacing + 'parameter name="' + name + '" string="true">' + value
-        + "</" + decor + spacing + "parameter>"
+        "<"
+        + decor
+        + spacing
+        + 'parameter name="'
+        + name
+        + '" string="true">'
+        + value
+        + "</"
+        + decor
+        + spacing
+        + "parameter>"
         for name, value in params.items()
     )
     closer = "</" + decor + spacing + "invoke>"
@@ -271,20 +359,42 @@ def test_dsml_openers_parse_when_split_across_chunks():
     cases = []
     for label, decor, spacing, nested in dialect_shapes:
         opener, corpus = _build_block(decor, spacing, mcp_tool, file_uri, nested)
-        cases.append((label, corpus, (1, max(len(opener) - 1, 1), len(opener)), mcp_tool, file_uri))
+        cases.append(
+            (
+                label,
+                corpus,
+                (1, max(len(opener) - 1, 1), len(opener)),
+                mcp_tool,
+                file_uri,
+            )
+        )
     long_tool = "mcp_" + "x" * 5000
     long_param = "p" * 300
     long_value = "v" * 5000
     opener, corpus = _build_block(marker, "", long_tool, {long_param: long_value})
     assert len(opener) > 5000
-    cases.append(("unbounded_opener", corpus, (1, 7, len(opener) - 1, len(opener)), long_tool, {long_param: long_value}))
-    cases.append((
-        "json_body",
-        "<" + marker + 'tool_call>{"name": "Bash", "arguments": {"command": "ls -la"}}</' + marker + "tool_call>",
-        (1, 5, 11),
-        "Bash",
-        {"command": "ls -la"},
-    ))
+    cases.append(
+        (
+            "unbounded_opener",
+            corpus,
+            (1, 7, len(opener) - 1, len(opener)),
+            long_tool,
+            {long_param: long_value},
+        )
+    )
+    cases.append(
+        (
+            "json_body",
+            "<"
+            + marker
+            + 'tool_call>{"name": "Bash", "arguments": {"command": "ls -la"}}</'
+            + marker
+            + "tool_call>",
+            (1, 5, 11),
+            "Bash",
+            {"command": "ls -la"},
+        )
+    )
     for label, corpus, chunk_sizes, tool_name, tool_args in cases:
         for chunk_size in chunk_sizes:
             where = f"{label} chunk={chunk_size}"
@@ -329,7 +439,9 @@ def test_fix5_bare_markers_do_not_break_real_tool_calls():
     fullwidth_bar = "\uff5c"
     marker = fullwidth_bar * 2 + "DSML" + fullwidth_bar * 2
     bare_noise = "</" + marker + ">"
-    param = xml('[LT]parameter name="command" string="true"[GT]ls -la[LT]/parameter[GT]')
+    param = xml(
+        '[LT]parameter name="command" string="true"[GT]ls -la[LT]/parameter[GT]'
+    )
     tool = "<" + marker + 'invoke name="Bash">' + param + "</" + marker + "invoke>"
     corpus = "intro" + bare_noise + tool + "outro"
     for chunk_size in (1, 4, len(corpus)):
@@ -351,12 +463,12 @@ def test_fix6_plural_function_calls_container_streams_clean():
     and no DSML text may leak."""
     fullwidth_bar = "\uff5c"
     marker = fullwidth_bar * 2 + "DSML" + fullwidth_bar * 2
-    param = xml('[LT]parameter name="command" string="true"[GT]ls -la[LT]/parameter[GT]')
+    param = xml(
+        '[LT]parameter name="command" string="true"[GT]ls -la[LT]/parameter[GT]'
+    )
     tool = "<" + marker + 'invoke name="Bash">' + param + "</" + marker + "invoke>"
     corpus = (
-        "<" + marker + " function_calls>"
-        + tool
-        + "</" + marker + " function_calls>"
+        "<" + marker + " function_calls>" + tool + "</" + marker + " function_calls>"
     )
     for chunk_size in (1, 2, 5, len(corpus)):
         where = f"chunk={chunk_size}"
@@ -376,12 +488,18 @@ def test_fix6_plural_function_calls_parse_tools():
     removes it from the companion text."""
     fullwidth_bar = "\uff5c"
     marker = fullwidth_bar * 2 + "DSML" + fullwidth_bar * 2
-    param = xml('[LT]parameter name="command" string="true"[GT]ls -la[LT]/parameter[GT]')
+    param = xml(
+        '[LT]parameter name="command" string="true"[GT]ls -la[LT]/parameter[GT]'
+    )
     tool = "<" + marker + 'invoke name="Bash">' + param + "</" + marker + "invoke>"
     corpus = (
-        "before <" + marker + " function_calls>"
+        "before <"
+        + marker
+        + " function_calls>"
         + tool
-        + "</" + marker + " function_calls> after"
+        + "</"
+        + marker
+        + " function_calls> after"
     )
     parsed, clean = parse_tools(corpus)
     assert names(parsed) == ["Bash"], parsed

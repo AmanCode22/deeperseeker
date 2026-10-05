@@ -9,6 +9,7 @@ own token.
 
 Run:  python tests/test_file_ownership.py   (pytest-compatible)
 """
+
 import asyncio
 import os
 import sys
@@ -31,7 +32,9 @@ def test_record_and_lookup_first_owner_wins():
     _fresh_db()
     functions.record_file("file-1", 2)
     assert functions.get_file_token("file-1") == 2
-    functions.record_file("file-1", 5)  # a later upload elsewhere must NOT steal ownership
+    functions.record_file(
+        "file-1", 5
+    )  # a later upload elsewhere must NOT steal ownership
     assert functions.get_file_token("file-1") == 2
     assert functions.get_file_token("missing") is None
 
@@ -41,16 +44,31 @@ def test_referenced_file_ids_scan():
 
     msgs = [
         {"role": "user", "content": "plain text"},
-        {"role": "user", "content": [
-            {"type": "text", "text": "use this"},
-            {"type": "file", "file": {"file_id": "file-openai"}},
-        ]},
-        {"role": "user", "content": [
-            {"type": "document", "source": {"type": "file", "file_id": "file-anthropic"}},
-        ]},
-        {"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "data": "..."}},  # not a reference
-        ]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "use this"},
+                {"type": "file", "file": {"file_id": "file-openai"}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "document",
+                    "source": {"type": "file", "file_id": "file-anthropic"},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "data": "..."},
+                },  # not a reference
+            ],
+        },
     ]
     assert app_module._referenced_file_ids(msgs) == ["file-openai", "file-anthropic"]
     assert app_module._referenced_file_ids([{"role": "user", "content": "str"}]) == []
@@ -71,28 +89,45 @@ def test_rehome_replaces_foreign_and_keeps_owned():
     async def fake_upload(file_bytes, file_name, file_content_type, auth_token):
         assert auth_token == "tok-1", "the copy must be uploaded with the CHAT's token"
         yield ("uploaded", "ignored")
-        yield ("success", {"file_id": "file-copy", "openai_timestamp": 0, "size": 4,
-                           "anthropic_timestamp": "1970-01-01T00:00:00Z"})
+        yield (
+            "success",
+            {
+                "file_id": "file-copy",
+                "openai_timestamp": 0,
+                "size": 4,
+                "anthropic_timestamp": "1970-01-01T00:00:00Z",
+            },
+        )
 
     saved_get_token = app_module.get_token
     saved_get_file_content = app_module.get_file_content
     saved_upload = app_module.upload_file
-    app_module.get_token = lambda tid: {"id": tid, "token": f"tok-{tid}", "status": "ACTIVE"}
+    app_module.get_token = lambda tid: {
+        "id": tid,
+        "token": f"tok-{tid}",
+        "status": "ACTIVE",
+    }
     app_module.get_file_content = fake_get_file_content
     app_module.upload_file = fake_upload
     try:
         tok = {"id": 1, "token": "tok-1", "status": "ACTIVE"}
-        out = asyncio.run(app_module._rehome_foreign_files(
-            ["file-owned", "file-foreign", "file-legacy"], 1, tok
-        ))
+        out = asyncio.run(
+            app_module._rehome_foreign_files(
+                ["file-owned", "file-foreign", "file-legacy"], 1, tok
+            )
+        )
     finally:
         app_module.get_token = saved_get_token
         app_module.get_file_content = saved_get_file_content
         app_module.upload_file = saved_upload
 
     assert out == ["file-owned", "file-copy", "file-legacy"], out
-    assert functions.get_file_token("file-copy") == 1, "the copy must be pinned to the chat's token"
-    assert functions.get_file_token("file-foreign") == 2, "the original mapping must stay untouched"
+    assert functions.get_file_token("file-copy") == 1, (
+        "the copy must be pinned to the chat's token"
+    )
+    assert functions.get_file_token("file-foreign") == 2, (
+        "the original mapping must stay untouched"
+    )
 
 
 def test_chat_prefers_file_owner_token_on_first_turn():
@@ -113,11 +148,20 @@ def test_chat_prefers_file_owner_token_on_first_turn():
         def fake_get_token(tid):
             return {"id": tid, "token": f"tok-{tid}", "status": "ACTIVE"}
 
-        def fake_send(chat_id, auth_token, message, parent, thinking=False, search=False, file_ids_=None):
+        def fake_send(
+            chat_id,
+            auth_token,
+            message,
+            parent,
+            thinking=False,
+            search=False,
+            file_ids_=None,
+        ):
             calls["tokens"].append((auth_token, tuple(file_ids_ or [])))
 
             async def gen():
                 yield "ok"
+
             return gen()
 
         async def fake_create_chat(token):
@@ -132,10 +176,15 @@ def test_chat_prefers_file_owner_token_on_first_turn():
         def fake_save(s, tid, sid, parent):
             calls["sessions"].append((tid, sid, parent))
 
-        messages = [{"role": "user", "content": [
-            {"type": "text", "text": "what does this say?"},
-            {"type": "file", "file": {"file_id": "file-openai"}},
-        ]}]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what does this say?"},
+                    {"type": "file", "file": {"file_id": "file-openai"}},
+                ],
+            }
+        ]
 
         patches = [
             ("get_auth_token", lambda: "tok"),
@@ -170,10 +219,12 @@ def test_chat_prefers_file_owner_token_on_first_turn():
     finally:
         app_module._chat_locks.clear()
     assert result == "ok"
-    assert calls["tokens"] == [("tok-2", ())], \
+    assert calls["tokens"] == [("tok-2", ())], (
         f"the chat must run on the file-owner token, got {calls['tokens']}"
-    assert calls["sessions"] and calls["sessions"][0][0] == 2, \
+    )
+    assert calls["sessions"] and calls["sessions"][0][0] == 2, (
         "the session must be saved against the owner token"
+    )
 
 
 def _files_content_scenario(calls, owner_id, owner_row_exists=True, register=True):
@@ -228,9 +279,12 @@ def test_files_content_prefers_owner_token():
     owner — the same broken flow B4 fixed for chat."""
     calls = {"get_token": [], "pick_token": 0, "fetch_token": None, "released": False}
     _files_content_scenario(calls, owner_id=2)
-    assert calls["fetch_token"] == "tok-2", \
+    assert calls["fetch_token"] == "tok-2", (
         f"content must be fetched with the OWNER token, got {calls['fetch_token']}"
-    assert calls["pick_token"] == 0, "the scheduler must not be consulted when an owner exists"
+    )
+    assert calls["pick_token"] == 0, (
+        "the scheduler must not be consulted when an owner exists"
+    )
     assert calls["released"], "the slot reservation must still be released"
 
 
@@ -246,7 +300,9 @@ def test_files_content_falls_back_when_owner_token_gone():
     """A registered owner whose token row was deleted must not wedge retrieval."""
     calls = {"get_token": [], "pick_token": 0, "fetch_token": None, "released": False}
     _files_content_scenario(calls, owner_id=9, owner_row_exists=False)
-    assert calls["pick_token"] == 1, "a vanished owner token must fall back to the scheduler"
+    assert calls["pick_token"] == 1, (
+        "a vanished owner token must fall back to the scheduler"
+    )
     assert calls["fetch_token"] == "tok-1", calls
 
 

@@ -11,6 +11,7 @@ chunks that have an empty choices array (isOpenAIChatUsageOnlyStreamChunk).
 
 Run with pytest, or directly: python tests/test_stream_usage.py
 """
+
 import asyncio
 import json
 import os
@@ -44,7 +45,7 @@ def _data_payloads(lines):
     for line in lines:
         if not line.startswith("data: "):
             continue
-        body = line[len("data: "):].strip()
+        body = line[len("data: ") :].strip()
         if body == "[DONE]":
             continue
         payloads.append(json.loads(body))
@@ -70,9 +71,11 @@ def _run_stream(**kwargs):
         generate_signature_sync=mock.DEFAULT,
     ):
         return asyncio.run(
-            _collect(app_module.stream_response(
-                _gen(CHUNKS, **kwargs), "v4.1flash", MESSAGES, 1, "sess", "sig", []
-            ))
+            _collect(
+                app_module.stream_response(
+                    _gen(CHUNKS, **kwargs), "v4.1flash", MESSAGES, 1, "sess", "sig", []
+                )
+            )
         )
 
 
@@ -97,7 +100,8 @@ def test_usage_chunk_emitted_before_done():
 
     # The usage chunk must come after the finish_reason chunk.
     finish_idx = next(
-        i for i, p in enumerate(payloads)
+        i
+        for i, p in enumerate(payloads)
         if p.get("choices") and p["choices"][0].get("finish_reason")
     )
     assert payloads.index(usage_chunk) > finish_idx
@@ -113,7 +117,9 @@ def test_no_usage_chunk_when_upstream_fails():
 
 
 def main():
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    tests = [
+        v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)
+    ]
     failed = 0
     for t in tests:
         try:

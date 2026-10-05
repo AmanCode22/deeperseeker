@@ -1,4 +1,5 @@
 # DeeperSeeker
+[![CI Pipeline](https://github.com/AmanCode22/deeperseeker/actions/workflows/tests.yaml/badge.svg)](https://github.com/AmanCode22/deeperseeker/actions/workflows/tests.yaml)
 
 DeepSeek website reverse-proxy server with FastAPI, supporting OpenAI & Anthropic API standards.
 
@@ -18,14 +19,32 @@ A kind request: do not spam the server, respect DeepSeek's limits, and use it fo
 
 ## Quickstart
 
-### Local Python
+### Local Python[UV, Recommended]
+Needs uv first
+
+for linux/macos
 ```bash
-python3 -m venv deeperseeker_env
-source deeperseeker_env/bin/activate
-pip install -r requirements.txt
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+or on windows
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+Then,
+```bash
+uv sync
+source .venv/bin/activate # or activate.fish or activate.zsh
 cp .env.example .env
+uv run deeperseeker
+```
+### Local Python[Non UV, Not usually recommended]
+```bash
+python3 -m venv .venv
+pip install -r requirements.txt 
+cp .env.example .env 
 python3 app.py
 ```
+
 
 > **Note:** Thanks to PR https://github.com/AmanCode22/deeperseeker/pull/16 by [@alan7383](https://github.com/alan7383), Playwright and Chromium are deprecated and kept as backup (DeepSeek does not enforce AWS WAF on requests using Android client headers). You no longer need to run `playwright install chromium` or `xvfb-run` unless reverting to the backup cookie mechanism. And it now saves ram also and is much stable than cookie harvesting.
 
