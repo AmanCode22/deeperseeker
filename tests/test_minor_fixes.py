@@ -62,6 +62,88 @@ def test_responses_input_image_mapped():
     assert msgs[0]["content"] == "plain question"
 
 
+def test_responses_format_and_stream():
+    import json
+    import unittest.mock as mock
+
+    chat_res = app_module.format_response(
+        '<think>plan</think>Hi\n<tool_call name="lookup"><parameter name="q">x</parameter></tool_call>',
+        "v4.1flash",
+        [{"role": "user", "content": "hi"}],
+    )
+    resp = app_module.format_responses_response(
+        chat_res,
+        "v4.1flash",
+        {
+            "instructions": "sys",
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}],
+        },
+    )
+    assert resp["id"].startswith("resp_")
+    assert resp["object"] == "response"
+    assert resp["status"] == "completed"
+    assert isinstance(resp["created_at"], int)
+    assert resp["output"][0]["type"] == "reasoning"
+    assert resp["output"][0]["summary"] == [{"type": "summary_text", "text": "plan"}]
+    assert resp["output"][1]["type"] == "function_call"
+    assert resp["output"][1]["name"] == "lookup"
+    assert json.loads(resp["output"][1]["arguments"]) == {"q": "x"}
+    assert "input_tokens" in resp["usage"]
+    assert "output_tokens" in resp["usage"]
+
+    async def _gen():
+        yield "<think>step</think>"
+        yield "Hello "
+        yield "world"
+
+    async def _collect():
+        out = []
+        async for frame in app_module.stream_responses_response(
+            _gen(),
+            "v4.1flash",
+            [{"role": "user", "content": "hi"}],
+            1,
+            "sess",
+            "sig",
+            [],
+        ):
+            out.append(frame)
+        return out
+
+    with mock.patch.multiple(
+        app_module,
+        mark_active=mock.DEFAULT,
+        save_session=mock.DEFAULT,
+        generate_signature_sync=mock.DEFAULT,
+        delete_sessions_for_chat=mock.DEFAULT,
+    ):
+        frames = asyncio.run(_collect())
+
+    events = []
+    for frame in frames:
+        lines = [ln for ln in frame.strip().split("\n") if ln]
+        assert lines[0].startswith("event: ")
+        assert lines[1].startswith("data: ")
+        evt_name = lines[0][len("event: ") :]
+        data = json.loads(lines[1][len("data: ") :])
+        assert data["type"] == evt_name
+        events.append(data)
+
+    assert [e["sequence_number"] for e in events] == list(range(len(events)))
+    assert events[0]["type"] == "response.created"
+    assert events[1]["type"] == "response.in_progress"
+    assert events[-1]["type"] == "response.completed"
+    assert events[-1]["response"]["status"] == "completed"
+    assert events[-1]["response"]["output"][0]["type"] == "reasoning"
+    assert events[-1]["response"]["output"][1]["type"] == "message"
+    assert events[-1]["response"]["output"][1]["content"][0] == {
+        "type": "output_text",
+        "text": "Hello world",
+        "annotations": [],
+        "logprobs": [],
+    }
+
+
 def test_invalid_json_returns_400():
     from fastapi.testclient import TestClient
 

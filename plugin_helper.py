@@ -200,10 +200,19 @@ def strip_summary_tags(text):
 
 
 async def extract_system(messages):
+    parts = []
     for i in messages:
         if i.get("role") == "system":
-            return i.get("content")
-    return None
+            c = i.get("content", "")
+            if isinstance(c, list):
+                c = "\n".join(
+                    p.get("text", "")
+                    for p in c
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            if c:
+                parts.append(str(c))
+    return "\n\n".join(parts) if parts else None
 
 
 async def extract_tools(tools):
@@ -212,10 +221,10 @@ async def extract_tools(tools):
     final_tools = []
     for i in tools:
         if i.get("type") == "function":
-            fn = i.get("function", {})
+            fn = i.get("function") if isinstance(i.get("function"), dict) else i
             name = fn.get("name", "")
             desc = fn.get("description", "")
-            params = fn.get("parameters", {})
+            params = fn.get("parameters", fn.get("input_schema", {}))
             final_tools.append(
                 f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}"
             )
@@ -343,11 +352,12 @@ async def extract_and_upload_files(messages, auth_token, last_user_only=False):
                         elif k[0] == "success":
                             result_fileids.append(k[1]["file_id"])
             elif j["type"] == "file":
-                if "file_id" in j["file"]:
-                    result_fileids.append(j["file"]["file_id"])
-                if "file_data" in j["file"]:
-                    filename = j["file"].get("filename") or "file.bin"
-                    data_parts = j["file"]["file_data"].split(",", 1)
+                file_obj = j.get("file") if isinstance(j.get("file"), dict) else j
+                if file_obj.get("file_id"):
+                    result_fileids.append(file_obj["file_id"])
+                if file_obj.get("file_data"):
+                    filename = file_obj.get("filename") or "file.bin"
+                    data_parts = file_obj["file_data"].split(",", 1)
                     if len(data_parts) != 2:
                         continue
                     mimetype_base, base64_data = data_parts
