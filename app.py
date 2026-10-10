@@ -655,8 +655,28 @@ async def handle_chat(
             {"error": "No auth token. Add via dashboard."}, status_code=401
         )
 
-    sig = await generate_signature(messages, model, scope)
+    has_prior_turn = any(
+        m.get("role") in ("assistant", "tool") for m in messages
+    ) or bool(
+        isinstance(response_opts, dict) and response_opts.get("previous_response_id")
+    )
+    if (
+        is_responses
+        and not has_prior_turn
+        and isinstance(response_opts, dict)
+        and response_opts.get("_resp_id")
+    ):
+        sig = str(response_opts["_resp_id"])
+    else:
+        sig = await generate_signature(messages, model, scope)
     sess = await _db(find_session, sig)
+    if (
+        not sess
+        and is_responses
+        and isinstance(response_opts, dict)
+        and response_opts.get("previous_response_id")
+    ):
+        sess = await _db(find_session, str(response_opts["previous_response_id"]))
     rollover_summary = None
     ref_ids = []  # B4: file ids referenced by the conversation (set by the create path)
 
@@ -855,6 +875,20 @@ async def handle_chat(
                             new_session_id,
                             next_parent(0),
                         )
+                        if (
+                            is_responses
+                            and isinstance(response_opts, dict)
+                            and response_opts.get("_resp_id")
+                        ):
+                            r_id = response_opts["_resp_id"]
+                            await _db(
+                                save_session,
+                                r_id,
+                                new_token_id,
+                                new_session_id,
+                                next_parent(0),
+                            )
+                            _store_response_history(r_id, next_messages)
                         if rot_owner is not None:
                             rot_owner.release()
                         return format_response(resp_text, model, messages, tools)
@@ -1146,6 +1180,20 @@ async def handle_chat(
                 session_id,
                 next_parent(parent_message_id),
             )
+            if (
+                is_responses
+                and isinstance(response_opts, dict)
+                and response_opts.get("_resp_id")
+            ):
+                r_id = response_opts["_resp_id"]
+                await _db(
+                    save_session,
+                    r_id,
+                    token_id,
+                    session_id,
+                    next_parent(parent_message_id),
+                )
+                _store_response_history(r_id, next_messages)
             return format_response(resp_text, model, messages, tools)
     except asyncio.CancelledError:
         # B2 (Stage 1 audit): the client went away mid-request — the exchange
@@ -1776,6 +1824,20 @@ def format_anthropic_response(result, model):
     }
 
 
+_response_history = OrderedDict()
+RESPONSE_HISTORY_MAX = 2048
+
+
+def _store_response_history(resp_id, msgs):
+    if not resp_id:
+        return
+    copied = [dict(m) for m in msgs]
+    _response_history[resp_id] = copied
+    _response_history.move_to_end(resp_id)
+    while len(_response_history) > RESPONSE_HISTORY_MAX:
+        _response_history.popitem(last=False)
+
+
 def _normalize_responses_tools(tools):
     if not isinstance(tools, list):
         return []
@@ -1958,8 +2020,11 @@ def format_responses_response(result, model=None, opts=None):
     raw_usage = result.get("usage", {})
     in_tokens = raw_usage.get("prompt_tokens", raw_usage.get("input_tokens", 0))
     out_tokens = raw_usage.get("completion_tokens", raw_usage.get("output_tokens", 0))
+    preset_id = opts.get("_resp_id") if isinstance(opts, dict) else None
     raw_id = str(result.get("id", ""))
-    if raw_id.startswith("resp_"):
+    if preset_id:
+        resp_id = preset_id
+    elif raw_id.startswith("resp_"):
         resp_id = raw_id
     elif raw_id.startswith("chatcmpl-"):
         resp_id = f"resp_{raw_id[len('chatcmpl-') :].replace('-', '')}"
@@ -1994,7 +2059,8 @@ async def stream_responses_response(
     scope="",
     opts=None,
 ):
-    resp_id = f"resp_{uuid.uuid4().hex}"
+    preset_id = opts.get("_resp_id") if isinstance(opts, dict) else None
+    resp_id = preset_id or f"resp_{uuid.uuid4().hex}"
     created_at = int(time.time())
     model_name = req_model if req_model else model
     seq = 0
@@ -2216,6 +2282,8 @@ async def stream_responses_response(
 
             for r in parser.feed(chunk):
                 if "text" in r and r["text"]:
+                    if not msg_started and not r["text"].strip():
+                        continue
                     for f in _delta_msg(r["text"]):
                         yield f
         await _db(mark_active, token_id)
@@ -2263,6 +2331,15 @@ async def stream_responses_response(
             clean_text,
             flags=re.IGNORECASE,
         ).strip()
+        flushed_chunks = []
+        if not parsed_tools:
+            for r in parser.flush():
+                if "text" in r and r["text"]:
+                    if not msg_started and not flushed_chunks and not r["text"].strip():
+                        continue
+                    flushed_chunks.append(r["text"])
+        combined_stream_text = msg_text + "".join(flushed_chunks)
+        final_text = combined_stream_text if combined_stream_text else clean_text
         in_tokens = count_tok(_messages_text(messages))
         usage_out = _completion_usage_text(clean_text, parsed_tools)
         out_tokens = count_tok(usage_out) if usage_out else 0
@@ -2273,7 +2350,7 @@ async def stream_responses_response(
             if parsed_tools:
                 ast_msg["tool_calls"] = parsed_tools
             else:
-                ast_msg["content"] = clean_text
+                ast_msg["content"] = final_text.strip()
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
             await _db(
@@ -2286,6 +2363,14 @@ async def stream_responses_response(
                 session_id,
                 next_parent(parent_message_id),
             )
+            await _db(
+                save_session,
+                resp_id,
+                token_id,
+                session_id,
+                next_parent(parent_message_id),
+            )
+            _store_response_history(resp_id, next_messages)
 
         if not aborted and not failed:
             try:
@@ -2294,16 +2379,14 @@ async def stream_responses_response(
                         yield f
 
                 if not parsed_tools:
-                    for r in parser.flush():
-                        if "text" in r and r["text"]:
-                            for f in _delta_msg(r["text"]):
-                                yield f
+                    for fc in flushed_chunks:
+                        for f in _delta_msg(fc):
+                            yield f
                     if not msg_started:
                         for f in _delta_msg(clean_text) if clean_text else _open_msg():
                             yield f
 
                 if msg_started:
-                    final_text = msg_text if msg_text else clean_text
                     final_part = {
                         "type": "output_text",
                         "text": final_text,
@@ -2755,6 +2838,7 @@ def _responses_input_to_messages(inputs):
     if isinstance(inputs, (str, dict)):
         inputs = [inputs]
     messages = []
+    call_names = {}
     for item in inputs:
         if isinstance(item, str):
             messages.append({"role": "user", "content": item})
@@ -2767,13 +2851,19 @@ def _responses_input_to_messages(inputs):
         if item_type == "function_call":
             raw_args = item.get("arguments", "{}")
             args_str = raw_args if isinstance(raw_args, str) else json.dumps(raw_args)
-            tc = {
-                "id": item.get("call_id")
+            call_id = (
+                item.get("call_id")
                 or item.get("id")
-                or ("call_" + uuid.uuid4().hex[:8]),
+                or ("call_" + uuid.uuid4().hex[:8])
+            )
+            fn_name = item.get("name", "")
+            if call_id and fn_name:
+                call_names[call_id] = fn_name
+            tc = {
+                "id": call_id,
                 "type": "function",
                 "function": {
-                    "name": item.get("name", ""),
+                    "name": fn_name,
                     "arguments": args_str,
                 },
             }
@@ -2795,13 +2885,15 @@ def _responses_input_to_messages(inputs):
                 )
             elif not isinstance(out_val, str):
                 out_val = json.dumps(out_val)
+            call_id = item.get("call_id") or item.get("id") or ""
             tool_msg = {
                 "role": "tool",
-                "tool_call_id": item.get("call_id") or item.get("id") or "",
+                "tool_call_id": call_id,
                 "content": out_val,
             }
-            if item.get("name"):
-                tool_msg["name"] = item["name"]
+            t_name = item.get("name") or call_names.get(call_id)
+            if t_name:
+                tool_msg["name"] = t_name
             messages.append(tool_msg)
             continue
 
@@ -2851,6 +2943,25 @@ def _responses_input_to_messages(inputs):
                         msg_content.append(c)
                 else:
                     msg_content.append(c)
+        if (
+            role == "assistant"
+            and isinstance(msg_content, list)
+            and all(
+                isinstance(p, dict) and p.get("type") == "text" for p in msg_content
+            )
+        ):
+            msg_content = "\n".join(p.get("text", "") for p in msg_content)
+        if role == "assistant" and messages and messages[-1].get("role") == "assistant":
+            prev_c = messages[-1].get("content")
+            if not prev_c:
+                messages[-1]["content"] = msg_content
+            elif isinstance(prev_c, str) and isinstance(msg_content, str):
+                messages[-1]["content"] = (
+                    f"{prev_c}\n{msg_content}" if msg_content else prev_c
+                )
+            elif isinstance(prev_c, list) and isinstance(msg_content, list):
+                prev_c.extend(msg_content)
+            continue
         messages.append({"role": role, "content": msg_content})
     return messages
 
@@ -2890,7 +3001,24 @@ async def openai_responses(request: Request):
             schema_inst = f"You MUST return valid JSON adhering strictly to this JSON Schema:\n{json.dumps(json_schema)}"
             inst_text = f"{inst_text}\n\n{schema_inst}" if inst_text else schema_inst
 
-    if inst_text:
+    prev_resp_id = body.get("previous_response_id")
+    if (
+        prev_resp_id
+        and prev_resp_id in _response_history
+        and not any(m.get("role") == "assistant" for m in messages)
+    ):
+        prev_msgs = [dict(m) for m in _response_history[prev_resp_id]]
+        if inst_text and not (
+            prev_msgs
+            and prev_msgs[0].get("role") == "system"
+            and prev_msgs[0].get("content") == inst_text
+        ):
+            if prev_msgs and prev_msgs[0].get("role") == "system":
+                prev_msgs[0] = {"role": "system", "content": inst_text}
+            else:
+                prev_msgs.insert(0, {"role": "system", "content": inst_text})
+        messages = prev_msgs + messages
+    elif inst_text:
         messages.insert(0, {"role": "system", "content": inst_text})
 
     thinking = is_thinking_enabled(body, request)
@@ -2913,6 +3041,7 @@ async def openai_responses(request: Request):
 
     response_opts = dict(body)
     response_opts["thinking"] = thinking
+    response_opts["_resp_id"] = f"resp_{uuid.uuid4().hex}"
 
     result = await handle_chat(
         messages,

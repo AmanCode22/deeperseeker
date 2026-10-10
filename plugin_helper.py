@@ -645,20 +645,28 @@ async def build_prompt(
             )
             final_prompt += f"[TOOL RESULTS]\n{tools_result_extract}\n\n"
 
+        trailing_sys_parts = []
         trailing_user_parts = []
         for m in trailing_messages:
-            if m.get("role") == "user":
+            if m.get("role") in ("user", "system"):
                 c = m.get("content", "")
+                txt = ""
                 if isinstance(c, str) and c:
-                    trailing_user_parts.append(c)
+                    txt = c
                 elif isinstance(c, list):
                     txt = " ".join(
                         part.get("text", "")
                         for part in c
                         if isinstance(part, dict) and part.get("type") == "text"
                     )
-                    if txt:
+                if txt:
+                    if m.get("role") == "system":
+                        trailing_sys_parts.append(txt)
+                    else:
                         trailing_user_parts.append(txt)
+
+        if trailing_sys_parts:
+            final_prompt += f"[SYSTEM]\n{chr(10).join(trailing_sys_parts)}\n\n"
 
         if trailing_user_parts:
             final_prompt += f"[USER]\n{chr(10).join(trailing_user_parts)}\n\n"

@@ -143,6 +143,96 @@ def test_responses_format_and_stream():
         "logprobs": [],
     }
 
+    sessions_store = {}
+    sent_calls = []
+    replies = [
+        '<think>plan</think>Checking\n<tool_call name="shell"><parameter name="cmd">ls</parameter></tool_call>',
+        "Found file1.txt",
+        "Done!",
+        "Fresh chat reply!",
+    ]
+
+    async def fake_create_chat(tok):
+        return f"chat_{len(sent_calls)}"
+
+    async def fake_send(
+        chat_id,
+        auth_token,
+        prompt,
+        parent_id,
+        thinking=False,
+        search=False,
+        file_ids=None,
+    ):
+        reply = replies[len(sent_calls)]
+        sent_calls.append((chat_id, parent_id, prompt))
+        yield reply
+
+    from fastapi.testclient import TestClient
+
+    with mock.patch.multiple(
+        app_module,
+        check_key=lambda req: True,
+        get_auth_token=lambda: "tok",
+        pick_token=lambda exclude=None: 1,
+        get_token=lambda tid: {
+            "id": 1,
+            "token": "tok",
+            "status": "ACTIVE",
+            "alias": "t",
+        },
+        create_new_chat=fake_create_chat,
+        send_message=fake_send,
+        mark_active=lambda tid: None,
+        find_session=lambda s: sessions_store.get(s),
+        save_session=lambda s, tid, sid, pid=0: sessions_store.__setitem__(
+            s, {"token_id": tid, "session_id": sid, "parent_message_id": pid}
+        ),
+        delete_sessions_for_chat=lambda tid, sid: None,
+    ):
+        client = TestClient(app_module.app)
+        t1_input = [
+            {"role": "user", "content": [{"type": "input_text", "text": "run ls"}]},
+        ]
+        r1 = client.post(
+            "/v1/responses",
+            json={"model": "v4.1flash", "instructions": "sys", "input": t1_input},
+        ).json()
+        t2_input = (
+            t1_input
+            + r1["output"]
+            + [
+                {
+                    "type": "function_call_output",
+                    "call_id": r1["output"][-1]["call_id"],
+                    "output": "file1.txt",
+                }
+            ]
+        )
+        r2 = client.post(
+            "/v1/responses",
+            json={"model": "v4.1flash", "instructions": "sys", "input": t2_input},
+        ).json()
+        r3 = client.post(
+            "/v1/responses",
+            json={
+                "model": "v4.1flash",
+                "previous_response_id": r2["id"],
+                "input": "great, thanks",
+            },
+        ).json()
+        r4 = client.post(
+            "/v1/responses",
+            json={"model": "v4.1flash", "instructions": "sys", "input": t1_input},
+        ).json()
+        assert r3["status"] == "completed"
+        assert r4["status"] == "completed"
+        assert sent_calls[0][0] == sent_calls[1][0] == sent_calls[2][0] == "chat_0"
+        assert [c[1] for c in sent_calls[:3]] == [0, 2, 4]
+        assert "Tool: shell" in sent_calls[1][2]
+        assert sent_calls[3][0] == "chat_3"
+        assert sent_calls[3][1] == 0
+
 
 def test_invalid_json_returns_400():
     from fastapi.testclient import TestClient
