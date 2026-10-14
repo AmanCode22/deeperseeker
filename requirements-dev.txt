@@ -32,7 +32,7 @@ click==8.5.0
     #   uvicorn
 deepseek-tokenizer==0.3.0
     # via -r requirements.in
-fastapi==0.142.2
+fastapi==0.143.0
     # via -r requirements.in
 frozenlist==1.8.0
     # via
@@ -104,6 +104,8 @@ python-multipart==0.0.32
     # via -r requirements.in
 ruff==0.16.10
     # via -r requirements-dev.in
+setuptools==84.0.0
+    # via pip-tools
 starlette==1.7.0
     # via fastapi
 typing-extensions==4.16.0
@@ -127,7 +129,3 @@ wheel==0.48.0
     # via pip-tools
 yarl==1.25.1
     # via aiohttp
-
-# The following packages are considered to be unsafe in a requirements file:
-# pip
-# setuptools
