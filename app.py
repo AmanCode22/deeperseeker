@@ -1826,6 +1826,7 @@ def format_anthropic_response(result, model):
 
 _response_history = OrderedDict()
 RESPONSE_HISTORY_MAX = 2048
+GENERIC_RESPONSE_ERROR = "An internal error occurred while generating the response."
 
 
 def _store_response_history(resp_id, msgs):
@@ -1880,6 +1881,27 @@ def _responses_usage(in_tokens, out_tokens):
     }
 
 
+def _responses_effort(opts):
+    reasoning_cfg = opts.get("reasoning")
+    effort = reasoning_cfg.get("effort") if isinstance(reasoning_cfg, dict) else None
+    if effort is None and isinstance(reasoning_cfg, str):
+        effort = reasoning_cfg
+    if effort is None:
+        for key in ("reasoning_effort", "effort"):
+            candidate = opts.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                effort = candidate
+                break
+    if isinstance(effort, str) and effort.strip().lower() in (
+        "minimal",
+        "low",
+        "medium",
+        "high",
+    ):
+        return effort.strip().lower()
+    return None
+
+
 def _build_response_object(
     resp_id,
     created_at,
@@ -1893,15 +1915,15 @@ def _build_response_object(
 ):
     opts = opts if isinstance(opts, dict) else {}
     reasoning_cfg = opts.get("reasoning")
-    default_effort = "medium" if opts.get("thinking") else None
+    effort = _responses_effort(opts)
     if isinstance(reasoning_cfg, dict):
         reasoning_obj = {
-            "effort": reasoning_cfg.get("effort", default_effort),
+            "effort": effort,
             "summary": reasoning_cfg.get("summary"),
         }
     else:
         reasoning_obj = {
-            "effort": default_effort,
+            "effort": effort,
             "summary": None,
         }
     text_cfg = opts.get("text")
@@ -2316,7 +2338,7 @@ async def stream_responses_response(
                 status="failed",
                 usage=None,
                 completed_at=None,
-                error={"code": "server_error", "message": str(e)[:300]},
+                error={"code": "server_error", "message": GENERIC_RESPONSE_ERROR},
                 opts=opts,
             )
             yield _sse({"type": "response.failed", "response": failed_resp})
