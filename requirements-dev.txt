@@ -32,7 +32,7 @@ click==8.5.0
     #   uvicorn
 deepseek-tokenizer==0.3.0
     # via -r requirements.in
-fastapi==0.143.0
+fastapi==0.143.2
     # via -r requirements.in
 frozenlist==1.8.0
     # via
@@ -70,8 +70,6 @@ packaging==26.3
     #   build
     #   pytest
     #   wheel
-pip==26.2.1
-    # via pip-tools
 pip-tools==7.6.2
     # via -r requirements-dev.in
 playwright==1.63.0
@@ -106,8 +104,6 @@ python-multipart==0.0.32
     # via -r requirements.in
 ruff==0.16.10
     # via -r requirements-dev.in
-setuptools==84.0.0
-    # via pip-tools
 starlette==1.7.0
     # via fastapi
 typing-extensions==4.16.0
