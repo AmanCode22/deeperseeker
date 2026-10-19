@@ -63,7 +63,7 @@ opentelemetry-api==1.45.0
     # via fastapi
 packaging==26.3
     # via pytest
-playwright==1.63.0
+playwright==1.64.0
     # via -r requirements-waf-backup.in
 pluggy==1.6.0
     # via pytest

@@ -46,7 +46,7 @@ multidict==6.9.1
     #   yarl
 opentelemetry-api==1.45.0
     # via fastapi
-playwright==1.63.0
+playwright==1.64.0
     # via -r requirements-waf-backup.in
 propcache==0.5.4
     # via
