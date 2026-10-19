@@ -74,7 +74,7 @@ pip==26.2.1
     # via pip-tools
 pip-tools==7.6.2
     # via -r requirements-dev.in
-playwright==1.63.0
+playwright==1.64.0
     # via -r requirements-waf-backup.in
 pluggy==1.6.0
     # via pytest
