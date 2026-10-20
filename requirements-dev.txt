@@ -6,7 +6,7 @@
 #
 aiohappyeyeballs==2.7.1
     # via aiohttp
-aiohttp==3.14.5
+aiohttp==3.14.4
     # via -r requirements.in
 aiosignal==1.4.0
     # via aiohttp
@@ -70,6 +70,8 @@ packaging==26.3
     #   build
     #   pytest
     #   wheel
+pip==26.2.1
+    # via pip-tools
 pip-tools==7.6.2
     # via -r requirements-dev.in
 playwright==1.64.0
@@ -104,6 +106,8 @@ python-multipart==0.0.32
     # via -r requirements.in
 ruff==0.17.1
     # via -r requirements-dev.in
+setuptools==84.2.0
+    # via pip-tools
 starlette==1.7.0
     # via fastapi
 typing-extensions==4.16.0
