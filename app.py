@@ -167,6 +167,52 @@ def _log_security_banner():
 
 _log_security_banner()
 
+
+def _enforce_exposure_policy():
+    """P0-8 (Day 16): default dashboard credentials never meet a non-loopback bind.
+
+    B9 made the boot matrix honest about insecure defaults, but Boot 3 —
+    admin/admin while binding a public interface — only *warned*. Anyone who
+    can reach the dashboard owns the token pool, so that boot now refuses to
+    start and names the exact fix, the ds2api failure class killed at boot
+    time instead of in a postmortem. Boot 2 (defaults + loopback) keeps the
+    landed warn-loud behavior: local development must stay zero-config.
+
+    The override exists for deliberate, e.g. firewalled deployments:
+    DEEPSEEKER_ALLOW_DEFAULT_ADMIN=1 accepts the risk explicitly (any other
+    value keeps the refusal).
+    """
+    host = (os.getenv("HOST") or "").strip().lower()
+    loopback = host in ("", "127.0.0.1", "localhost", "::1")
+    if loopback:
+        return
+    default_admin = ADMIN_USER == "admin" and ADMIN_PASSWORD == "admin"
+    if not default_admin:
+        return
+    if os.getenv("DEEPSEEKER_ALLOW_DEFAULT_ADMIN", "").strip() == "1":
+        logger.error(
+            "SECURITY: DEEPSEEKER_ALLOW_DEFAULT_ADMIN=1 — the dashboard keeps "
+            "admin/admin on a NON-LOOPBACK host (%s) by explicit request. This "
+            "is exactly the exposed-relay configuration that got ds2api killed.",
+            host or "0.0.0.0",
+        )
+        return
+    raise SystemExit(
+        "\n"
+        "SECURITY: refusing to start — the dashboard uses the default admin/admin\n"
+        "credentials while binding a NON-LOOPBACK host (%s). Anyone who can reach\n"
+        "this service owns its token pool.\n"
+        "Fix one of these and start again:\n"
+        "  1. set DEEPSEEKER_ADMIN_USER and DEEPSEEKER_ADMIN_PASSWORD to\n"
+        "     non-default values (recommended), or\n"
+        "  2. keep HOST on 127.0.0.1 / localhost (local-only), or\n"
+        "  3. set DEEPSEEKER_ALLOW_DEFAULT_ADMIN=1 to accept the risk explicitly\n"
+        "     (not recommended).\n" % (host or "0.0.0.0")
+    )
+
+
+_enforce_exposure_policy()
+
 # The token used for this request, logged as "key: <alias>".
 # Must stay a dict: BaseHTTPMiddleware runs the endpoint in a child task, and
 # only in place mutation of the same object reaches the access log context.
