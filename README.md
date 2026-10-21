@@ -3,19 +3,37 @@
 
 DeepSeek website reverse-proxy server with FastAPI, supporting OpenAI & Anthropic API standards.
 
+[English](#deeperseeker) · [中文快速开始](#中文快速开始)
+
 If you want to use deeperseeker with claude desktop app see [Claude Desktop Setup Guide](CLAUDE_DESKTOP_SETUP.md)
 
 For solving deepseek pow challenge the wasm file included is from my other repo: https://github.com/AmanCode22/deepseek_pow_solver/
 
 If you liked this repo please star it and star the solver also.
 
-⚠️ Warning: Automated use violates DeepSeek's Terms of Use.
-Use a dedicated throwaway account, never your personal one.
-Accounts may be banned at any time. 
-Use at your own risk.
+⚠️ **Risk banner** — read before you run anything:
 
-A kind request: do not spam the server, respect DeepSeek's limits, and use it for personal purposes only.
+- This project drives a **reverse-engineered web interface**, not a sanctioned API. Automated use violates DeepSeek's Terms of Use.
+- **Account-ban risk is real and on you**: use a dedicated throwaway account, never your personal one. Accounts may be banned at any time, without warning.
+- Personal use only. Run it for yourself, on your own account, at your own risk.
 
+**No public relays, ever.** This is a self-hosted tool for one person's own account. Operating a shared/public relay on top of it concentrates exactly the abuse that gets accounts banned and projects killed (see the ds2api story) — it will not be supported, and issues asking for help running one will be closed.
+
+**Takedown / contact policy.** I'm Aman (AmanCode22, amanady125@gmail.com). If you are DeepSeek and this project harms you: email me and I will respond — taking the repo down or removing specific components is on the table, and notice is honored quickly. Bug reports and security reports follow [SECURITY.md](SECURITY.md).
+
+## Status
+
+| Check | State | Last verified | Notes |
+|---|---|---|---|
+| Upstream health (bridge mode) | see `/health?deep=1` | run it yourself | the deep probe does one real PoW + chat-session round trip; a table row written at release time is stale the moment it ships, so the source of truth is the authenticated probe |
+| PoW (DeepSeekHashV1) | working via [deepseek_pow_solver](https://github.com/AmanCode22/deepseek_pow_solver/) wasm | 2026-10 | if DeepSeek raises the difficulty, the solver repo gets the fix first |
+| OpenAI surface (`/v1/chat/completions`, `/v1/responses`) | working | 2026-10 | streaming + tools; see the client matrix below |
+| Anthropic surface (`/v1/messages`) | working | 2026-10 | Claude Desktop guide in CLAUDE_DESKTOP_SETUP.md |
+| Official-API mode (P0-7) | see README section below | 2026-10 | the exit door when the bridge dies |
+
+A status table you stop checking is a table that lies — treat "last verified" as the claim's expiry date.
+
+Per-client compatibility lives in [docs/CLIENT_MATRIX.md](docs/CLIENT_MATRIX.md): one row per real, dated run — no run, no row.
 
 ## Quickstart
 
@@ -196,6 +214,35 @@ The `cost` reported in API responses uses these flat rates.
 ## Disclaimer
 
 Educational purpose only. This project is not affiliated with, endorsed by, or sponsored by DeepSeek. Use responsibly and in accordance with DeepSeek's terms of service.
+
+## 中文快速开始
+
+**这是什么**：把 DeepSeek 网页版反向代理成 OpenAI / Anthropic 兼容接口的自托管服务。⚠️ 风险提示：自动化使用违反 DeepSeek 服务条款，账号可能随时被封——请只用小号，自用即可，风险自负。**禁止搭建公共转发站。**
+
+**安装（推荐 uv）：**
+
+```bash
+git clone https://github.com/AmanCode22/deeperseeker && cd deeperseeker
+uv sync
+source .venv/bin/activate
+cp .env.example .env        # 填写 DEEPSEEKER_ADMIN_PASSWORD 等配置
+uv run deeperseeker
+```
+
+**首次启动**：若未设置 `DEEPSEEKER_API_KEY`，服务会自动生成一个强密钥并打印一次（同时保存在数据库旁的 `api_key.txt`）。调用接口时带上 `Authorization: Bearer <该密钥>`。
+
+**添加令牌**：浏览器无痕窗口登录 `chat.deepseek.com` → 控制台（F12）执行 `JSON.parse(localStorage.getItem("userToken")).value` → 复制返回的令牌 → 粘贴到 `http://localhost:4000/dashboard`（默认账号密码 `admin`/`admin`，仅限本机访问时使用；对外暴露前必须修改，否则服务会拒绝启动）。
+
+**调用接口**：
+
+```bash
+curl http://localhost:4000/v1/chat/completions \
+  -H "Authorization: Bearer <你的密钥>" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "v4.1flash", "messages": [{"role": "user", "content": "你好"}]}'
+```
+
+**检查服务是否还活着**：`curl -H "Authorization: Bearer <你的密钥>" "http://localhost:4000/health?deep=1"` —— 深度探活会真实走一次上游（含 PoW），返回 `upstream_reachable` 与延迟。更多配置见上方英文配置表。
 
 ## Contributors
 

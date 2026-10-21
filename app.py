@@ -3612,7 +3612,80 @@ async def health(request: Request):
     if check_key(request):
         data["active_tokens"] = active
         data["cookies_valid"] = cookies_valid
+        data["version"] = APP_VERSION
+
+        # P0-9 (Day 26): deep probe. Authenticated callers can ask for one
+        # real end-to-end upstream round trip (PoW challenge -> solve ->
+        # chat session create). The shallow check stays public; an
+        # unauthenticated deep request is refused BEFORE any upstream traffic
+        # so the endpoint can never be abused as a free relay tester.
+        deep = (request.query_params.get("deep") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if deep:
+            probe = await _deep_health_probe()
+            data["deep"] = probe
+            if probe.get("upstream_reachable") is not True:
+                data["status"] = "degraded"
+                ok = False
     return JSONResponse(data, status_code=200 if ok else 503)
+
+
+async def _deep_health_probe_guarded(authorized):
+    """Deep probe entry shared by the route and tests (P0-9).
+
+    An unauthorized caller gets the 401 BEFORE any upstream call is made —
+    the ordering is the security property, so it lives in one place."""
+    if not authorized:
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
+    probe = await _deep_health_probe()
+    ok = probe.get("upstream_reachable") is True
+    return JSONResponse(
+        {"status": "ok" if ok else "degraded", "deep": probe},
+        status_code=200 if ok else 503,
+    )
+
+
+async def _deep_health_probe():
+    """One end-to-end upstream round trip including PoW (P0-9).
+
+    Cost: one empty upstream chat per call — the cheapest honest probe this
+    bridge can run, because chat session create is exactly the hop that
+    breaks when PoW, the client version or the token dies. The probe never
+    sends a message and never reports token material, only shapes.
+    """
+    auth_token = await _db(get_auth_token)
+    if not auth_token:
+        return {
+            "upstream_reachable": False,
+            "pow_ok": False,
+            "latency_ms": None,
+            "reason": "no token in pool",
+        }
+    started = time.perf_counter()
+    try:
+        chat_id = await create_new_chat(auth_token)
+    except Exception as e:
+        logger.warning("Deep health probe failed: %s", e)
+        return {
+            "upstream_reachable": False,
+            "pow_ok": False,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            # upstream-derived text never reaches the body: only the typed
+            # status via the redaction used for error envelopes
+            "reason": _redact_secret_material(str(e))[:200] or "upstream error",
+        }
+    latency_ms = round((time.perf_counter() - started) * 1000, 1)
+    return {
+        "upstream_reachable": True,
+        "pow_ok": True,
+        "latency_ms": latency_ms,
+        # the created session id is upstream account material — report only
+        # that it exists, never the id itself
+        "chat_created": bool(chat_id),
+    }
 
 
 def main():
