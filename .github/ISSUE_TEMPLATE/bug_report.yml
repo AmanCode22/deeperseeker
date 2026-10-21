@@ -1,0 +1,77 @@
+name: Bug report
+description: Something broke — give us what a trace needs, and we'll look same day.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never paste tokens, cookies, or API keys. The trace id + the state names
+        are enough; anything credential-shaped will be scrubbed and the report
+        may be closed as invalid.
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: `pip show deeperseeker` version, image digest, or the commit you run — and the startup log line "deeperseeker X (commit Y)".
+      placeholder: e.g. 1.0.0 / ghcr.io/amancode22/deeperseeker@sha256:… / a99e36a
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - bridge (DEEPSEEKER_MODE unset or =bridge)
+        - official (DEEPSEEKER_MODE=official)
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Client surface
+      options:
+        - OpenAI (/v1/chat/completions or /v1/responses)
+        - Anthropic (/v1/messages)
+        - models/files/health
+        - dashboard
+    validations:
+      required: true
+  - type: textarea
+    id: client
+    attributes:
+      label: Client + version
+      description: What called the service (Claude Desktop, Cline, New API, curl…)? One line. See docs/CLIENT_MATRIX.md for the row format.
+      placeholder: e.g. Cline 3.4.1
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened vs what you expected
+      description: Symptom first, then expectation. Include the exact error body the client received.
+    validations:
+      required: true
+  - type: input
+    id: trace
+    attributes:
+      label: Trace id
+      description: From the 502 body (request_id / [trace: …]) or the X-Request-ID response header — this is what ties your report to the access log.
+      placeholder: e.g. a6b1cdbe11844cdb842fe810caa6765f
+  - type: textarea
+    id: deep-health
+    attributes:
+      label: Deep health result
+      description: Output of `curl -H "Authorization: Bearer <your key>" "http://localhost:4000/health?deep=1"` — redact the key itself.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: The access-log line(s) matching your trace id and anything around them. No tokens.
+  - type: checkboxes
+    id: pool
+    attributes:
+      label: Pool view state at the time
+      options:
+        - label: Some tokens were RATE_LIMITED / QUARANTINED on the dashboard
+        - label: All tokens ACTIVE
+        - label: Not checked

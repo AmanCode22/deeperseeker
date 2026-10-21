@@ -1,0 +1,64 @@
+name: Ban report
+description: An account got banned/blocked while using this bridge. This is the sensor — report the pattern, never the tokens.
+labels: ["ban-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This template exists so the project can see ban patterns early and warn
+        others. NEVER include account tokens, cookies, phone numbers or emails —
+        counts, timing and shapes only. Reports with credential material will be
+        scrubbed and may be closed.
+  - type: input
+    id: version
+    attributes:
+      label: Bridge version / commit
+      description: The startup log line "deeperseeker X (commit Y)" or image digest.
+    validations:
+      required: true
+  - type: input
+    id: accounts
+    attributes:
+      label: How many accounts
+      description: A count, e.g. "1 of 3". Not which.
+    validations:
+      required: true
+  - type: textarea
+    id: timing
+    attributes:
+      label: Timing
+      description: How long was the account in use before the ban? Days/weeks, rough request volume per day, concurrent or serial?
+    validations:
+      required: true
+  - type: textarea
+    id: pattern
+    attributes:
+      label: Request pattern
+      description: Chat only, or agent harness with tools? Streaming? Thinking mode? Files? Big contexts (approx sizes)? One honest paragraph.
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: Error shape
+      description: What did the bridge/client see right before and at the ban (HTTP status, message shape, empty streams)? Paste the redacted error body.
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface(s) did the account serve?
+      options:
+        - OpenAI only
+        - Anthropic only
+        - Both
+        - official mode (reporting for completeness)
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmations
+      options:
+        - label: My report contains no token/cookie/account material
+          required: true
+        - label: The account was a throwaway, not a personal one
+          required: true
