@@ -103,7 +103,12 @@ API_KEY, _api_key_generated = _resolve_api_key()
 ADMIN_USER = os.getenv("DEEPSEEKER_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("DEEPSEEKER_ADMIN_PASSWORD", "admin")
 
-from middleware import RealIPMiddleware, RecovererMiddleware, RequestIDMiddleware
+from middleware import (
+    RealIPMiddleware,
+    RecovererMiddleware,
+    RequestIDMiddleware,
+    request_id_var,
+)
 from plugin_helper import (
     MAX_SUMMARY_TOKENS,
     build_prompt,
@@ -510,6 +515,66 @@ def _api_error_response(e, is_anthropic=False):
     else:
         err_type = "rate_limit_error" if code == 429 else "api_error"
         payload = {"error": {"message": str(e)[:500], "type": err_type, "code": code}}
+    return JSONResponse(payload, status_code=code)
+
+
+# P0-4: credential-shaped material must never reach a client-visible error
+# body, even when the text came out of an upstream SSE error event. Scrub the
+# shapes DeepSeek traffic actually carries — long hex/base64 runs (session and
+# message ids, token material) and Bearer schemes — before the terminal
+# envelope is built.
+_SECRET_RUN_RE = re.compile(r"[A-Za-z0-9+/_=-]{32,}")
+_BEARER_RE = re.compile(r"(?i)bearer\s+[A-Za-z0-9._+=/-]+")
+
+
+def _redact_secret_material(text):
+    scrubbed = _BEARER_RE.sub("[redacted]", str(text))
+    scrubbed = _SECRET_RUN_RE.sub("[redacted]", scrubbed)
+    return scrubbed
+
+
+def _terminal_error_response(e, is_anthropic=False):
+    """P0-4 (Day 13): the budget-exhausted exit returns a DESIGNED envelope.
+
+    When every pooled token failed — the #33 terminal empty-SSE class — the
+    client used to get whatever str(exception) happened to carry: no trace id,
+    no status contract, upstream text verbatim. This exit reuses the typed
+    UpstreamError machinery (B6) for the status, passes the message through
+    the secret scrub above, and stamps the request's correlation id so the
+    response, the access log and the pool view tell one story. There is no
+    second error path: _api_error_response still owns the mid-retry shapes.
+
+    The trace id travels in the OpenAI body as request_id, and inside the
+    Anthropic message text (their error objects have no extra-field
+    contract); the X-Request-ID header rides along on both regardless.
+    """
+    code = _upstream_http_code(e) or 502
+    if isinstance(e, CookieGenerationError):
+        code = 503
+    if code < 400 or code > 599:
+        code = 502
+    trace = request_id_var.get()
+    if trace == "-":
+        trace = uuid.uuid4().hex  # direct invocation path (tests, scripts)
+    message = _redact_secret_material(str(e)[:500])
+    if is_anthropic:
+        payload = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": f"{message} [trace: {trace}]",
+            },
+        }
+    else:
+        err_type = "rate_limit_error" if code == 429 else "api_error"
+        payload = {
+            "error": {
+                "message": message,
+                "type": err_type,
+                "code": code,
+                "request_id": trace,
+            }
+        }
     return JSONResponse(payload, status_code=code)
 
 
@@ -1255,9 +1320,10 @@ async def handle_chat(
         )
         await _db(delete_sessions_for_chat, token_id, session_id)
         if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS:
-            # B10: budget exhausted — surface the (already redacted/truncated)
-            # upstream error instead of retrying forever.
-            return _api_error_response(e, is_anthropic)
+            # B10: budget exhausted. P0-4: surface the DESIGNED terminal
+            # envelope — redacted body, trace id, status contract — instead of
+            # the raw exception dump.
+            return _terminal_error_response(e, is_anthropic)
         # PR #26 review fix (Blocker 2 — retry self-deadlock): the recursive
         # call can resolve to the SAME chat (the retry re-derives the session
         # from whatever the persistence layer still returns). Recursing while
