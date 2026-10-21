@@ -1910,6 +1910,31 @@ _CONTEXT_LIMIT_HINT_RE = re.compile(
 _SSE_RECENT_LINES = 8
 
 
+def is_context_limit_error(exc):
+    """Public classifier (DSH fix): did this failure come from the upstream
+    session running out of context?
+
+    Agent harnesses die here: a context-class failure used to be retried
+    verbatim on other tokens (the context belongs to the CHAT, not the token,
+    so every attempt fails the same way) and finally surfaced to the client as
+    a context-limit error. The caller uses this to trigger a summary rollover
+    instead. Matches:
+      * UpstreamError bodies carrying upstream context wording (HTTP 400
+        'maximum context length', 'context limit', 'too long', ...), and
+      * the bridge's own empty-SSE-with-context-hint error.
+    Deliberately NOT matched: generic 5xx/timeouts — 'deadline exceeded' or
+    '502 upstream timeout' are retry-shaped, not context-shaped, so the loose
+    words ('too long', 'exceed') only count for real UpstreamError bodies,
+    never for arbitrary exception text."""
+    if isinstance(exc, UpstreamError):
+        body = exc.body or ""
+        return bool(_CONTEXT_LIMIT_HINT_RE.search(body))
+    text = str(exc or "")
+    return bool(
+        re.search(r"context|token.?limit|maximum.?context", text, re.IGNORECASE)
+    )
+
+
 class _SseStreamFinished(Exception):
     pass
 

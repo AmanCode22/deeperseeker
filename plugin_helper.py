@@ -39,6 +39,18 @@ OBSERVED_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEKER_MAX_OUTPUT_TOKENS", "8192
 ROLLOVER_SAFETY_TOKENS = int(os.getenv("DEEPSEEKER_ROLLOVER_SAFETY_TOKENS", "24000"))
 # Token budget for the model-generated handoff summary.
 MAX_SUMMARY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_SUMMARY_TOKENS", "4096"))
+# DSH fix: hard cap for the LATEST user message embedded in a prompt. The
+# first-message path accepts ~1M tokens upstream, but nothing above that
+# ceiling can ever succeed — and before this cap existed, an oversized single
+# message (an agent harness replaying its whole context) failed identically on
+# every retry because the payload was never shrunk. The cap sits just below
+# the observed first-message acceptance so the capped prompt still passes.
+MAX_USER_MESSAGE_TOKENS = int(os.getenv("DEEPSEEKER_MAX_USER_MESSAGE_TOKENS", "900000"))
+# DSH fix: flat overhead added to the rollover estimate for the tokens the
+# client-visible history does NOT contain but the upstream session DOES
+# accumulate: tool schemas, system expansion, handoff summaries, per-turn
+# instructions and the model's own reasoning across turns.
+PROMPT_OVERHEAD_TOKENS = int(os.getenv("DEEPSEEKER_PROMPT_OVERHEAD_TOKENS", "4096"))
 
 
 def context_window_tokens():
@@ -61,13 +73,20 @@ def estimate_conversation_tokens(messages):
     return _count_tokens(_messages_plain_text(messages))
 
 
-def needs_rollover(messages):
+def needs_rollover(messages, tools=None):
     """Decide keep-current-chat vs summarize-and-roll-over.
 
     Returns True when the accumulated session context is nearing the observed
     remembered-context limit. The very first exchange (system/user + assistant,
     however large — a single first message passes upstream up to ~1M tokens)
     is never rolled over; rollover exists purely for accumulated context.
+
+    DSH fix: the estimate now includes what the upstream session actually
+    carries beyond the client-visible text — the tool-schema block (a harness
+    with a dozen tools adds 10-20K tokens upstream that the old estimate never
+    saw) plus a flat overhead for system expansion, handoff summaries and
+    per-turn instructions. Without this, the estimate crossed the threshold
+    well AFTER the upstream session had already died.
     """
     non_system = [m for m in messages if m.get("role") != "system"]
     # First exchange only: one user turn, optionally answered by the assistant
@@ -76,7 +95,11 @@ def needs_rollover(messages):
         [m for m in non_system if m.get("role") in ("user", "assistant")]
     ) <= 2 and not any(m.get("role") == "tool" for m in non_system):
         return False
-    return estimate_conversation_tokens(messages) > context_window_tokens()
+    total = estimate_conversation_tokens(messages)
+    if tools:
+        with contextlib.suppress(TypeError, ValueError):
+            total += count_tokens(json.dumps(tools))
+    return total + PROMPT_OVERHEAD_TOKENS > context_window_tokens()
 
 
 def _messages_plain_text(messages):
@@ -584,6 +607,14 @@ async def build_prompt(
             final_prompt += f"[TOOL RESULTS]\n{relevant_tool_results}\n\n"
         user_msg = await extract_user_msg(messages)
         if user_msg:
+            # DSH fix: the seed prompt must fit under the first-message
+            # ceiling no matter what the client sent — an oversized latest
+            # message is tail-truncated with a marker, never forwarded raw.
+            user_msg = _capped_text(
+                user_msg,
+                MAX_USER_MESSAGE_TOKENS,
+                "[... beginning of the message truncated to fit the context limit ...]",
+            )
             final_prompt += f"[USER]\n{user_msg}\n\n"
         return final_prompt.strip() + "\n\n"
     if is_first_message:
@@ -625,6 +656,15 @@ async def build_prompt(
 
         user_msg = await extract_user_msg(messages)
         if user_msg:
+            # DSH fix: a first message over the observed ~975K acceptance
+            # ceiling fails upstream with a hard rejection, and the retry used
+            # to re-send it verbatim until the budget died. Cap it — tail kept
+            # — so the turn passes instead of dying.
+            user_msg = _capped_text(
+                user_msg,
+                MAX_USER_MESSAGE_TOKENS,
+                "[... beginning of the message truncated to fit the context limit ...]",
+            )
             final_prompt += f"[USER]\n{user_msg}\n\n"
     else:
         last_ast_idx = -1
@@ -669,10 +709,24 @@ async def build_prompt(
             final_prompt += f"[SYSTEM]\n{chr(10).join(trailing_sys_parts)}\n\n"
 
         if trailing_user_parts:
-            final_prompt += f"[USER]\n{chr(10).join(trailing_user_parts)}\n\n"
+            trailing_user_text = chr(10).join(trailing_user_parts)
+            # DSH fix: a continuation turn rides on top of everything the
+            # upstream chat already remembers — an uncapped huge user message
+            # here is what pushed remembered chats over the limit.
+            trailing_user_text = _capped_text(
+                trailing_user_text,
+                MAX_USER_MESSAGE_TOKENS,
+                "[... beginning of the message truncated to fit the context limit ...]",
+            )
+            final_prompt += f"[USER]\n{trailing_user_text}\n\n"
         elif not tools_result_extract:
             user_msg = await extract_user_msg(messages)
             if user_msg:
+                user_msg = _capped_text(
+                    user_msg,
+                    MAX_USER_MESSAGE_TOKENS,
+                    "[... beginning of the message truncated to fit the context limit ...]",
+                )
                 final_prompt += f"[USER]\n{user_msg}\n\n"
 
         if tools_extract:

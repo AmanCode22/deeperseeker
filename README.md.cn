@@ -164,6 +164,8 @@ python3 app.py
 | `DEEPSEEKER_TOKEN_CONCURRENCY` | 单 token 软并发上限；满载的 token 只在无其他空闲时使用 | `8` |
 | `DEEPSEEKER_QUARANTINE_AFTER_403` | 连续多少次 403 会把 token 移出轮换，直到手动恢复（`0` 关闭升级） | `3` |
 | `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` | 一轮对话在池内的重试次数，用尽后才把上游错误返回给客户端 | `3` |
+| `DEEPSEEKER_MAX_USER_MESSAGE_TOKENS` | 提示内最新一条用户消息的硬上限；超过后按尾部截断并加标记，而不是让上游失败 | `900000` |
+| `DEEPSEEKER_PROMPT_OVERHEAD_TOKENS` | 滚动估算时加上的固定开销，覆盖工具模式、系统扩写与原始历史中看不到的摘要 | `4096` |
 | `DEEPSEEKER_MODE` | `bridge`（逆向网页会话）或 `official`（官方 API 直通）。必须显式设置——没有任何自动回退 | `bridge` |
 | `DEEPSEEKER_OFFICIAL_API_KEY` | `official` 模式使用的官方 API 密钥（来自 platform.deepseek.com）。官方模式下必填 | 未设置 |
 | `DEEPSEEKER_OFFICIAL_BASE` | 官方模式下官方 API 基址覆盖 | `https://api.deepseek.com` |
@@ -222,6 +224,7 @@ docker run --rm -u root -v deeperseeker_deeperseeker_data:/app/data alpine \
 ## 故障排查
 
 - **回复为空或空白，最后收到 HTTP 502** —— *症状：* 客户端收到 `Empty response from DeepSeek (no parseable SSE content)`（或上游错误事件），最终收到一个带 `error.request_id`（OpenAI 面）或消息尾部 `[trace: …]`（Anthropic 面）的 `502`。*服务现在的行为：* 该轮在池内重试——每次换一个 token，尝试间抖动退避——最多 `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` 次；当所有尝试都返回空时，返回设计好的 502，相关 id 盖在响应体和 `X-Request-ID` 头里，上游来源的信息不会未脱敏地进入响应体。*要查什么：* 打开仪表盘池视图，找卡在 `RATE_LIMITED`/`QUARANTINED` 的 token；拿 `request_id`/`trace` 对照访问日志行，看该轮走过了哪些状态。
+- **Agent 框架（Claude Code、Cline 等编程 harness）报 "Context limit" 错误** —— *症状：* harness 上报上下文超限失败，而普通聊天客户端一直正常。*根因：* 上游上下文属于**聊天会话**而不是 token——旧的朴素重试原样重发同一个超长上下文（harness 每轮都会重放全部历史），每次尝试都以同样方式失败。*服务现在的行为：*（1）上下文类失败（上游上下文措辞，或带上下文提示的空 SSE 错误）会让重试**强制走摘要滚动**——新会话用模型生成的交接摘要做种子，轮次带着完整连续性恢复，而不是死掉或截肢历史；（2）最新用户消息有硬上限（`DEEPSEEKER_MAX_USER_MESSAGE_TOKENS`，保留尾部），超过约 975K 上游上限的首条消息也能通过，而不是每次尝试都失败；（3）滚动估算把工具模式和提示开销计入（`DEEPSEEKER_PROMPT_OVERHEAD_TOKENS`），让主动滚动在记忆会话死掉**之前**触发，而不是之后。
 
 ## 价格（每 1M token，截至 2026-09-06）
 
