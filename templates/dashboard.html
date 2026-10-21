@@ -30,15 +30,17 @@
 </section>
 
 <section>
-    <h2>Tokens ({{ tokens|length }})</h2>
+    <h2>Token pool ({{ tokens|length }})</h2>
     {% if tokens %}
     <table>
         <thead>
             <tr>
                 <th>ID</th>
                 <th>Alias</th>
-                <th>Token</th>
-                <th>Status</th>
+                <th>State</th>
+                <th>In-flight</th>
+                <th>Last used</th>
+                <th>Cooldown</th>
                 <th>Actions</th>
             </tr>
         </thead>
@@ -46,14 +48,20 @@
             {% for tok in tokens %}
             <tr>
                 <td>{{ tok['id'] }}</td>
-                <td>{{ tok['alias'] or '—' }}</td>
-                <td><code>{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
+                <td>{{ tok['label'] }}</td>
                 <td>
-                    <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] == 'RATE_LIMITED' %}warn{% else %}err{% endif %}">
-                        {{ tok['status'] }}
-                    </span>
+                    <span class="status {{ tok['state_class'] }}">{{ tok['status'] }}</span>
+                    <div class="state-note">{{ tok['state_note'] }}</div>
                 </td>
+                <td>{{ tok['in_flight'] }}</td>
+                <td>{{ tok['last_used'] }}</td>
+                <td>{{ tok['cooldown'] }}</td>
                 <td>
+                    {% if tok['can_restore'] %}
+                    <form method="post" action="/tokens/{{ tok['id'] }}/restore" style="display:inline">
+                        <button type="submit" class="btn-sm">Restore</button>
+                    </form>
+                    {% endif %}
                     <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
                           onsubmit="return confirm('Delete?')">
                         <button type="submit" class="btn-sm btn-danger">Delete</button>
@@ -63,6 +71,11 @@
             {% endfor %}
         </tbody>
     </table>
+    <p class="state-note">
+        RATE_LIMITED cools down and rejoins by itself. QUARANTINED never does —
+        an auth failure or a repeated 403 takes the token out until Restore puts
+        it back. No token material is shown on this page.
+    </p>
     {% else %}
     <p>No tokens yet.</p>
     {% endif %}

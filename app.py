@@ -49,6 +49,7 @@ from functions import (
     get_auth_token,
     get_file_content,
     get_file_token,
+    get_pool_view,
     get_token,
     get_tokens,
     init_db,
@@ -58,6 +59,7 @@ from functions import (
     parse_tools,
     pick_token,
     record_file,
+    restore_token,
     save_session,
     send_message,
     upload_file,
@@ -685,7 +687,10 @@ async def handle_chat(
         session_id = sess["session_id"]
         parent_message_id = sess["parent_message_id"]
         tok = await _db(get_token, token_id)
-        if not tok or tok["status"] == "RATE_LIMITED":
+        # P0-3: anything that is not ACTIVE is unusable for this session, so a
+        # quarantined token bound by a stored signature rotates away like a
+        # cooled-down one. (Rate-limited is still transient; quarantine is not.)
+        if not tok or tok["status"] != "ACTIVE":
             new_token_id = await _db(pick_token)
             if new_token_id and (not tok or new_token_id != token_id):
                 new_tok = await _db(get_token, new_token_id)
@@ -1205,7 +1210,7 @@ async def handle_chat(
     except Exception as e:
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            await _db(mark_limited, token_id, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             if not _auth_rotated:
                 new_token_id = await _db(pick_token)
@@ -1434,7 +1439,7 @@ async def stream_response(
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            await _db(mark_limited, token_id, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_response upstream HTTP %s: %s", code, e)
         else:
@@ -1606,7 +1611,7 @@ async def stream_anthropic_response(
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            await _db(mark_limited, token_id, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_anthropic_response upstream HTTP %s: %s", code, e)
         else:
@@ -2323,7 +2328,7 @@ async def stream_responses_response(
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id)
+            await _db(mark_limited, token_id, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_responses_response upstream HTTP %s: %s", code, e)
         else:
@@ -3409,7 +3414,9 @@ async def dashboard(request: Request):
         get_current_admin(request)
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
-    tokens = await _db(get_tokens)
+    # P0-3: the pool view carries state, load and timers — and no credential
+    # field, so nothing secret can reach the page source.
+    tokens = await _db(get_pool_view)
     return templates.TemplateResponse(request, "dashboard.html", {"tokens": tokens})
 
 
@@ -3434,6 +3441,17 @@ async def tokens_delete(token_id: int, request: Request):
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     await _db(delete_token, token_id)
+    return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+
+
+@app.post("/tokens/{token_id}/restore")
+async def tokens_restore(token_id: int, request: Request):
+    """P0-3: the manual return from quarantine — there is no other exit."""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    await _db(restore_token, token_id)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 
