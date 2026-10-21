@@ -1,0 +1,51 @@
+name: Deploy help
+description: Install/boot/container trouble — the README one-liner failed, the container crash-loops, the health check never turns ok.
+labels: ["deploy"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version / image digest / commit
+      description: What you actually run (tag, digest, or commit).
+    validations:
+      required: true
+  - type: dropdown
+    id: method
+    attributes:
+      label: How you run it
+      options:
+        - uv (local Python)
+        - pip/venv (non-uv)
+        - Docker (prebuilt image)
+        - Docker (built from source)
+        - Podman
+        - docker/podman compose
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      options:
+        - amd64
+        - arm64
+        - other/unknown
+  - type: textarea
+    id: command
+    attributes:
+      label: The exact command and what it printed
+      description: Full command + full error output. Redact keys/passwords — keep the SHAPE (e.g. "DEEPSEEKER_API_KEY=<redacted>").
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you already tried
+      description: Which README sections you followed, what changed.
+  - type: checkboxes
+    id: security
+    attributes:
+      label: Security defaults
+      options:
+        - label: I saw the "refusing to start" message and understand it means the admin credential pair must be set
+        - label: No message like that appeared

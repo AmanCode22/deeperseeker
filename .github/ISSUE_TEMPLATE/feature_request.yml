@@ -1,0 +1,30 @@
+name: Feature request
+description: A concrete improvement you would defend in a review.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can you not do today, or what hurts? One paragraph, from your own usage.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should change, concretely — surfaces, env knobs, dashboard bits. If it needs new credentials or a new upstream, say so explicitly.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including "do nothing" — and why that is not enough.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmations
+      options:
+        - label: This is for personal/self-hosted use, not a public relay
+          required: true
