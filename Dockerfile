@@ -33,9 +33,15 @@ RUN useradd --uid 10001 --home-dir /app --no-create-home --shell /usr/sbin/nolog
 
 EXPOSE 4000
 
+# P0-2 (Day 20): stamped by .github/workflows/release.yml so the startup log
+# states the exact commit the image was built from. Defaults keep local
+# builds honest ("-").
+ARG DEEPSEEKER_BUILD_COMMIT=-
+
 ENV DB_PATH=/app/data/deeperseeker.db
 ENV DEEPSEEKER_COOKIE_PATH=/app/data/aws_cookies_deepseek.json
 ENV HOST=0.0.0.0
+ENV DEEPSEEKER_BUILD_COMMIT=${DEEPSEEKER_BUILD_COMMIT}
 # uv installs the console script into /app/.venv/bin — without this the
 # CMD below never resolves ("exec: deeperseeker: not found").
 ENV PATH="/app/.venv/bin:${PATH}"
