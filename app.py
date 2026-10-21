@@ -218,7 +218,8 @@ _enforce_exposure_policy()
 # stamped by the release workflow as a build arg -> env, and both degrade
 # gracefully for source checkouts (version "dev", commit "-").
 try:
-    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
 
     try:
         APP_VERSION = _pkg_version("deeperseeker")
