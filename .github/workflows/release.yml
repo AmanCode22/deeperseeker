@@ -1,18 +1,23 @@
 name: Release image
 
-# P0-2: a tag push builds and publishes the multi-arch image to ghcr.io and
-# prints the digest. Installs inside the image come from uv.lock only (uv
-# sync in the Dockerfile) — no unpinned dependency is evaluated at build time.
+# Images are built ONLY by this workflow — never locally, never by hand.
+# A release is: bump [project] version in pyproject.toml, push the matching
+# v<version> tag; this yaml does the rest on GitHub's runners.
 #
-# Tag scheme (one sentence in README): every `v*` tag publishes
-#   ghcr.io/<owner>/<repo>:<full version>   e.g. v1.0.0
-#   ghcr.io/<owner>/<repo>:<major>          e.g. v1
+# The version has ONE source: pyproject.toml [project] version (e.g. "6.0").
+# The workflow refuses to build when the pushed tag disagrees with it, then
+# publishes one multi-arch image (amd64 + arm64) under three tags:
+#   ghcr.io/<owner>/<repo>:<version>   e.g. 6.0   (full version)
+#   ghcr.io/<owner>/<repo>:<major>     e.g. 6     (major line)
 #   ghcr.io/<owner>/<repo>:latest
+#
+# Installs inside the image come from uv.lock only (uv sync in the
+# Dockerfile) — no unpinned dependency is evaluated at build time.
+
 on:
   push:
     tags:
       - "v*"
-      - "v*.*.*"
 
 env:
   REGISTRY: ghcr.io
@@ -28,6 +33,25 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Read the version from pyproject.toml (single source of truth)
+        id: ver
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -n1)"
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not read the [project] version from pyproject.toml — the release version must live there, not in the tag alone."
+            exit 1
+          fi
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$TAG_VERSION" != "$VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match pyproject.toml version ${VERSION}. Tag the release v${VERSION} (or fix pyproject.toml) — never build a mislabeled image."
+            exit 1
+          fi
+          MAJOR="${VERSION%%.*}"
+          echo "Releasing ${GITHUB_REF_NAME} -> image tags: ${VERSION}, ${MAJOR}, latest"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "major=${MAJOR}" >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU (arm64 emulation)
         uses: docker/setup-qemu-action@v3
 
@@ -41,14 +65,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Derive the tag scheme (semver + major + latest)
+      - name: Derive image tags from the pyproject.toml version
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=${{ steps.ver.outputs.major }}
             type=raw,value=latest
 
       - name: Build and push (amd64 + arm64)
@@ -65,6 +89,6 @@ jobs:
 
       - name: Print the digest
         run: |
-          echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}"
           echo "Digest: ${{ steps.push.outputs.digest }}"
           echo "Tags: ${{ steps.meta.outputs.tags }}"
