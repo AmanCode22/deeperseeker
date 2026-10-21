@@ -405,6 +405,54 @@ def test_pool_race_proof_ten_concurrent_requests(tmpdir=None):
     )
 
 
+def test_stale_success_cannot_lift_a_quarantine(tmpdir=None):
+    """Day 11's sleep-on-it attack: a token dies between selection and use.
+
+    Two sends overlap on one token. The first takes a 401 and quarantines it;
+    the second, already in flight, finishes successfully afterwards. That stale
+    success must not launder the quarantine — the state is operator-controlled,
+    so only restore_token() ends it. The in-flight slot still has to release,
+    which is what keeps the pool from leaking reservations.
+    """
+    import tempfile
+
+    tmpdir = tmpdir or tempfile.mkdtemp()
+    fns = _fresh_pool(tmpdir, ["a", "b"])
+
+    slot = fns.acquire_token_slot(1)  # the send that is already running
+    _report(fns, 1, 401)  # the other one dies on auth
+    assert fns.get_token(1)["status"] == "QUARANTINED"
+
+    slot.release()  # the dying token must still give up its slot
+    assert fns.token_in_flight(1) == 0, "a released send must not leak in-flight"
+
+    fns.mark_active(1)  # the stale success lands after the quarantine
+    assert fns.get_token(1)["status"] == "QUARANTINED", (
+        "an in-flight success must not undo a quarantine: "
+        f"got {fns.get_token(1)['status']}"
+    )
+
+    # Healthy token cooling too: the landed fallback may still reach for the
+    # cooling token (it recovers by itself), but never for the quarantined one.
+    conn = fns.get_db()
+    conn.execute(
+        "UPDATE tokens SET status='RATE_LIMITED', rate_limited_until=? WHERE id=2",
+        (time.time() + 3600,),
+    )
+    conn.commit()
+    conn.close()
+    assert fns.pick_token() == 2, (
+        "the soonest-to-recover fallback may use a cooling token..."
+    )
+    assert fns.get_token(1)["status"] == "QUARANTINED", (
+        "...but a laundered quarantine would hand a dead credential back to it"
+    )
+
+    fns.restore_token(1)
+    assert fns.get_token(1)["status"] == "ACTIVE"
+    assert fns.pick_token() == 1
+
+
 TESTS = [
     test_cooldown_auto_recovery,
     test_mark_limited_sets_and_clears_cooldown,
@@ -416,6 +464,7 @@ TESTS = [
     test_repeated_403_escalates_to_quarantine,
     test_quarantine_returns_only_by_manual_action,
     test_pool_race_proof_ten_concurrent_requests,
+    test_stale_success_cannot_lift_a_quarantine,
 ]
 
 

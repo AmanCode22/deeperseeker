@@ -737,10 +737,17 @@ def mark_limited(token_id, code=None):
 
 
 def mark_active(token_id):
+    """Stamp a successful turn: back in rotation, streak cleared.
+
+    A QUARANTINED row is deliberately left alone (P0-3). Requests overlap, so a
+    send that started before the pull can land its success afterwards; letting
+    that flip the status would let a stale response launder an operator-
+    controlled state, and only restore_token() ends a quarantine.
+    """
     conn = get_db()
     conn.execute(
         "UPDATE tokens SET status = ?, rate_limited_until = NULL, last_used = ?, "
-        "consecutive_403 = 0 WHERE id = ?",
+        "consecutive_403 = 0 WHERE id = ? AND status != 'QUARANTINED'",
         ("ACTIVE", time.time(), token_id),
     )
     conn.commit()
