@@ -134,6 +134,21 @@ cp .env.example .env
 - **Claude Desktop Compatible**: Rich `/v1/models` capability metadata + the `anthropic/claude-v4.1flash` alias for automatic client discovery.
 - **Hardened Dashboard**: Session TTL, brute-force login lockout (5 attempts → 5 min), CSRF origin check.
 
+## Security defaults
+
+What each boot does, verified by actually running it (P0-8 before/after matrix):
+
+- **No `DEEPSEEKER_API_KEY` set** (Boot 1): a strong key is generated, printed once on boot, and persisted to `api_key.txt` next to the database so restarts keep the same key. Never an open relay.
+- **Default dashboard credentials + loopback bind** (Boot 2): boots with a loud warning suggesting `DEEPSEEKER_ADMIN_USER` / `DEEPSEEKER_ADMIN_PASSWORD`. Local development stays zero-config.
+- **Default dashboard credentials + non-loopback bind** (Boot 3): **refuses to start**, naming the fix — set the credential pair, stay loopback, or set `DEEPSEEKER_ALLOW_DEFAULT_ADMIN=1` to accept the risk explicitly (not recommended). Anyone who can reach the dashboard owns the token pool; that is the exposed-relay configuration that killed ds2api, so it dies at boot time now, not in a postmortem.
+
+The container runs as an unprivileged user (uid 10001); only `/app/data` (database, cookie backup, generated key) is writable. A **new** named volume inherits that ownership automatically. A volume populated by a pre-P0-8 root-era image holds root-owned files — hand it over once, then use the image normally (and the reverse direction is always safe: a chown'd volume also works under a root-era image):
+
+```bash
+docker run --rm -u root -v deeperseeker_deeperseeker_data:/app/data alpine \
+  chown -R 10001:10001 /app/data
+```
+
 ## Troubleshooting
 
 - **Empty or blank replies, then an HTTP 502** — *Symptom:* the client gets `Empty response from DeepSeek (no parseable SSE content)` (or an upstream error event) and finally a `502` with an `error.request_id` (OpenAI surface) or a `[trace: …]` suffix in the message (Anthropic surface). *What the service does now:* the turn is retried across the pool — each attempt on a different token, jittered backoff between attempts — up to `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` tries; when every attempt comes back empty, the designed 502 is returned with the correlation id stamped in the body and the `X-Request-ID` header, and nothing upstream-derived reaches the body unredacted. *What to check:* open the dashboard pool view and look for tokens stuck `RATE_LIMITED`/`QUARANTINED`; match the `request_id`/`trace` against the access log line to see which states the turn traversed.
