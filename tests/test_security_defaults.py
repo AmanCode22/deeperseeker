@@ -87,7 +87,82 @@ def test_module_api_key_always_present():
     assert app_module.API_KEY, "API_KEY must never be empty (fail-open)"
 
 
+# ==============================================================================
+# P0-8 (Days 15-16): exposure policy — default credentials never meet a
+# non-loopback bind. Boot matrix before the fix:
+#   Boot 1: no key set                       -> generated key, shown once (B9)   [ok]
+#   Boot 2: admin/admin + loopback bind      -> loud warning, boots              [ok]
+#   Boot 3: admin/admin + non-loopback bind  -> loud warning, STILL BOOTS        [gap]
+# After the fix Boot 3 refuses to start, naming the exact fix.
+# ==============================================================================
+
+
+def test_boot3_default_admin_non_loopback_refuses():
+    """Defaults meeting a non-loopback bind must refuse to start, and the
+    refusal must name the exact env fix."""
+    with mock.patch.dict(
+        os.environ,
+        {"HOST": "0.0.0.0"},
+    ):
+        try:
+            app_module._enforce_exposure_policy()
+        except SystemExit as e:
+            message = str(e)
+            assert "DEEPSEEKER_ADMIN_PASSWORD" in message, (
+                "the refusal must name the exact fix"
+            )
+            assert "DEEPSEEKER_ADMIN_USER" in message
+        else:
+            raise AssertionError(
+                "default admin credentials on a non-loopback bind must refuse to start"
+            )
+
+
+def test_boot2_default_admin_loopback_still_boots():
+    """Loopback + defaults keeps the landed B9 behavior: warn, don't refuse."""
+    with mock.patch.dict(os.environ, {"HOST": "127.0.0.1"}):
+        app_module._enforce_exposure_policy()  # must not raise
+
+
+def test_boot2_default_admin_unset_host_still_boots():
+    """HOST unset means the 127.0.0.1 default — that is a loopback boot."""
+    with mock.patch.dict(os.environ, {}, clear=True):
+        app_module._enforce_exposure_policy()  # must not raise
+
+
+def test_non_default_admin_non_loopback_boots():
+    """Explicit credentials plus an exposed bind is a legitimate deployment."""
+    with (
+        mock.patch.dict(os.environ, {"HOST": "0.0.0.0"}),
+        mock.patch.object(app_module, "ADMIN_USER", "ops"),
+        mock.patch.object(app_module, "ADMIN_PASSWORD", "correct horse battery staple"),
+    ):
+        app_module._enforce_exposure_policy()  # must not raise
+
+
+def test_boot3_escape_hatch_is_explicit():
+    """The documented override must exist and must be opt-in by name."""
+    with mock.patch.dict(
+        os.environ, {"HOST": "0.0.0.0", "DEEPSEEKER_ALLOW_DEFAULT_ADMIN": "1"}
+    ):
+        app_module._enforce_exposure_policy()  # explicit acceptance -> boots
+    with mock.patch.dict(
+        os.environ, {"HOST": "0.0.0.0", "DEEPSEEKER_ALLOW_DEFAULT_ADMIN": "0"}
+    ):
+        try:
+            app_module._enforce_exposure_policy()
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("any value other than '1' must keep the refusal")
+
+
 TESTS = [
+    test_boot3_default_admin_non_loopback_refuses,
+    test_boot2_default_admin_loopback_still_boots,
+    test_boot2_default_admin_unset_host_still_boots,
+    test_non_default_admin_non_loopback_boots,
+    test_boot3_escape_hatch_is_explicit,
     test_explicit_key_honored,
     test_empty_key_generates_and_persists,
     test_generated_key_never_equals_documented_default,
