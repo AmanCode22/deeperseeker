@@ -181,7 +181,13 @@ def test_retries_count_once_and_failures_record_nothing():
         assert "dsk-retrykey" not in str(rows), "key material must be masked"
 
         # a turn that never succeeds records nothing
-        async def always_fail(*a, **k):
+        def always_fail(*a, **k):
+            # sync on purpose: send_message is an async GENERATOR function —
+            # callers do `gen = send_message(...)` (no await) and iterate.
+            # An `async def` fake here returns a coroutine instead of an
+            # async generator, so the iterate site explodes with TypeError
+            # and abandons an un-awaited coroutine (RuntimeWarning noise;
+            # review fix, PR #58-#67 test-hygiene).
             async def fail_gen():
                 raise RuntimeError(
                     "Empty response from DeepSeek (no parseable SSE content)"

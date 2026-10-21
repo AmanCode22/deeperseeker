@@ -111,6 +111,22 @@ def test_classifier_matches_context_class_failures():
     assert not is_context_limit_error(TimeoutError())
     # loose words like 'exceeded' only count for real UpstreamError bodies
     assert not is_context_limit_error(RuntimeError("deadline exceeded"))
+    # review fix (PR #67): the loose words count only when ANCHORED to
+    # context material — a bare 'exceed' in an upstream body, a 'too long'
+    # with no prompt/message in front, and a plain-exception 'context'
+    # substring are retry-shaped, not context-shaped
+    assert not is_context_limit_error(UpstreamError(400, "header limit exceeded"))
+    assert not is_context_limit_error(UpstreamError(400, "request line too long"))
+    assert not is_context_limit_error(RuntimeError("context deadline exceeded"))
+    # ... while the anchored forms still classify
+    assert is_context_limit_error(
+        UpstreamError(400, "the last message is too long for the context window")
+    )
+    assert is_context_limit_error(
+        UpstreamError(400, "prompt exceeded the context window")
+    )
+    assert is_context_limit_error(RuntimeError("maximum context length is 65536"))
+    assert is_context_limit_error(RuntimeError("token limit hit"))
 
 
 # --------------------------------------------------------------------------
@@ -188,7 +204,11 @@ def test_context_failure_retries_with_forced_summary_rollover():
         def fake_find(s):
             return store.get(s)
 
-        async def fake_delete(token_id, session_id):
+        def fake_delete(token_id, session_id):
+            # sync on purpose: delete_sessions_for_chat runs via _db()
+            # (asyncio.to_thread) — an async fake here would create a
+            # coroutine that is never awaited (review fix, PR #58-#67
+            # test-hygiene) and its body would never run.
             for key in [
                 k for k, v in store.items() if v.get("session_id") == session_id
             ]:

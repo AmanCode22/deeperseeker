@@ -277,9 +277,10 @@ def test_terminal_empty_sse_shaped_502():
     # P0-4: the terminal envelope carries the correlation id so a failing
     # stream can be traced in the access log without asking the operator.
     assert err.get("request_id"), "terminal 502 must carry a trace id"
-    assert (
+    # review fix (nit, PR #59): the old `assert (str and cond)` idiom passed
+    # by accident of truthiness — assert the redaction directly
+    assert "token" not in err["message"].lower(), (
         "no secret material in the terminal body"
-        and "token" not in err["message"].lower()
     )
 
 

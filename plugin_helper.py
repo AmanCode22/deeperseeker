@@ -586,7 +586,11 @@ async def build_prompt(
 ):
     final_prompt = ""
     tools_extract = await extract_tools(tools)
-    if is_first_message and (rollover_summary or needs_rollover(messages)):
+    # PR #67 review fix (Medium): pass the tools through — the tool-aware
+    # estimate (tool schemas + prompt overhead) is the whole point of the DSH
+    # fix, and this decision point was still calling it tool-blind, i.e. with
+    # exactly the underestimate the fix removed everywhere else.
+    if is_first_message and (rollover_summary or needs_rollover(messages, tools)):
         # Accumulated context is nearing the observed limit: hand off to a
         # fresh chat seeded with a model-generated summary instead of blindly
         # truncating the oldest history. Restore the full runtime contract

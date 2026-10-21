@@ -4,7 +4,7 @@ All notable user-visible changes. One bullet per change, each citing its PR
 or issue — no citation, no bullet. Dates are the day the change landed on
 main.
 
-## [1.0.0] — 2026-10-21
+## [6.0] — 2026-10-21
 
 ### Fixed
 

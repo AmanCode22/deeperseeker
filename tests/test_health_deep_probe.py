@@ -44,8 +44,18 @@ def test_deep_probe_healthy_reports_shape_without_secrets():
 
     with (
         mock.patch.object(app_module, "create_new_chat", ok_create),
+        # Review fix (PR #62): the probe rides the state-aware pick
+        # (pick_token -> get_token) instead of the state-blind first row.
+        mock.patch.object(app_module, "pick_token", lambda: 1),
         mock.patch.object(
-            app_module, "get_auth_token", lambda: "secret-token-material"
+            app_module,
+            "get_token",
+            lambda tid: {
+                "id": tid,
+                "alias": None,
+                "token": "secret-token-material",
+                "status": "ACTIVE",
+            },
         ),
     ):
         payload = asyncio.run(app_module._deep_health_probe())
@@ -68,7 +78,12 @@ def test_deep_probe_failure_is_degraded_and_redacted():
 
     with (
         mock.patch.object(app_module, "create_new_chat", boom),
-        mock.patch.object(app_module, "get_auth_token", lambda: "tok"),
+        mock.patch.object(app_module, "pick_token", lambda: 1),
+        mock.patch.object(
+            app_module,
+            "get_token",
+            lambda tid: {"id": tid, "alias": None, "token": "tok", "status": "ACTIVE"},
+        ),
     ):
         payload = asyncio.run(app_module._deep_health_probe())
     assert payload["upstream_reachable"] is False
@@ -79,10 +94,73 @@ def test_deep_probe_failure_is_degraded_and_redacted():
 
 
 def test_deep_probe_without_pool_token_is_honest():
-    with mock.patch.object(app_module, "get_auth_token", lambda: None):
+    with mock.patch.object(app_module, "pick_token", lambda: None):
         payload = asyncio.run(app_module._deep_health_probe())
     assert payload["upstream_reachable"] is False
-    assert payload["reason"] == "no token in pool"
+    assert payload["reason"] == "no ACTIVE token in pool"
+
+
+def test_deep_probe_skips_quarantined_pool():
+    """A pool whose only row is QUARANTINED must NOT be probed: pick_token()
+    returns None (quarantined rows are never candidates) and the probe
+    reports honestly instead of re-arming a known-dead credential."""
+    calls = {"create": 0}
+
+    async def fail_if_called(token):
+        calls["create"] += 1
+        return "chat-should-not-exist"
+
+    with (
+        mock.patch.object(app_module, "create_new_chat", fail_if_called),
+        mock.patch.object(app_module, "pick_token", lambda: None),
+        # even a state-blind get_token would find this dead row — the probe
+        # must never reach it because pick_token already refused
+        mock.patch.object(
+            app_module,
+            "get_token",
+            lambda tid: {
+                "id": tid,
+                "alias": None,
+                "token": "dead-credential",
+                "status": "QUARANTINED",
+            },
+        ),
+    ):
+        payload = asyncio.run(app_module._deep_health_probe())
+    assert calls["create"] == 0, "a quarantined pool must not be probed upstream"
+    assert payload["upstream_reachable"] is False
+    assert payload["reason"] == "no ACTIVE token in pool"
+
+
+def test_health_route_refuses_unauthenticated_deep_before_upstream():
+    """Route-level contract (review fix, PR #62 Low): GET /health?deep=1
+    without a key returns 401 and never reaches create_new_chat — the
+    ordering the shallow route used to swallow."""
+    from fastapi.testclient import TestClient
+
+    calls = {"create": 0}
+
+    async def fail_if_called(token):
+        calls["create"] += 1
+        return "chat-should-not-exist"
+
+    with mock.patch.object(app_module, "create_new_chat", fail_if_called):
+        client = TestClient(app_module.app)
+        resp = client.get("/health?deep=1")
+    assert calls["create"] == 0, "unauthenticated deep probing must not touch upstream"
+    assert resp.status_code == 401, resp.text
+    assert "Invalid API key" in resp.text
+
+
+def test_health_route_shallow_stays_public():
+    """The shallow check stays public: no key and no deep param is answered
+    (200/503 by pool state), never 401."""
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app_module.app)
+    resp = client.get("/health")
+    assert resp.status_code in (200, 503), resp.text
+    assert "Invalid API key" not in resp.text
 
 
 TESTS = [
@@ -90,6 +168,9 @@ TESTS = [
     test_deep_probe_healthy_reports_shape_without_secrets,
     test_deep_probe_failure_is_degraded_and_redacted,
     test_deep_probe_without_pool_token_is_honest,
+    test_deep_probe_skips_quarantined_pool,
+    test_health_route_refuses_unauthenticated_deep_before_upstream,
+    test_health_route_shallow_stays_public,
 ]
 
 

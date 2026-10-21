@@ -1439,10 +1439,13 @@ async def handle_chat(
         # experience 'context limit' deaths. Classify it and make the retry
         # a FORCED summary rollover instead: the fresh chat is seeded with a
         # model-generated handoff summary, keeping full continuity. One
-        # context retry per turn — if the summary path also fails, the
-        # remaining budget retries normally.
-        context_class = is_context_limit_error(e)
-        if context_class:
+        # context retry per turn: the forced flag is NOT sticky (review fix,
+        # PR #67) — `_context_retried or context_class` kept it pinned for
+        # the whole remaining budget, forcing an extra upstream summary call
+        # on every later attempt. Once the forced attempt has run, the rest
+        # of the budget retries normally.
+        force_context_retry = bool(is_context_limit_error(e)) and not _context_retried
+        if force_context_retry:
             logger.warning(
                 "Context-class upstream failure on chat %s (%s); the retry will force a summary rollover",
                 session_id,
@@ -1475,7 +1478,7 @@ async def handle_chat(
             _attempt=_attempt + 1,
             _auth_rotated=_auth_rotated,
             _exclude_token=token_id,
-            _context_retried=_context_retried or context_class,
+            _context_retried=force_context_retry,
             is_responses=is_responses,
             response_opts=response_opts,
         )
@@ -3913,6 +3916,19 @@ async def health(request: Request):
     # WAF cookies are deprecated in favor of Android headers (which do not require cookies).
     # Token presence determines service readiness; cookie status is kept for backup visibility.
     ok = active > 0
+    # P0-9 contract (PR #62 review fix, Low): an unauthenticated deep request
+    # is refused with 401 BEFORE any upstream traffic — the shallow check
+    # stays public, the deep probe can never work as a free relay tester.
+    # The ordering used to live only inside _deep_health_probe_guarded, which
+    # the route never called, so an unauthenticated ?deep=1 silently got the
+    # shallow 200 instead of the documented 401.
+    deep = (request.query_params.get("deep") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if deep and not check_key(request):
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
     data = {"status": "ok" if ok else "degraded"}
     if check_key(request):
         data["active_tokens"] = active
@@ -3922,13 +3938,9 @@ async def health(request: Request):
         # P0-9 (Day 26): deep probe. Authenticated callers can ask for one
         # real end-to-end upstream round trip (PoW challenge -> solve ->
         # chat session create). The shallow check stays public; an
-        # unauthenticated deep request is refused BEFORE any upstream traffic
-        # so the endpoint can never be abused as a free relay tester.
-        deep = (request.query_params.get("deep") or "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        # unauthenticated deep request is refused above, BEFORE any upstream
+        # traffic, so the endpoint can never be abused as a free relay
+        # tester.
         if deep:
             probe = await _deep_health_probe()
             data["deep"] = probe
@@ -3960,14 +3972,24 @@ async def _deep_health_probe():
     bridge can run, because chat session create is exactly the hop that
     breaks when PoW, the client version or the token dies. The probe never
     sends a message and never reports token material, only shapes.
+
+    State-aware pick (PR #62 review fix, Medium): the probe rides
+    pick_token(), which skips QUARANTINED rows and still-cooling
+    RATE_LIMITED rows. The old get_auth_token() grabbed literally the first
+    row in the table, so the probe both reported degraded while healthy
+    tokens existed (false negative) and deliberately sent upstream traffic
+    into a known-dead credential — the exact re-arming behavior P0-3 exists
+    to prevent.
     """
-    auth_token = await _db(get_auth_token)
+    token_id = await _db(pick_token)
+    row = await _db(get_token, token_id) if token_id is not None else None
+    auth_token = row["token"] if row else None
     if not auth_token:
         return {
             "upstream_reachable": False,
             "pow_ok": False,
             "latency_ms": None,
-            "reason": "no token in pool",
+            "reason": "no ACTIVE token in pool",
         }
     started = time.perf_counter()
     try:

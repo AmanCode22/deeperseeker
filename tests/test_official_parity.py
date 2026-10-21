@@ -15,11 +15,13 @@ The 5-line spec locked here:
 Run:  python tests/test_official_parity.py   (pytest-compatible)
 """
 
+import asyncio
 import json
 import os
 import sys
 import tempfile
 import unittest.mock as mock
+from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -132,16 +134,6 @@ def test_official_plain_turn_shape_matches_bridge():
 
         # Bridge mode, same route, deterministic upstream: same top-level shape.
         os.environ.pop("DEEPSEEKER_MODE", None)
-        bridge_shape = {
-            "id",
-            "object",
-            "created",
-            "model",
-            "choices",
-            "usage",
-            "cost",
-            "system_fingerprint",
-        }
         assert set(official_shape.keys()) <= {
             "id",
             "object",
@@ -153,7 +145,6 @@ def test_official_plain_turn_shape_matches_bridge():
         assert official_shape["object"] == "chat.completion"
         assert official_shape["choices"][0]["message"]["content"] == "official says hi"
         assert official_shape["usage"]["prompt_tokens"] == 11
-        del bridge_shape
     finally:
         official_api._post_json = saved_post
         _restore_mode(old_mode)
@@ -413,6 +404,85 @@ def test_official_error_never_leaks_key():
         functions._db = saved
 
 
+def test_map_model_preserves_official_ids():
+    """Review fix (PR #64, Medium): /v1/models advertises deepseek-reasoner,
+    but the unknown-id default used to reroute it to deepseek-chat — reasoner
+    requests silently served by the chat model. Official ids map to
+    themselves."""
+    assert official_api.map_model("v4.1flash") == "deepseek-chat"
+    assert official_api.map_model("deepseek-chat") == "deepseek-chat"
+    assert official_api.map_model("deepseek-reasoner") == "deepseek-reasoner"
+    assert official_api.map_model("  deepseek-reasoner  ") == "deepseek-reasoner"
+    # unknown ids still fall back to the bridge-visible default
+    assert official_api.map_model(None) == "deepseek-chat"
+    assert official_api.map_model("totally-unknown") == "deepseek-chat"
+
+
+def test_official_stream_posts_to_absolute_official_url():
+    """Review fix (PR #64, HIGH): the official STREAMING path must POST the
+    absolute official URL. It used to hand f"{OFFICIAL_BASE}/chat/completions"
+    to post_with_failover(path) — which prepends the BRIDGE base — producing
+    https://chat.deepseek.comhttps://api.deepseek.com/chat/completions, a URL
+    that can never resolve, so every official-mode stream died 502/DNS. CI
+    missed it because the envelope test mocked official_chat wholesale; this
+    test pins the outbound URL instead."""
+    captured = {}
+
+    async def _no_lines():
+        return
+        yield b""  # pragma: no cover — makes this an async generator
+
+    class _FakeResp:
+        status = 200
+        content = _no_lines()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _FakeSession:
+        async def post(self, url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return _FakeResp()
+
+    async def fake_get_session():
+        return _FakeSession()
+
+    saved_session = official_api.get_session
+    saved_key = official_api.OFFICIAL_API_KEY
+    official_api.get_session = fake_get_session
+    official_api.OFFICIAL_API_KEY = "k-official-test"
+    try:
+
+        async def _drain():
+            gen = official_api._official_chat_stream(
+                {"model": "v4.1flash", "messages": [{"role": "user", "content": "hi"}]}
+            )
+            return [line async for line in gen]
+
+        lines = asyncio.run(_drain())
+    finally:
+        official_api.get_session = saved_session
+        official_api.OFFICIAL_API_KEY = saved_key
+
+    url = captured["url"]
+    parsed = urlparse(url)
+    official = urlparse(official_api.OFFICIAL_BASE)
+    assert parsed.scheme == "https", url
+    assert parsed.netloc == official.netloc, (
+        f"stream must post to the official host, got {url}"
+    )
+    assert parsed.path == "/chat/completions", url
+    assert url.count("https://") == 1, f"bridge base leaked into the URL: {url}"
+    assert captured["kwargs"]["headers"]["Authorization"] == "Bearer k-official-test"
+    assert captured["kwargs"]["json"]["model"] == "deepseek-chat"
+    # an empty upstream stream still produces the [DONE] envelope
+    assert lines == ["data: [DONE]\n\n"]
+
+
 TESTS = [
     test_mode_switch_is_explicit,
     test_official_plain_turn_shape_matches_bridge,
@@ -420,6 +490,8 @@ TESTS = [
     test_official_stream_envelope_matches_contract,
     test_official_anthropic_surface_parity,
     test_official_models_surface,
+    test_map_model_preserves_official_ids,
+    test_official_stream_posts_to_absolute_official_url,
     test_official_usage_recorded_with_masked_key,
     test_official_error_never_leaks_key,
 ]

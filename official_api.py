@@ -28,7 +28,7 @@ import uuid
 
 import aiohttp
 
-from functions import UpstreamError, get_session, post_with_failover
+from functions import UpstreamError, get_session
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -49,7 +49,15 @@ def official_mode_enabled():
 # Bridge model id -> official model id. The bridge exposes one model
 # (v4.1flash); official mode maps it to deepseek-chat. Clients keep sending
 # whatever they sent before — the mode switch is invisible to them.
-MODEL_MAP = {"v4.1flash": "deepseek-chat"}
+# deepseek-chat and deepseek-reasoner are official ids themselves (reasoner
+# is advertised by /v1/models below): the unknown-id default must not
+# silently reroute a requested reasoner to the chat model (PR #64 review
+# fix, Medium).
+MODEL_MAP = {
+    "v4.1flash": "deepseek-chat",
+    "deepseek-chat": "deepseek-chat",
+    "deepseek-reasoner": "deepseek-reasoner",
+}
 
 
 def map_model(model):
@@ -150,19 +158,28 @@ async def _official_chat_stream(payload):
         raise UpstreamError(
             503, "official mode is on but DEEPSEEKER_OFFICIAL_API_KEY is not set"
         )
-    await get_session()  # ensure the shared client session exists
+    session = await get_session()  # ensure the shared client session exists
     cid = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
     client_model = payload.get("model")
     usage_seen = None
     try:
-        resp = await post_with_failover(
+        # PR #64 review fix (HIGH): this must be an ABSOLUTE official URL.
+        # The old code handed f"{OFFICIAL_BASE}/chat/completions" to
+        # post_with_failover(path) — which prepends the BRIDGE base
+        # (session.post(base + path)) — producing
+        # https://chat.deepseek.comhttps://api.deepseek.com/chat/completions,
+        # a URL that can never resolve: every official-mode streaming chat
+        # died 502/DNS, and CI missed it because the envelope test mocked
+        # official_chat wholesale. _post_json already posted the absolute
+        # URL; the streaming path now does exactly the same.
+        resp = await session.post(
             f"{OFFICIAL_BASE}/chat/completions",
             headers=_headers(),
             json=payload,
             timeout=aiohttp.ClientTimeout(total=300),
         )
-    except aiohttp.ClientError as e:
+    except (TimeoutError, aiohttp.ClientError) as e:
         raise UpstreamError(502, f"official API unreachable: {type(e).__name__}") from e
     async with resp:
         if resp.status != 200:

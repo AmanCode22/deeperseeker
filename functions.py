@@ -1904,7 +1904,11 @@ _EMPTY_SSE_CONTEXT = (
     "Empty response from DeepSeek (prompt may exceed the session context limit)"
 )
 _CONTEXT_LIMIT_HINT_RE = re.compile(
-    r"context|token.?limit|maximum.?context|too.?long|exceed",
+    r"maximum.?context"
+    r"|context.?(?:length|limit|window)"
+    r"|token.?limit"
+    r"|(?:prompt|payload|conversation|messages?).{0,24}too.?long"
+    r"|exceed(?:ed|s)?[^.\n]{0,30}context",
     re.IGNORECASE,
 )
 _SSE_RECENT_LINES = 8
@@ -1923,15 +1927,24 @@ def is_context_limit_error(exc):
         'maximum context length', 'context limit', 'too long', ...), and
       * the bridge's own empty-SSE-with-context-hint error.
     Deliberately NOT matched: generic 5xx/timeouts — 'deadline exceeded' or
-    '502 upstream timeout' are retry-shaped, not context-shaped, so the loose
-    words ('too long', 'exceed') only count for real UpstreamError bodies,
-    never for arbitrary exception text."""
+    '502 upstream timeout' are retry-shaped, not context-shaped. The loose
+    words only count when anchored to context material: a bare 'exceed' or a
+    'too long' with no prompt/message in front of it no longer classifies as
+    context (review fix, PR #67 — an upstream body like 'header limit
+    exceeded' for a non-context reason used to force a wasteful summary
+    rollover), and the plain-exception fallback requires explicit context-
+    limit phrasing — a mere 'context' substring ('context deadline
+    exceeded') is retry-shaped, not context-shaped."""
     if isinstance(exc, UpstreamError):
         body = exc.body or ""
         return bool(_CONTEXT_LIMIT_HINT_RE.search(body))
     text = str(exc or "")
     return bool(
-        re.search(r"context|token.?limit|maximum.?context", text, re.IGNORECASE)
+        re.search(
+            r"maximum.?context|context.?(?:length|limit|window)|token.?limit",
+            text,
+            re.IGNORECASE,
+        )
     )
 
 
