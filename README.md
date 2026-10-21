@@ -139,6 +139,20 @@ cp .env.example .env
 | `DEEPSEEKER_TOKEN_CONCURRENCY` | Soft per-token in-flight cap; at-cap tokens are used only when nothing else is free | `8` |
 | `DEEPSEEKER_QUARANTINE_AFTER_403` | Consecutive 403s that take a token out of rotation until you restore it (`0` disables escalation) | `3` |
 | `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` | Retries of one turn across the pool before the upstream error is surfaced to the client | `3` |
+| `DEEPSEEKER_MODE` | `bridge` (reverse-engineered web session) or `official` (official API passthrough). Explicit only — nothing falls back on its own | `bridge` |
+| `DEEPSEEKER_OFFICIAL_API_KEY` | Official API key used when mode is `official` (from platform.deepseek.com). Required in official mode | unset |
+| `DEEPSEEKER_OFFICIAL_BASE` | Official API base URL override in official mode | `https://api.deepseek.com` |
+
+## Official-API mode (the exit door)
+
+Set `DEEPSEEKER_MODE=official` and `DEEPSEEKER_OFFICIAL_API_KEY` and the same
+endpoints (chat, messages, models) serve requests from the **official API**
+instead of the web session. The mode switch is invisible to clients: same
+auth (your `DEEPSEEKER_API_KEY`), same model id (`v4.1flash` maps to
+`deepseek-chat`), same tool calling, same usage stats (surface `official`).
+The official key never reaches a log line or an error body. When the bridge
+breaks (PoW change, WAF return, layout change), this is the minutes-not-hours
+fallback — flip the env, restart, keep working; flip it back the same way.
 
 ## Auth Token Setup
 
