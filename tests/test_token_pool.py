@@ -326,6 +326,85 @@ def test_quarantine_returns_only_by_manual_action(tmpdir=None):
     )
 
 
+def test_pool_race_proof_ten_concurrent_requests(tmpdir=None):
+    """10 concurrent same-signature requests, one token cooling (Day 9).
+
+    Selection and reservation happen with no await between them, which is
+    exactly what the per-chat lock guarantees for same-signature traffic in
+    app.py: it makes the "cooling token got nothing" and soft-cap assertions
+    deterministic instead of dependent on thread interleaving. The cooldown
+    bookkeeping write still runs through asyncio.to_thread, the way production
+    does it, so the release path is exercised concurrently.
+
+    If this ever goes flaky the race is real; do not loosen the assertions.
+    """
+    import asyncio
+    import random
+    import tempfile
+
+    tmpdir = tmpdir or tempfile.mkdtemp()
+    fns = _fresh_pool(tmpdir, ["a", "b", "c"])
+
+    # Token 2 is cooling for an hour: it must receive zero requests.
+    fns.mark_limited(2)
+    conn = fns.get_db()
+    conn.execute(
+        "UPDATE tokens SET rate_limited_until=? WHERE id=2", (time.time() + 3600,)
+    )
+    conn.commit()
+    conn.close()
+
+    seen = []
+    peak = {}
+    held = {"n": 0}
+
+    async def request(i):
+        tid = fns.pick_token()
+        slot = fns.acquire_token_slot(tid)  # no await: reserve follows the pick
+        held["n"] += 1
+        seen.append(tid)
+        assert tid != 2, "a cooling token must never be selected"
+        assert held["n"] == sum(fns._in_flight.values()), (
+            "in-flight accounting drifted: "
+            f"{held['n']} held vs {dict(fns._in_flight)} recorded"
+        )
+        now = fns.token_in_flight(tid)
+        peak[tid] = max(peak.get(tid, 0), now)
+        assert now <= fns.TOKEN_CONCURRENCY_CAP, (
+            f"token {tid} passed the soft cap: {now} in flight"
+        )
+        await asyncio.sleep(random.uniform(0.002, 0.02))  # overlap the sends
+        slot.release()
+        held["n"] -= 1
+        await asyncio.to_thread(fns.mark_active, tid)
+
+    async def scenario():
+        await asyncio.gather(*(request(i) for i in range(10)))
+
+    asyncio.run(scenario())
+
+    assert len(seen) == 10
+    assert 2 not in seen, f"the cooling token received a request: {seen}"
+    assert set(seen) == {1, 3}, (
+        f"least-in-flight should spread over both healthy tokens: {sorted(seen)}"
+    )
+    assert fns._in_flight == {}, f"slots leaked: {dict(fns._in_flight)}"
+    assert max(peak.values()) <= fns.TOKEN_CONCURRENCY_CAP
+
+    # Cooldown expiry still recovers a merely-limited token (P0-3 added a
+    # terminal state; it must not have swallowed the landed auto-recovery).
+    conn = fns.get_db()
+    conn.execute(
+        "UPDATE tokens SET rate_limited_until=? WHERE id=2", (time.time() - 1,)
+    )
+    conn.commit()
+    conn.close()
+    assert fns.pick_token() in (1, 2, 3)
+    assert fns.get_token(2)["status"] == "ACTIVE", (
+        "an expired cooldown must still auto-recover"
+    )
+
+
 TESTS = [
     test_cooldown_auto_recovery,
     test_mark_limited_sets_and_clears_cooldown,
@@ -336,6 +415,7 @@ TESTS = [
     test_401_quarantines_and_makes_the_token_unselectable,
     test_repeated_403_escalates_to_quarantine,
     test_quarantine_returns_only_by_manual_action,
+    test_pool_race_proof_ten_concurrent_requests,
 ]
 
 
