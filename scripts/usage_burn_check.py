@@ -26,10 +26,9 @@ functions.init_db()
 IN_A, OUT_A = 123 * 1000, 123 * 250
 IN_B, OUT_B = 47 * 500, 47 * 100
 for i in range(123):
-    functions.record_usage(
-        KEY_A, "openai" if i % 2 else "anthropic", "v4.1flash", 1000, 250, ts=NOW
-    )
-for i in range(47):
+    surface = "openai" if i % 2 else "anthropic"
+    functions.record_usage(KEY_A, surface, "v4.1flash", 1000, 250, ts=NOW)
+for _ in range(47):
     functions.record_usage(KEY_B, "openai", "v4.1flash", 500, 100, ts=NOW)
 
 rows = functions.usage_by_day_key()

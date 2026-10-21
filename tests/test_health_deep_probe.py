@@ -42,8 +42,11 @@ def test_deep_probe_healthy_reports_shape_without_secrets():
     async def ok_create(token):
         return "chat-session-id-1234"
 
-    with mock.patch.object(app_module, "create_new_chat", ok_create), mock.patch.object(
-        app_module, "get_auth_token", lambda: "secret-token-material"
+    with (
+        mock.patch.object(app_module, "create_new_chat", ok_create),
+        mock.patch.object(
+            app_module, "get_auth_token", lambda: "secret-token-material"
+        ),
     ):
         payload = asyncio.run(app_module._deep_health_probe())
     assert payload["upstream_reachable"] is True
@@ -59,10 +62,13 @@ def test_deep_probe_failure_is_degraded_and_redacted():
     from functions import UpstreamError
 
     async def boom(token):
-        raise UpstreamError(401, "upstream said no with token aaaa1111bbbb2222cccc3333dddd4444")
+        raise UpstreamError(
+            401, "upstream said no with token aaaa1111bbbb2222cccc3333dddd4444"
+        )
 
-    with mock.patch.object(app_module, "create_new_chat", boom), mock.patch.object(
-        app_module, "get_auth_token", lambda: "tok"
+    with (
+        mock.patch.object(app_module, "create_new_chat", boom),
+        mock.patch.object(app_module, "get_auth_token", lambda: "tok"),
     ):
         payload = asyncio.run(app_module._deep_health_probe())
     assert payload["upstream_reachable"] is False

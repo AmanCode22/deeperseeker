@@ -37,6 +37,7 @@ security = HTTPBasic()
 from functions import (
     CookieGenerationError,
     StreamToolParser,
+    UpstreamError,
     acquire_token_slot,
     add_token,
     close_session,
@@ -106,6 +107,7 @@ API_KEY, _api_key_generated = _resolve_api_key()
 ADMIN_USER = os.getenv("DEEPSEEKER_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("DEEPSEEKER_ADMIN_PASSWORD", "admin")
 
+import official_api
 from middleware import (
     RealIPMiddleware,
     RecovererMiddleware,
@@ -578,14 +580,17 @@ def _api_error_response(e, is_anthropic=False):
         code = 503  # WAF cookies cannot be produced right now — upstream unreachable, not a client error
     if code < 400 or code > 599:
         code = 502
+    # P0-7: official-mode error bodies carry upstream text too — every
+    # client-visible error body passes the secret scrub, one discipline.
+    message = _redact_secret_material(str(e)[:500])
     if is_anthropic:
         payload = {
             "type": "error",
-            "error": {"type": "api_error", "message": str(e)[:500]},
+            "error": {"type": "api_error", "message": message},
         }
     else:
         err_type = "rate_limit_error" if code == 429 else "api_error"
-        payload = {"error": {"message": str(e)[:500], "type": err_type, "code": code}}
+        payload = {"error": {"message": message, "type": err_type, "code": code}}
     return JSONResponse(payload, status_code=code)
 
 
@@ -3042,9 +3047,78 @@ async def chat_completions(request: Request):
     search = body.get("search", False)
     stream = body.get("stream", False)
     tools = body.get("tools", None)
+    # P0-7: official passthrough — same handler, different upstream. The
+    # mode is explicit (DEEPSEEKER_MODE=official); no silent fallback.
+    if official_api.official_mode_enabled():
+        return await _official_chat_response(body, model, stream, tools, request)
     return await handle_chat(
         messages, model, thinking, search, stream, tools, scope=get_api_key(request)
     )
+
+
+_OFFICIAL_PASSTHROUGH_FIELDS = (
+    "messages",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "response_format",
+    "stop",
+)
+
+
+async def _official_chat_response(body, model, stream, tools, request):
+    """P0-7: serve /v1/chat/completions from the official API.
+
+    Same auth (checked by the caller), same usage recording (surface
+    'official', masked key, B7-independent because upstream reports real
+    usage), tools forwarded in native OpenAI format. The official key never
+    enters logs or error bodies (official_api redacts).
+    """
+    payload = {k: body[k] for k in _OFFICIAL_PASSTHROUGH_FIELDS if k in body}
+    payload["model"] = official_api.map_model(model)
+    if tools:
+        payload["tools"] = tools
+    if not stream:
+        try:
+            result = await official_api.official_chat(payload, stream=False)
+        except UpstreamError as e:
+            return _api_error_response(e, is_anthropic=False)
+        usage = result.get("usage") or {}
+        await _record_usage_safe(
+            get_api_key(request),
+            "official",
+            result.get("model") or payload["model"],
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+        )
+        return JSONResponse(result)
+    scope = get_api_key(request)
+
+    async def _gen():
+        total_in = total_out = 0
+        try:
+            async for line in official_api.official_chat(payload, stream=True):
+                if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                    try:
+                        chunk = json.loads(line[len("data: ") :])
+                        usage = chunk.get("usage")
+                        if usage:
+                            total_in = usage.get("prompt_tokens", total_in)
+                            total_out = usage.get("completion_tokens", total_out)
+                    except json.JSONDecodeError:
+                        pass
+                yield line
+        except UpstreamError as e:
+            # mid-stream failure: same discipline as the bridge streams —
+            # an error frame into the open stream, then stop
+            with suppress(Exception):
+                yield f"data: {json.dumps({'error': {'message': _redact_secret_material(str(e))[:300]}})}\n\n"
+            return
+        await _record_usage_safe(
+            scope, "official", payload["model"], total_in, total_out
+        )
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
 def _responses_input_to_messages(inputs):
@@ -3441,6 +3515,37 @@ async def anthropic_messages(request: Request):
             )
 
     req_model = body.get("model")
+    # P0-7: official passthrough for the Anthropic surface — the translated
+    # OpenAI-style messages and tools above go straight to the official API;
+    # the reply is re-shaped by the same format_anthropic_response the bridge
+    # uses, so the client-visible shape is identical. v1 keeps one upstream
+    # call shape: a streaming request is answered with correct Anthropic SSE
+    # built from the complete upstream answer.
+    if official_api.official_mode_enabled():
+        payload = {"model": official_api.map_model(model), "messages": openai_msgs}
+        if openai_tools:
+            payload["tools"] = openai_tools
+        try:
+            result = await official_api.official_chat(payload, stream=False)
+        except UpstreamError as e:
+            return _api_error_response(e, is_anthropic=True)
+        usage = result.get("usage") or {}
+        await _record_usage_safe(
+            get_api_key(request),
+            "official",
+            result.get("model") or payload["model"],
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+        )
+        if stream:
+            return StreamingResponse(
+                _official_anthropic_stream(result, req_model, usage),
+                media_type="text/event-stream",
+            )
+        if not isinstance(result, dict) or "choices" not in result:
+            return JSONResponse(result)
+        return format_anthropic_response(result, req_model)
+
     if stream:
         return await handle_chat(
             openai_msgs,
@@ -3470,11 +3575,129 @@ async def anthropic_messages(request: Request):
     return format_anthropic_response(result, req_model)
 
 
+def _official_anthropic_stream(result, req_model, usage):
+    """P0-7: Anthropic SSE built from a COMPLETE official chat completion.
+
+    v1 official mode keeps one upstream call shape (non-stream), so a client
+    that asked for streaming gets the correct Anthropic event sequence
+    (message_start -> content blocks -> message_delta -> message_stop) built
+    from the finished answer — byte-compatible with what
+    stream_anthropic_response emits for the bridge."""
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    model_name = req_model if req_model else SINGLE_MODEL
+    in_tokens = (usage or {}).get("prompt_tokens", 0)
+    out_tokens = (usage or {}).get("completion_tokens", 0)
+
+    def _evt(payload, event=None):
+        prefix = f"event: {event}\n" if event else ""
+        return f"{prefix}data: {json.dumps(payload)}\n\n"
+
+    async def _gen():
+        yield _evt(
+            {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model_name,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": in_tokens, "output_tokens": 1},
+                },
+            },
+            "message_start",
+        )
+        choice = (result.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        block_index = 0
+        text = message.get("content") or ""
+        if text:
+            yield _evt(
+                {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                "content_block_start",
+            )
+            yield _evt(
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+                "content_block_delta",
+            )
+            yield _evt(
+                {"type": "content_block_stop", "index": block_index},
+                "content_block_stop",
+            )
+            block_index += 1
+        tool_calls = message.get("tool_calls") or []
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            try:
+                tool_input = (
+                    json.loads(fn.get("arguments", "{}"))
+                    if isinstance(fn.get("arguments"), str)
+                    else (fn.get("arguments") or {})
+                )
+            except json.JSONDecodeError:
+                tool_input = {}
+            yield _evt(
+                {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:16]}",
+                        "name": fn.get("name", ""),
+                        "input": {},
+                    },
+                },
+                "content_block_start",
+            )
+            yield _evt(
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(tool_input),
+                    },
+                },
+                "content_block_delta",
+            )
+            yield _evt(
+                {"type": "content_block_stop", "index": block_index},
+                "content_block_stop",
+            )
+            block_index += 1
+        stop_reason = "tool_use" if tool_calls else "end_turn"
+        yield _evt(
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": out_tokens},
+            },
+            "message_delta",
+        )
+        yield _evt({"type": "message_stop"}, "message_stop")
+
+    return _gen()
+
+
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models(request: Request):
     if not check_key(request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
+
+    # P0-7: official mode lists the official ids with their documented limits.
+    if official_api.official_mode_enabled():
+        return JSONResponse({"object": "list", "data": official_api.OFFICIAL_MODELS})
 
     # Declared limits reflect OBSERVED DeepSeek web behavior (issue #22), not
     # guaranteed upstream API limits: a single first message passes up to ~1M
