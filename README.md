@@ -72,6 +72,27 @@ Note: `docker-compose.yml` binds to `127.0.0.1:4000` only (local access) — cha
 
 Dashboard: `http://localhost:4000/`
 
+### Prebuilt image (ghcr.io, amd64 + arm64)
+
+Multi-arch images publish on every `v*` tag. Pull-and-run, no repo clone needed:
+
+```bash
+export DEEPSEEKER_ADMIN_PASSWORD='pick-a-real-password'   # P0-8 refuses admin/admin on exposed binds
+docker run -d --name deeperseeker -p 4000:4000 \
+  -e DEEPSEEKER_ADMIN_USER=admin -e DEEPSEEKER_ADMIN_PASSWORD \
+  ghcr.io/amancode22/deeperseeker:latest
+```
+
+Prefer pinning the digest you verified over a moving tag:
+
+```bash
+docker pull ghcr.io/amancode22/deeperseeker:v1 \
+  && docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/amancode22/deeperseeker:v1
+# then run ghcr.io/amancode22/deeperseeker@sha256:<digest-of-that-output>
+```
+
+Tags: `<full version>` (e.g. `v1.0.0`), `<major>` (e.g. `v1`), and `latest`. The same directory works with `podman pull`/`podman run` unchanged. Config-heavy setups: keep using the compose file above (`cp .env.example .env`, fill in the admin pair, `docker compose up -d`) — the image reads the same environment variables.
+
 ## Configuration (`.env`)
 
 Copy `.env.example` to `.env` and edit your secret values:
@@ -82,9 +103,10 @@ cp .env.example .env
 
 | Variable | Description | Default |
 |---|---|---|
-| `DEEPSEEKER_API_KEY` | Bearer API key required to access endpoints | `dseeker` |
+| `DEEPSEEKER_API_KEY` | Bearer API key required to access endpoints; if unset, a strong key is generated on first boot, printed once and persisted to `api_key.txt` | generated |
 | `DEEPSEEKER_ADMIN_USER` | Dashboard login username | `admin` |
-| `DEEPSEEKER_ADMIN_PASSWORD` | Dashboard login password | `admin` |
+| `DEEPSEEKER_ADMIN_PASSWORD` | Dashboard login password — defaults + non-loopback bind refuse to boot (see Security defaults) | `admin` |
+| `DEEPSEEKER_ALLOW_DEFAULT_ADMIN` | Explicitly accept admin/admin on a non-loopback bind (not recommended); only the literal value `1` unlocks the boot | unset |
 | `HOST` | Bind address for bare-metal runs (`127.0.0.1` = local only, `0.0.0.0` = expose) | `127.0.0.1` |
 | `PORT` | Server port | `4000` |
 | `DEEPSEEKER_MAX_HISTORY_TOKENS` | Token cap for injected history on first-message prompt builds | `24000` |
