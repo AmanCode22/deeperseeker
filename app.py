@@ -55,14 +55,17 @@ from functions import (
     init_db,
     mark_active,
     mark_limited,
+    mask_api_key,
     next_parent,
     parse_tools,
     pick_token,
     record_file,
+    record_usage,
     restore_token,
     save_session,
     send_message,
     upload_file,
+    usage_by_day_key,
 )
 
 
@@ -751,6 +754,19 @@ def _replay_stream(gen, first):
     return _wrapped()
 
 
+async def _record_usage_safe(scope, surface, model, in_tokens, out_tokens):
+    """P0-6: record one completed turn. Failure-proof by design — a stats
+    write must never break (or delay beyond a thread hop) a served response.
+    The key is masked here so raw key material never reaches the store."""
+    try:
+        return await _db(
+            record_usage, mask_api_key(scope), surface, model, in_tokens, out_tokens
+        )
+    except Exception:
+        logger.warning("usage record failed (non-fatal)", exc_info=True)
+        return None
+
+
 async def _preflight_stream(gen):
     """Consume the first chunk eagerly so upstream errors surface before streaming starts."""
     try:
@@ -1332,6 +1348,20 @@ async def handle_chat(
                     next_parent(parent_message_id),
                 )
                 _store_response_history(r_id, next_messages)
+            # P0-6: one row per completed turn, B7 semantics (cleaned reply
+            # billing) — the same numbers the response's usage block reports.
+            surface = (
+                "anthropic"
+                if is_anthropic
+                else ("responses" if is_responses else "openai")
+            )
+            await _record_usage_safe(
+                scope,
+                surface,
+                req_model or model,
+                count_tok(_messages_text(messages)),
+                count_tok(_completion_usage_text(clean_text, parsed_tools)),
+            )
             return format_response(resp_text, model, messages, tools)
     except asyncio.CancelledError:
         # B2 (Stage 1 audit): the client went away mid-request — the exchange
@@ -1646,6 +1676,10 @@ async def stream_response(
                 # think-tag reasoning and tool markup are not billed output.
                 usage_out = _completion_usage_text(clean_text, parsed_tools)
                 out_tokens = count_tok(usage_out) if usage_out else 0
+                # P0-6: completed streamed turns record exactly one usage row
+                # (aborted/failed streams record nothing, mirroring the skip
+                # above so a partial response never pollutes billing).
+                await _record_usage_safe(scope, "openai", model, in_tokens, out_tokens)
                 usage_chunk = _chat_chunk([], cid=cid, created=created, model=model)
                 usage_chunk["usage"] = {
                     "prompt_tokens": in_tokens,
@@ -1840,6 +1874,15 @@ async def stream_anthropic_response(
 
         if not aborted and not failed:
             try:
+                # P0-6: one usage row per completed Anthropic stream, same
+                # cleaned-reply semantics as the tail usage event below it.
+                await _record_usage_safe(
+                    scope,
+                    "anthropic",
+                    req_model if req_model else model,
+                    in_tokens,
+                    out_tokens,
+                )
                 for evt in tail_events.split("\n\n"):
                     if evt.strip():
                         yield evt + "\n\n"
@@ -2662,6 +2705,15 @@ async def stream_responses_response(
                     opts=opts,
                 )
                 yield _sse({"type": "response.completed", "response": completed_resp})
+                # P0-6: one usage row per completed Responses stream — the
+                # same in/out numbers the completed event just carried.
+                await _record_usage_safe(
+                    scope,
+                    "responses",
+                    model_name,
+                    in_tokens,
+                    out_tokens,
+                )
             except asyncio.CancelledError:
                 pass
 
@@ -3551,7 +3603,15 @@ async def dashboard(request: Request):
     # P0-3: the pool view carries state, load and timers — and no credential
     # field, so nothing secret can reach the page source.
     tokens = await _db(get_pool_view)
-    return templates.TemplateResponse(request, "dashboard.html", {"tokens": tokens})
+    # P0-6: last 30 days of usage, per day x per masked key. The aggregation
+    # returns ready-to-render rows (masked aliases + pricing-source note), the
+    # template computes nothing.
+    usage_rows = await _db(usage_by_day_key, time.time() - 30 * 86400)
+    return templates.TemplateResponse(
+        request,
+        "dashboard.html",
+        {"tokens": tokens, "usage_rows": usage_rows},
+    )
 
 
 @app.post("/tokens/add")

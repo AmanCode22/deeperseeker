@@ -127,6 +127,26 @@ def init_db():
     }
     if "last_used" not in existing_session_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN last_used REAL")
+    # P0-6 (Day 29): usage stats — one row per COMPLETED turn (client-visible
+    # success), aggregated per day x per masked key at read time. Keeping raw
+    # rows instead of pre-aggregated counters makes the numbers auditable and
+    # the "streamed retries count once" rule structural: a failed attempt has
+    # nothing to record.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            day TEXT NOT NULL,
+            key_alias TEXT NOT NULL,
+            surface TEXT NOT NULL,
+            model TEXT,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_usage_day_key ON usage(day, key_alias)"
+    )
     conn.commit()
     conn.close()
     try:
@@ -764,6 +784,105 @@ def _format_span(seconds):
     if seconds < 86400:
         return f"{seconds // 3600}h"
     return f"{seconds // 86400}d"
+
+
+# ==============================================================================
+# P0-6 (Days 28-30) — usage stats
+#
+# One row per COMPLETED turn (the client saw a real answer). Failed attempts
+# record nothing, so a turn retried across the pool lands exactly once — the
+# counting rule is structural, not a dedup heuristic. Tokens are billed on the
+# CLEANED completion (B7 semantics) by the callers, matching the usage chunk
+# clients already receive. Cost is derived from the flat tariff table and is
+# labeled as such everywhere it renders: it is an estimate against the shipped
+# rates, not upstream metering.
+# ==============================================================================
+
+
+def mask_api_key(key):
+    """Masked key alias for display: last 4 characters only.
+
+    The dashboard and every aggregate render this — a screenshot of the page
+    must not carry usable key material. Short keys (<= 8 chars, e.g. someone's
+    one-word key) are fully masked."""
+    key = str(key or "").strip()
+    if not key:
+        return "unknown"
+    if len(key) <= 8:
+        return "…"
+    return "…" + key[-4:]
+
+
+def record_usage(key_alias, surface, model, in_tokens, out_tokens, ts=None):
+    """Record one completed turn. `key_alias` is expected PRE-MASKED — pass
+    mask_api_key(raw_key) at the call site; this function never stores raw
+    key material as a defense against future callers forgetting."""
+    alias = (
+        mask_api_key(key_alias)
+        if key_alias and not str(key_alias).startswith("…")
+        else str(key_alias or "unknown")
+    )
+    when = time.time() if ts is None else float(ts)
+    day = time.strftime("%Y-%m-%d", time.gmtime(when))
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO usage (ts, day, key_alias, surface, model, input_tokens, output_tokens) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            when,
+            day,
+            alias,
+            str(surface or "unknown"),
+            str(model or ""),
+            max(0, int(in_tokens or 0)),
+            max(0, int(out_tokens or 0)),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def usage_by_day_key(since_ts=0.0):
+    """Aggregate usage per day x per masked key alias.
+
+    Returns ready-to-render rows (day, key, surfaces, requests, input_tokens,
+    output_tokens, cost, pricing_source) — the template computes nothing, the
+    same rule the pool view follows. An empty store is an empty list, never an
+    error; an unused key simply has no rows for that day. Performance: the
+    (day, key_alias) index covers the GROUP BY, so a month of data stays a
+    few milliseconds of SQLite work — no pre-aggregation table needed."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT day, key_alias, "
+        "GROUP_CONCAT(DISTINCT surface), COUNT(*), "
+        "SUM(input_tokens), SUM(output_tokens) "
+        "FROM usage WHERE ts >= ? "
+        "GROUP BY day, key_alias ORDER BY day DESC, key_alias ASC",
+        (float(since_ts or 0.0),),
+    ).fetchall()
+    conn.close()
+
+    tariff = DEEPSEEK_TARIFFS["deepseek-v4.1-flash"]
+    out = []
+    for day, alias, surfaces, requests, in_tok, out_tok in rows:
+        in_tok = in_tok or 0
+        out_tok = out_tok or 0
+        cost = (in_tok / 1_000_000 * tariff["cache_miss_input"]) + (
+            out_tok / 1_000_000 * tariff["output_generation"]
+        )
+        out.append(
+            {
+                "day": day,
+                "key": alias,
+                "surfaces": surfaces or "unknown",
+                "requests": requests,
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "cost": round(cost, 6),
+                "pricing_source": "flat tariff table (not metered upstream usage)",
+            }
+        )
+    return out
 
 
 def get_pool_view():

@@ -82,6 +82,47 @@
 </section>
 
 <section>
+    <h2>Usage — last 30 days (per day × per key)</h2>
+    {% if usage_rows %}
+    <table>
+        <thead>
+            <tr>
+                <th>Day (UTC)</th>
+                <th>Key</th>
+                <th>Surfaces</th>
+                <th>Requests</th>
+                <th>Input tok</th>
+                <th>Output tok</th>
+                <th>Cost (est.)</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in usage_rows %}
+            <tr>
+                <td>{{ row['day'] }}</td>
+                <td>{{ row['key'] }}</td>
+                <td>{{ row['surfaces'] }}</td>
+                <td>{{ row['requests'] }}</td>
+                <td>{{ row['input_tokens'] }}</td>
+                <td>{{ row['output_tokens'] }}</td>
+                <td>${{ '%.6f'|format(row['cost']) }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <p class="state-note">
+        One row per completed turn — failed attempts and streamed retries never
+        double-count. Tokens are billed on the cleaned reply. Cost is an
+        estimate from the flat tariff table shipped with the bridge
+        (input $0.44/M, output $1.32/M), not upstream metering. Key aliases are
+        masked; no key or token material appears on this page.
+    </p>
+    {% else %}
+    <p class="state-note">No usage recorded yet. A key with no traffic shows no rows — honest zeros, not blanks.</p>
+    {% endif %}
+</section>
+
+<section>
     <h2>API</h2>
     <p>OpenAI: <code>http://localhost:4000/v1</code></p>
     <p>Anthropic: <code>http://localhost:4000</code></p>
