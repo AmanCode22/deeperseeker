@@ -1,17 +1,52 @@
 # DeeperSeeker
+
 [![CI Pipeline](https://github.com/AmanCode22/deeperseeker/actions/workflows/tests.yaml/badge.svg)](https://github.com/AmanCode22/deeperseeker/actions/workflows/tests.yaml)
+[![Release image](https://github.com/AmanCode22/deeperseeker/actions/workflows/release.yml/badge.svg)](https://github.com/AmanCode22/deeperseeker/actions/workflows/release.yml)
 
-DeepSeek website reverse-proxy server with FastAPI, supporting OpenAI & Anthropic API standards.
+A self-hosted reverse proxy that turns a DeepSeek web session into an **OpenAI- and Anthropic-compatible API** — FastAPI underneath, with streaming, tool calling, files and vision.
 
-[English](#deeperseeker) · [中文快速开始](#中文快速开始)
+**English** · [简体中文](README.md.cn)
 
-If you want to use deeperseeker with claude desktop app see [Claude Desktop Setup Guide](CLAUDE_DESKTOP_SETUP.md)
+## Table of contents
 
-For solving deepseek pow challenge the wasm file included is from my other repo: https://github.com/AmanCode22/deepseek_pow_solver/
+- [What is this?](#what-is-this)
+- [Warnings — read before you run anything](#warnings--read-before-you-run-anything)
+- [Status](#status)
+- [Quickstart](#quickstart)
+  - [Prebuilt image (recommended)](#option-1--prebuilt-image-ghcrio-amd64--arm64--recommended)
+  - [Docker Compose](#option-2--docker-compose)
+  - [Local Python with uv](#option-3--local-python-with-uv-recommended-for-development)
+  - [Local Python without uv](#option-4--local-python-without-uv)
+- [Auth token setup](#auth-token-setup)
+- [Configuration (`.env`)](#configuration-env)
+- [API endpoints & usage](#api-endpoints--usage)
+- [Official-API mode (the exit door)](#official-api-mode-the-exit-door)
+- [Features](#features)
+- [Security defaults](#security-defaults)
+- [Troubleshooting](#troubleshooting)
+- [Pricing](#pricing)
+- [Project docs](#project-docs)
+- [Star history](#star-history)
+- [Contributors](#contributors)
+- [Disclaimer](#disclaimer)
 
-If you liked this repo please star it and star the solver also.
+## What is this?
 
-⚠️ **Risk banner** — read before you run anything:
+DeeperSeeker runs on your machine, holds one or more of your own DeepSeek web
+session tokens, and exposes standard API endpoints (`/v1/chat/completions`,
+`/v1/responses`, `/v1/messages`) that talk to the DeepSeek web backend for
+you. Any client that speaks OpenAI or Anthropic — Claude Desktop, agent
+harnesses, scripts — can point at it and work, with a dashboard for the token
+pool and usage stats. The single default model is `v4.1flash`.
+
+For solving the DeepSeek PoW challenge the wasm file included is from my
+other repo: <https://github.com/AmanCode22/deepseek_pow_solver/>. If you
+liked this repo please star it and star the solver also.
+
+Want to use DeeperSeeker with the Claude Desktop app? Follow the
+[Claude Desktop Setup Guide](CLAUDE_DESKTOP_SETUP.md).
+
+## Warnings — read before you run anything
 
 - This project drives a **reverse-engineered web interface**, not a sanctioned API. Automated use violates DeepSeek's Terms of Use.
 - **Account-ban risk is real and on you**: use a dedicated throwaway account, never your personal one. Accounts may be banned at any time, without warning.
@@ -29,7 +64,7 @@ If you liked this repo please star it and star the solver also.
 | PoW (DeepSeekHashV1) | working via [deepseek_pow_solver](https://github.com/AmanCode22/deepseek_pow_solver/) wasm | 2026-10 | if DeepSeek raises the difficulty, the solver repo gets the fix first |
 | OpenAI surface (`/v1/chat/completions`, `/v1/responses`) | working | 2026-10 | streaming + tools; see the client matrix below |
 | Anthropic surface (`/v1/messages`) | working | 2026-10 | Claude Desktop guide in CLAUDE_DESKTOP_SETUP.md |
-| Official-API mode (P0-7) | see README section below | 2026-10 | the exit door when the bridge dies |
+| Official-API mode | see [Official-API mode](#official-api-mode-the-exit-door) | 2026-10 | the exit door when the bridge dies |
 
 A status table you stop checking is a table that lies — treat "last verified" as the claim's expiry date.
 
@@ -37,60 +72,15 @@ Per-client compatibility lives in [docs/CLIENT_MATRIX.md](docs/CLIENT_MATRIX.md)
 
 ## Quickstart
 
-### Local Python[UV, Recommended]
-Needs uv first
-
-for linux/macos
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-or on windows
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-Then,
-```bash
-uv sync
-source .venv/bin/activate # or activate.fish or activate.zsh
-cp .env.example .env
-uv run deeperseeker
-```
-### Local Python[Non UV, Not usually recommended]
-```bash
-python3 -m venv .venv
-pip install -r requirements.txt 
-cp .env.example .env 
-python3 app.py
-```
-
-
-> **Note:** Thanks to PR https://github.com/AmanCode22/deeperseeker/pull/16 by [@alan7383](https://github.com/alan7383), Playwright and Chromium are deprecated and kept as backup (DeepSeek does not enforce AWS WAF on requests using Android client headers). You no longer need to run `playwright install chromium` or `xvfb-run` unless reverting to the backup cookie mechanism. And it now saves ram also and is much stable than cookie harvesting.
-
-### Docker / Podman (Podman recommended for rootless execution)
-
-Suggested in issue [#3](https://github.com/AmanCode22/deeperseeker/issues/3)
+Four ways to run, all reading the same `.env`. First, no matter which you pick:
 
 ```bash
 cp .env.example .env
-
-# Using Podman (Recommended - Rootless)
-podman build -t deeperseeker .
-podman run -d --name deeperseeker -p 4000:4000 --env-file .env deeperseeker
-
-# Using Docker
-docker build -t deeperseeker .
-docker run -d --name deeperseeker -p 4000:4000 --env-file .env deeperseeker
-
-# Or using Podman Compose / Docker Compose
-podman-compose up -d
-# docker compose up -d
 ```
 
-Note: `docker-compose.yml` binds to `127.0.0.1:4000` only (local access) — change the ports mapping if you need to expose it.
+Set at minimum `DEEPSEEKER_ADMIN_PASSWORD` in that file — [Security defaults](#security-defaults) refuses exposed binds with default credentials.
 
-Dashboard: `http://localhost:4000/`
-
-### Prebuilt image (ghcr.io, amd64 + arm64) — recommended
+### Option 1 — Prebuilt image (ghcr.io, amd64 + arm64) — recommended
 
 Images are **built only by CI** (`.github/workflows/release.yml`) — never locally, never by hand. The version has one source: `pyproject.toml` (`version = "6.0"` today). A release is: bump that field, push the matching `v<version>` tag (here `v6.0`) — the workflow refuses to build if the tag and `pyproject.toml` disagree, then publishes a multi-arch (amd64 + arm64) image. Pull-and-run, no repo clone needed:
 
@@ -109,15 +99,64 @@ docker pull ghcr.io/amancode22/deeperseeker:6.0 \
 # then run ghcr.io/amancode22/deeperseeker@sha256:<digest-of-that-output>
 ```
 
-Tags: the full version from `pyproject.toml` (e.g. `6.0`), the major line (e.g. `6`), and `latest` — all three always come from that one field, so an image tag can never disagree with the package version. The same directory works with `podman pull`/`podman run` unchanged. Config-heavy setups: keep using the compose file above (`cp .env.example .env`, fill in the admin pair, `docker compose up -d`) — the image reads the same environment variables.
+Tags: the full version from `pyproject.toml` (e.g. `6.0`), the major line (e.g. `6`), and `latest` — all three always come from that one field, so an image tag can never disagree with the package version. The same directory works with `podman pull`/`podman run` unchanged.
+
+### Option 2 — Docker Compose
+
+Suggested in issue [#3](https://github.com/AmanCode22/deeperseeker/issues/3); works with `podman-compose` too.
+
+```bash
+cp .env.example .env        # fill in DEEPSEEKER_ADMIN_PASSWORD
+docker compose up -d        # or: podman-compose up -d
+```
+
+Note: `docker-compose.yml` binds to `127.0.0.1:4000` only (local access) — change the ports mapping if you need to expose it.
+
+Dashboard: `http://localhost:4000/`
+
+### Option 3 — Local Python with uv (recommended for development)
+
+Install [uv](https://docs.astral.sh/uv/) first:
+
+```bash
+# linux / macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+```powershell
+# windows
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Then:
+
+```bash
+uv sync
+source .venv/bin/activate   # or activate.fish / activate.zsh
+cp .env.example .env
+uv run deeperseeker
+```
+
+### Option 4 — Local Python without uv
+
+```bash
+python3 -m venv .venv
+pip install -r requirements.txt
+cp .env.example .env
+python3 app.py
+```
+
+> **Note:** thanks to PR <https://github.com/AmanCode22/deeperseeker/pull/16> by [@alan7383](https://github.com/alan7383), Playwright and Chromium are deprecated and kept as backup (DeepSeek does not enforce AWS WAF on requests using Android client headers). You no longer need to run `playwright install chromium` or `xvfb-run` unless reverting to the backup cookie mechanism — and it saves RAM and is much more stable than cookie harvesting.
+
+## Auth token setup
+
+1. Open an incognito window → `chat.deepseek.com` → log in.
+2. Console (F12): `JSON.parse(localStorage.getItem("userToken")).value`
+3. Paste the raw token string into the dashboard (`/dashboard`). Close the incognito window.
 
 ## Configuration (`.env`)
 
-Copy `.env.example` to `.env` and edit your secret values:
-
-```bash
-cp .env.example .env
-```
+Copy `.env.example` to `.env` and edit your secret values. The table below is the full knob set; sane defaults mean you normally set only the admin pair.
 
 | Variable | Description | Default |
 |---|---|---|
@@ -143,24 +182,7 @@ cp .env.example .env
 | `DEEPSEEKER_OFFICIAL_API_KEY` | Official API key used when mode is `official` (from platform.deepseek.com). Required in official mode | unset |
 | `DEEPSEEKER_OFFICIAL_BASE` | Official API base URL override in official mode | `https://api.deepseek.com` |
 
-## Official-API mode (the exit door)
-
-Set `DEEPSEEKER_MODE=official` and `DEEPSEEKER_OFFICIAL_API_KEY` and the same
-endpoints (chat, messages, models) serve requests from the **official API**
-instead of the web session. The mode switch is invisible to clients: same
-auth (your `DEEPSEEKER_API_KEY`), same model id (`v4.1flash` maps to
-`deepseek-chat`), same tool calling, same usage stats (surface `official`).
-The official key never reaches a log line or an error body. When the bridge
-breaks (PoW change, WAF return, layout change), this is the minutes-not-hours
-fallback — flip the env, restart, keep working; flip it back the same way.
-
-## Auth Token Setup
-
-1. Open incognito window -> `chat.deepseek.com` -> Login
-2. Console (F12): `JSON.parse(localStorage.getItem("userToken")).value`
-3. Paste raw token string into Dashboard (`/dashboard`). Close incognito window.
-
-## API Endpoints & Usage
+## API endpoints & usage
 
 - **OpenAI Base**: `http://localhost:4000/v1`
   - `POST /v1/chat/completions` (streaming & non-streaming)
@@ -172,22 +194,29 @@ fallback — flip the env, restart, keep working; flip it back the same way.
 - **Anthropic Base**: `http://localhost:4000`
   - `POST /v1/messages` (also at `/messages`)
   - `POST /v1/files/upload`
-- **Auth Key**: Configured in `.env` (`DEEPSEEKER_API_KEY`)
-- **Model**: `v4.1flash` — the single default DeepSeek model (vision-capable: `vision` no longer needs a separate model tier). Every request is served by it, whatever `model` value the client sends (legacy aliases such as `instant`, `expert`, `vision`, and `anthropic/claude-*` are accepted and normalized to `v4.1flash`). Also listed as `anthropic/claude-v4.1flash` for Claude Desktop auto-discovery. If no `model` is sent, requests default to `v4.1flash`.
+- **Auth Key**: configured in `.env` (`DEEPSEEKER_API_KEY`)
+
+### Model
+
+`v4.1flash` — the single default DeepSeek model (vision-capable: `vision` no longer needs a separate model tier). Every request is served by it, whatever `model` value the client sends (legacy aliases such as `instant`, `expert`, `vision`, and `anthropic/claude-*` are accepted and normalized to `v4.1flash`). Also listed as `anthropic/claude-v4.1flash` for Claude Desktop auto-discovery. If no `model` is sent, requests default to `v4.1flash`.
+
+## Official-API mode (the exit door)
+
+Set `DEEPSEEKER_MODE=official` and `DEEPSEEKER_OFFICIAL_API_KEY` and the same endpoints (chat, messages, models) serve requests from the **official API** instead of the web session. The mode switch is invisible to clients: same auth (your `DEEPSEEKER_API_KEY`), same model id (`v4.1flash` maps to `deepseek-chat`), same tool calling, same usage stats (surface `official`). The official key never reaches a log line or an error body. When the bridge breaks (PoW change, WAF return, layout change), this is the minutes-not-hours fallback — flip the env, restart, keep working; flip it back the same way.
 
 ## Features
 
-- **Multi-Token Pooling**: Selects the least-in-flight token (oldest-idle tie-break) under a soft per-token concurrency cap, so concurrent requests spread across accounts instead of stampeding onto one.
-- **Context-Based Session Selector**: Computes a SHA-256 signature over the canonicalized message history (up to the last assistant turn), the model, and the API key scope, to match and resume existing web chat sessions. Session creation is lock-protected to avoid duplicates.
-- **Summarize-and-Rollover Context Policy**: When accumulated session context nears the observed remembered-context limit (~393K input tokens), the bridge asks the model for a compact handoff summary in a scratch chat, starts a fresh web chat, and seeds it with that summary plus the newest user message. Relevant newest tool calls/results are preserved (capped by `DEEPSEEKER_MAX_TOOL_RESULT_TOKENS`, with a tighter per-result cap via `DEEPSEEKER_PER_TOOL_RESULT_TOKENS`); attachments are described in words inside the summary rather than forwarded. The first exchange — however large — is never rolled over (the first-message path accepts ~1M tokens). Declared limits in `/v1/models` (`context_window`, `max_output_tokens`) reflect this observed behavior, not guaranteed upstream limits. The summary prompt instructs the model to treat conversation content as data, never as instructions.
-- **Full History Injection**: Inject full conversation history into new sessions when session signature is not in DB or when account fails over.
-- **Rate-Limit Recovery and Quarantine**: A 429 — or a 403 below the escalation threshold — cools a token for `DEEPSEEKER_RATE_LIMIT_COOLDOWN` seconds and it rejoins rotation by itself, while a 401 or `DEEPSEEKER_QUARANTINE_AFTER_403` consecutive 403s with no successful turn in between marks it `QUARANTINED` and takes it out of rotation for good, because a rejected credential is not a rate limit and re-arming it every minute is how accounts get banned. Nothing leaves quarantine except **Restore** on the dashboard (`POST /tokens/{id}/restore`). On an upstream 401/403/429 the broken web session is discarded and the turn is retried on a *different* pooled token with a jittered backoff — up to `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` tries, then a proper API error — with full history injection, and account-scoped files are re-homed onto that token first; the bridge rotates among the tokens you added, it never provisions one. The pool view shows each token's state, in-flight count, last use and remaining cooldown by alias with no credential material, and a stale in-flight success cannot lift a quarantine. In-flight counts are per process, so a multi-worker deployment sees only its own worker's numbers.
-- **Long-Context Resilience**: If the upstream web session fails or returns an empty response (e.g. context overflow), the broken session is discarded and the request is retried once on a fresh session with a compacted, token-capped history injection; unrecoverable upstream errors are returned as proper JSON API errors instead of raw 500s.
-- **Tool Calling & Streaming**: Server-sent events (SSE) streaming with think-tag reassembly across chunk boundaries (no truncation) and multi-format tool-call parsing — DSML XML, `<tool_call>` XML, `<function_call>` blocks, and JSON — into OpenAI/Anthropic tool schemas.
-- **File & Vision Support**: Base64/URL image extraction (with SSRF protection) and document upload streaming. Images and documents are referenced directly via `ref_file_ids` — the vision file-forking step (`fork_file_task`) was removed because `v4.1flash` handles vision natively.
+- **Multi-token pooling**: selects the least-in-flight token (oldest-idle tie-break) under a soft per-token concurrency cap, so concurrent requests spread across accounts instead of stampeding onto one.
+- **Context-based session selector**: computes a SHA-256 signature over the canonicalized message history (up to the last assistant turn), the model, and the API key scope, to match and resume existing web chat sessions. Session creation is lock-protected to avoid duplicates.
+- **Summarize-and-rollover context policy**: when accumulated session context nears the observed remembered-context limit (~393K input tokens), the bridge asks the model for a compact handoff summary in a scratch chat, starts a fresh web chat, and seeds it with that summary plus the newest user message. Relevant newest tool calls/results are preserved (capped by `DEEPSEEKER_MAX_TOOL_RESULT_TOKENS`, with a tighter per-result cap via `DEEPSEEKER_PER_TOOL_RESULT_TOKENS`); attachments are described in words inside the summary rather than forwarded. The first exchange — however large — is never rolled over (the first-message path accepts ~1M tokens). Declared limits in `/v1/models` (`context_window`, `max_output_tokens`) reflect this observed behavior, not guaranteed upstream limits. The summary prompt instructs the model to treat conversation content as data, never as instructions.
+- **Full history injection**: injects the full conversation history into new sessions when the session signature is not in the DB or when the account fails over.
+- **Rate-limit recovery and quarantine**: a 429 — or a 403 below the escalation threshold — cools a token for `DEEPSEEKER_RATE_LIMIT_COOLDOWN` seconds and it rejoins rotation by itself, while a 401 or `DEEPSEEKER_QUARANTINE_AFTER_403` consecutive 403s with no successful turn in between marks it `QUARANTINED` and takes it out of rotation for good, because a rejected credential is not a rate limit and re-arming it every minute is how accounts get banned. Nothing leaves quarantine except **Restore** on the dashboard (`POST /tokens/{id}/restore`). On an upstream 401/403/429 the broken web session is discarded and the turn is retried on a *different* pooled token with a jittered backoff — up to `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` tries, then a proper API error — with full history injection, and account-scoped files are re-homed onto that token first; the bridge rotates among the tokens you added, it never provisions one. The pool view shows each token's state, in-flight count, last use and remaining cooldown by alias with no credential material, and a stale in-flight success cannot lift a quarantine. In-flight counts are per process, so a multi-worker deployment sees only its own worker's numbers.
+- **Long-context resilience**: if the upstream web session fails or returns an empty response (e.g. context overflow), the broken session is discarded and the request is retried once on a fresh session with a compacted, token-capped history injection; unrecoverable upstream errors are returned as proper JSON API errors instead of raw 500s.
+- **Tool calling & streaming**: server-sent events (SSE) streaming with think-tag reassembly across chunk boundaries (no truncation) and multi-format tool-call parsing — DSML XML, XML blocks, `<function_call>` blocks, and JSON — into OpenAI/Anthropic tool schemas.
+- **File & vision support**: base64/URL image extraction (with SSRF protection) and document upload streaming. Images and documents are referenced directly via `ref_file_ids` — the vision file-forking step (`fork_file_task`) was removed because `v4.1flash` handles vision natively.
 - **Usage stats**: the dashboard shows requests, input/output tokens and an estimated cost per day × per masked key alias for the last 30 days — "which client burned my account?", answered honestly. One row per *completed* turn: failed attempts and streamed retries never double-count, tokens are billed on the cleaned reply (the same numbers the API usage block reports), and cost is labeled as a flat-tariff estimate, not upstream metering. The read-time aggregation stays a few milliseconds at a month of data (indexed `GROUP BY`, measured: ~30k rows → ~10 ms).
-- **Claude Desktop Compatible**: Rich `/v1/models` capability metadata + the `anthropic/claude-v4.1flash` alias for automatic client discovery.
-- **Hardened Dashboard**: Session TTL, brute-force login lockout (5 attempts → 5 min), CSRF origin check.
+- **Claude Desktop compatible**: rich `/v1/models` capability metadata + the `anthropic/claude-v4.1flash` alias for automatic client discovery.
+- **Hardened dashboard**: session TTL, brute-force login lockout (5 attempts → 5 min), CSRF origin check.
 
 ## Security defaults
 
@@ -217,7 +246,16 @@ Flat peak-hour rates for the single default model:
 | **DeepSeek V4.1 Flash** (`v4.1flash`) | $0.44 | $1.32 |
 
 The `cost` reported in API responses uses these flat rates.
-## Star History
+
+## Project docs
+
+- [Claude Desktop Setup Guide](CLAUDE_DESKTOP_SETUP.md) — point Claude Desktop at DeeperSeeker in a few minutes.
+- [docs/CLIENT_MATRIX.md](docs/CLIENT_MATRIX.md) — which clients were tested, when, with what result.
+- [SECURITY.md](SECURITY.md) — how to report security issues.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — branch/test/merge ritual for patches.
+- [CHANGELOG.md](CHANGELOG.md) — what changed, release by release.
+
+## Star history
 
 <a href="https://www.star-history.com/?repos=amancode22%2Fdeeperseeker&type=date&legend=top-left">
  <picture>
@@ -226,39 +264,11 @@ The `cost` reported in API responses uses these flat rates.
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=amancode22/deeperseeker&type=date&legend=top-left" />
  </picture>
 </a>
-## Disclaimer
-
-Educational purpose only. This project is not affiliated with, endorsed by, or sponsored by DeepSeek. Use responsibly and in accordance with DeepSeek's terms of service.
-
-## 中文快速开始
-
-**这是什么**：把 DeepSeek 网页版反向代理成 OpenAI / Anthropic 兼容接口的自托管服务。⚠️ 风险提示：自动化使用违反 DeepSeek 服务条款，账号可能随时被封——请只用小号，自用即可，风险自负。**禁止搭建公共转发站。**
-
-**安装（推荐 uv）：**
-
-```bash
-git clone https://github.com/AmanCode22/deeperseeker && cd deeperseeker
-uv sync
-source .venv/bin/activate
-cp .env.example .env        # 填写 DEEPSEEKER_ADMIN_PASSWORD 等配置
-uv run deeperseeker
-```
-
-**首次启动**：若未设置 `DEEPSEEKER_API_KEY`，服务会自动生成一个强密钥并打印一次（同时保存在数据库旁的 `api_key.txt`）。调用接口时带上 `Authorization: Bearer <该密钥>`。
-
-**添加令牌**：浏览器无痕窗口登录 `chat.deepseek.com` → 控制台（F12）执行 `JSON.parse(localStorage.getItem("userToken")).value` → 复制返回的令牌 → 粘贴到 `http://localhost:4000/dashboard`（默认账号密码 `admin`/`admin`，仅限本机访问时使用；对外暴露前必须修改，否则服务会拒绝启动）。
-
-**调用接口**：
-
-```bash
-curl http://localhost:4000/v1/chat/completions \
-  -H "Authorization: Bearer <你的密钥>" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "v4.1flash", "messages": [{"role": "user", "content": "你好"}]}'
-```
-
-**检查服务是否还活着**：`curl -H "Authorization: Bearer <你的密钥>" "http://localhost:4000/health?deep=1"` —— 深度探活会真实走一次上游（含 PoW），返回 `upstream_reachable` 与延迟。更多配置见上方英文配置表。
 
 ## Contributors
 
 [![Contributors](https://contrib.rocks/image?repo=amancode22/deeperseeker)](https://github.com/amancode22/deeperseeker/graphs/contributors)
+
+## Disclaimer
+
+Educational purpose only. This project is not affiliated with, endorsed by, or sponsored by DeepSeek. Use responsibly and in accordance with DeepSeek's terms of service.
