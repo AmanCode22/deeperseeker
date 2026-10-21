@@ -24,10 +24,17 @@ import os
 import re
 import time
 import uuid
+from contextvars import ContextVar
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger("uvicorn.error")
+
+# Per-request correlation id, readable from anywhere in the same request's
+# call chain (P0-4: the terminal empty-SSE envelope embeds it so a failing
+# response can be matched to its access-log line). Pure ASGI middleware runs
+# the route stack in the same task, so a plain ContextVar is safe here.
+request_id_var = ContextVar("deeperseeker_request_id", default="-")
 
 
 # ==============================================================================
@@ -162,6 +169,7 @@ class RequestIDMiddleware:
             inbound if _REQUEST_ID_RE.match(inbound or "") else uuid.uuid4().hex
         )
         state["request_id"] = request_id
+        request_id_var.set(request_id)
 
         started = time.perf_counter()
         status_holder = {"status": None}
