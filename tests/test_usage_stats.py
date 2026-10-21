@@ -20,16 +20,14 @@ import asyncio
 import os
 import sys
 import tempfile
-import unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import functions  # noqa: E402
 import app as app_module  # noqa: E402
-
+import functions  # noqa: E402
 
 # Fixed "today" so the day buckets are deterministic: 2026-10-21 UTC.
-T0 = 1792531200.0  # 2026-10-21 00:00:00 UTC (within the same hour)
+T0 = 1792540800.0  # 2026-10-21 00:00:00 UTC
 DAY = "2026-10-21"
 DAY2 = "2026-10-19"
 
@@ -50,7 +48,11 @@ def test_every_cell_of_the_expected_table():
         functions.record_usage("dsk-aaaa1111", "openai", "v4.1flash", 100, 50, ts=T0)
         functions.record_usage("dsk-aaaa1111", "openai", "v4.1flash", 200, 150, ts=T0)
         functions.record_usage(
-            "dsk-aaaa1111", "anthropic", "v4.1flash", 10, 5,
+            "dsk-aaaa1111",
+            "anthropic",
+            "v4.1flash",
+            10,
+            5,
             ts=T0 - 2 * 86400,
         )
         # key B: 1 record on DAY
@@ -68,7 +70,10 @@ def test_every_cell_of_the_expected_table():
         assert a_today["output_tokens"] == 200
         # cost = 300/1M*0.44 + 200/1M*1.32 = 0.000132 + 0.000264 = 0.000396
         assert abs(a_today["cost"] - 0.000396) < 1e-9
-        assert a_today["pricing_source"] == "flat tariff table (not metered upstream usage)"
+        assert (
+            a_today["pricing_source"]
+            == "flat tariff table (not metered upstream usage)"
+        )
 
         b_today = by[("2026-10-21", "…2222")]
         assert b_today["requests"] == 1
@@ -93,41 +98,48 @@ def test_retries_count_once_and_failures_record_nothing():
     saved = _fresh_store()
     calls = {"send": 0}
 
+    async def fake_sig(messages, model, scope=""):
+        return "sig-usage-retry"
+
+    def fake_pick(*a, **k):
+        return 1
+
+    def fake_get_token(tid):
+        return {"id": tid, "token": "tok", "status": "ACTIVE"}
+
+    async def fake_files(messages, token, last_user_only=False):
+        return []
+
+    async def fake_prompt(messages, tools, model, is_first, rollover_summary=None):
+        return "prompt"
+
+    def fake_send(
+        chat_id,
+        auth_token,
+        message,
+        parent,
+        thinking=False,
+        search=False,
+        file_ids_=None,
+    ):
+        calls["send"] += 1
+        if calls["send"] < 3:
+
+            async def fail_gen():
+                raise RuntimeError(
+                    "Empty response from DeepSeek (no parseable SSE content)"
+                )
+                yield ""  # pragma: no cover
+
+            return fail_gen()
+
+        async def ok_gen():
+            yield "final answer"
+
+        return ok_gen()
+
     async def scenario():
         app_module._chat_locks.clear()
-
-        async def fake_sig(messages, model, scope=""):
-            return "sig-usage-retry"
-
-        def fake_pick(*a, **k):
-            return 1
-
-        def fake_get_token(tid):
-            return {"id": tid, "token": "tok", "status": "ACTIVE"}
-
-        def fake_send(
-            chat_id, auth_token, message, parent,
-            thinking=False, search=False, file_ids_=None,
-        ):
-            calls["send"] += 1
-            if calls["send"] < 3:
-
-                async def fail_gen():
-                    raise RuntimeError("Empty response from DeepSeek (no parseable SSE content)")
-                    yield ""  # pragma: no cover
-
-                return fail_gen()
-
-            async def ok_gen():
-                yield "final answer"
-
-            return ok_gen()
-
-        async def fake_files(messages, token, last_user_only=False):
-            return []
-
-        async def fake_prompt(messages, tools, model, is_first, rollover_summary=None):
-            return "prompt"
 
         patches = [
             ("get_auth_token", lambda: "tok"),
@@ -169,28 +181,50 @@ def test_retries_count_once_and_failures_record_nothing():
         assert "dsk-retrykey" not in str(rows), "key material must be masked"
 
         # a turn that never succeeds records nothing
-        calls["send"] = 0
-
         async def always_fail(*a, **k):
             async def fail_gen():
-                raise RuntimeError("Empty response from DeepSeek (no parseable SSE content)")
+                raise RuntimeError(
+                    "Empty response from DeepSeek (no parseable SSE content)"
+                )
                 yield ""  # pragma: no cover
 
             return fail_gen()
 
-        app_module2 = app_module
-        with mock.patch.object(app_module2, "send_message", always_fail), mock.patch.object(
-            app_module2, "MAX_UPSTREAM_ATTEMPTS", 1
-        ):
+        patches2 = [
+            ("get_auth_token", lambda: "tok"),
+            ("generate_signature", fake_sig),
+            ("find_session", lambda s: None),
+            ("pick_token", lambda *a, **k: 1),
+            ("get_token", fake_get_token),
+            ("send_message", always_fail),
+            ("create_new_chat", lambda tok: _achat("chat-usage-2")),
+            ("extract_and_upload_files", fake_files),
+            ("build_prompt", fake_prompt),
+            ("mark_limited", lambda tid: None),
+            ("mark_active", lambda tid: None),
+            ("delete_sessions_for_chat", lambda *a: None),
+            ("save_session", lambda *a: None),
+            ("record_file", lambda *a: None),
+            ("parse_tools", lambda t: ([], t)),
+            ("format_response", lambda text, model, messages, tools=None: text),
+        ]
+        saved2 = [(name, getattr(app_module, name)) for name, _ in patches2]
+        for name, fn in patches2:
+            setattr(app_module, name, fn)
+        try:
             app_module._chat_locks.clear()
             resp = asyncio.run(
-                app_module2.handle_chat(
+                app_module.handle_chat(
                     [{"role": "user", "content": "hi again"}],
                     "v4.1flash",
                     scope="dsk-retrykey",
                 )
             )
             assert getattr(resp, "status_code", None) == 502, resp
+        finally:
+            for name, fn in saved2:
+                setattr(app_module, name, fn)
+            app_module._chat_locks.clear()
         rows2 = functions.usage_by_day_key()
         assert sum(r["requests"] for r in rows2) == 1, (
             "failed turns must record zero usage"
