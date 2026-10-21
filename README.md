@@ -90,9 +90,9 @@ Note: `docker-compose.yml` binds to `127.0.0.1:4000` only (local access) — cha
 
 Dashboard: `http://localhost:4000/`
 
-### Prebuilt image (ghcr.io, amd64 + arm64)
+### Prebuilt image (ghcr.io, amd64 + arm64) — recommended
 
-Multi-arch images publish on every `v*` tag. Pull-and-run, no repo clone needed:
+Images are **built only by CI** (`.github/workflows/release.yml`) — never locally, never by hand. The version has one source: `pyproject.toml` (`version = "6.0"` today). A release is: bump that field, push the matching `v<version>` tag (here `v6.0`) — the workflow refuses to build if the tag and `pyproject.toml` disagree, then publishes a multi-arch (amd64 + arm64) image. Pull-and-run, no repo clone needed:
 
 ```bash
 export DEEPSEEKER_ADMIN_PASSWORD='pick-a-real-password'   # P0-8 refuses admin/admin on exposed binds
@@ -104,12 +104,12 @@ docker run -d --name deeperseeker -p 4000:4000 \
 Prefer pinning the digest you verified over a moving tag:
 
 ```bash
-docker pull ghcr.io/amancode22/deeperseeker:v1 \
-  && docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/amancode22/deeperseeker:v1
+docker pull ghcr.io/amancode22/deeperseeker:6.0 \
+  && docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/amancode22/deeperseeker:6.0
 # then run ghcr.io/amancode22/deeperseeker@sha256:<digest-of-that-output>
 ```
 
-Tags: `<full version>` (e.g. `v1.0.0`), `<major>` (e.g. `v1`), and `latest`. The same directory works with `podman pull`/`podman run` unchanged. Config-heavy setups: keep using the compose file above (`cp .env.example .env`, fill in the admin pair, `docker compose up -d`) — the image reads the same environment variables.
+Tags: the full version from `pyproject.toml` (e.g. `6.0`), the major line (e.g. `6`), and `latest` — all three always come from that one field, so an image tag can never disagree with the package version. The same directory works with `podman pull`/`podman run` unchanged. Config-heavy setups: keep using the compose file above (`cp .env.example .env`, fill in the admin pair, `docker compose up -d`) — the image reads the same environment variables.
 
 ## Configuration (`.env`)
 
