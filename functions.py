@@ -116,6 +116,12 @@ def init_db():
         conn.execute("ALTER TABLE tokens ADD COLUMN rate_limited_until REAL")
     if "last_used" not in existing_cols:
         conn.execute("ALTER TABLE tokens ADD COLUMN last_used REAL")
+    # P0-3 migration: how many 403s this token has seen with no successful
+    # turn in between. Reset by mark_active() and by restore_token().
+    if "consecutive_403" not in existing_cols:
+        conn.execute(
+            "ALTER TABLE tokens ADD COLUMN consecutive_403 INTEGER NOT NULL DEFAULT 0"
+        )
     existing_session_cols = {
         row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
     }
@@ -511,10 +517,19 @@ def delete_token(token_id):
 #   * a soft per-token concurrency cap: capped tokens are only used when
 #     nothing else is free,
 #   * a soonest-to-recover fallback when every token is still cooling down.
+#
+# P0-3 adds the third state on top of this scheduler: QUARANTINED. Selection
+# logic below is untouched — a quarantined token is simply never a candidate.
 # ==============================================================================
 
 TOKEN_COOLDOWN_SECONDS = max(1, int(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "60")))
 TOKEN_CONCURRENCY_CAP = max(1, int(os.getenv("DEEPSEEKER_TOKEN_CONCURRENCY", "8")))
+
+# P0-3: a 403 seen this many times in a row (no successful turn in between) is
+# not a transient refusal — it is the ban ladder, so the token leaves rotation
+# until an operator restores it. 0 disables escalation and keeps today's
+# cooldown-everything behavior; a 401 quarantines unconditionally.
+QUARANTINE_AFTER_403 = max(0, int(os.getenv("DEEPSEEKER_QUARANTINE_AFTER_403", "3")))
 
 # Per-token in-flight refcounts (per process; single event-loop worker). Every
 # send reserves one slot via acquire_token_slot() and releases it when the
@@ -566,6 +581,10 @@ def pick_token(exclude=None):
     `exclude` (optional, B10) lists token ids the caller just saw fail: they
     are avoided while ANY other token is available, so an empty-SSE retry
     cannot land on the same poisoned token.
+
+    QUARANTINED tokens (P0-3) are never a candidate here, not even through the
+    all-cooling fallback: a token rejected on auth would otherwise be handed
+    straight back to the caller as the "soonest to recover" one.
     """
     now = time.time()
     conn = get_db()
@@ -580,6 +599,8 @@ def pick_token(exclude=None):
     available = []
     recovered = []
     for tid, status, until, last_used in rows:
+        if status == "QUARANTINED":
+            continue  # terminal: only restore_token() puts it back (P0-3)
         if status == "RATE_LIMITED" and until is not None and until > now:
             continue  # still cooling down
         if status == "RATE_LIMITED":
@@ -611,16 +632,95 @@ def pick_token(exclude=None):
 
     # Every token is rate-limited and still cooling: pick the one that
     # recovers first (bounded wait) instead of stampeding onto the lowest id
-    # with no backoff at all.
+    # with no backoff at all. Quarantined rows stay out of the race — with a
+    # pool of nothing but dead credentials this returns None, and the callers
+    # already treat "no token" as the not-configured case.
     conn = get_db()
     row = conn.execute(
-        "SELECT id FROM tokens ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
+        "SELECT id FROM tokens WHERE status != 'QUARANTINED' "
+        "ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
     ).fetchone()
     conn.close()
     return row[0] if row else None
 
 
-def mark_limited(token_id):
+def mark_quarantined(token_id, reason):
+    """Take a token out of rotation until an operator restores it (P0-3).
+
+    Unlike RATE_LIMITED there is no timer on this state: rate_limited_until is
+    cleared so pick_token()'s auto-recovery can never mistake a quarantined row
+    for a cooled-down one. The reason is logged for whoever is watching the
+    pool.
+    """
+    logger.warning(
+        "Token #%d QUARANTINED (manual return required): %s", token_id, reason
+    )
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL WHERE id = ?",
+        ("QUARANTINED", token_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def restore_token(token_id):
+    """The only exit from quarantine (P0-3): an explicit operator action.
+
+    last_used is deliberately left alone, so a restored token carries the
+    oldest usage stamp and the landed idle-oldest tie-break eases it back into
+    rotation instead of dumping a burst onto it.
+    """
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL, "
+        "consecutive_403 = 0 WHERE id = ?",
+        ("ACTIVE", token_id),
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Token #%d restored to ACTIVE by operator", token_id)
+
+
+def _bump_403_streak(token_id):
+    """Increment and return this token's consecutive-403 counter."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET consecutive_403 = consecutive_403 + 1 WHERE id = ?",
+        (token_id,),
+    )
+    row = conn.execute(
+        "SELECT consecutive_403 FROM tokens WHERE id = ?", (token_id,)
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    return row[0] if row else 0
+
+
+def mark_limited(token_id, code=None):
+    """Record an upstream failure against a token — the pool's one door.
+
+    Without `code` this is exactly the landed B3 behavior: a RATE_LIMITED
+    cooldown that recovers by itself. With the upstream status (P0-3):
+
+      * 401 -> QUARANTINED immediately. A rejected credential is never
+        transient, and cooling it for 60s just re-arms the same dead account.
+      * 403 -> cooldown as today, plus QUARANTINED once QUARANTINE_AFTER_403
+        consecutive 403s pile up with no successful turn in between.
+      * anything else (429) -> cooldown, as landed.
+    """
+    if code == 401:
+        mark_quarantined(token_id, "upstream 401 (auth rejected)")
+        return
+    if code == 403:
+        streak = _bump_403_streak(token_id)
+        threshold = QUARANTINE_AFTER_403
+        if threshold and streak >= threshold:
+            mark_quarantined(
+                token_id,
+                f"{streak} consecutive upstream 403s (threshold {threshold})",
+            )
+            return
     until = time.time() + TOKEN_COOLDOWN_SECONDS
     logger.warning(
         "Token #%d marked RATE_LIMITED for %ds (recovers automatically)",
@@ -639,7 +739,8 @@ def mark_limited(token_id):
 def mark_active(token_id):
     conn = get_db()
     conn.execute(
-        "UPDATE tokens SET status = ?, rate_limited_until = NULL, last_used = ? WHERE id = ?",
+        "UPDATE tokens SET status = ?, rate_limited_until = NULL, last_used = ?, "
+        "consecutive_403 = 0 WHERE id = ?",
         ("ACTIVE", time.time(), token_id),
     )
     conn.commit()
