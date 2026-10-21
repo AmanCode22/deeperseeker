@@ -95,6 +95,10 @@ cp .env.example .env
 | `DEEPSEEKER_ROLLOVER_SAFETY_TOKENS` | Headroom reserved below the memory limit before summarizing | `24000` |
 | `DEEPSEEKER_MAX_SUMMARY_TOKENS` | Budget for the model-generated handoff summary | `4096` |
 | `DEEPSEEKER_PER_TOOL_RESULT_TOKENS` | Per-result tool-output cap (so one giant output can't eat the budget) | `2000` |
+| `DEEPSEEKER_RATE_LIMIT_COOLDOWN` | Seconds a rate-limited token cools before it rejoins the pool automatically | `60` |
+| `DEEPSEEKER_TOKEN_CONCURRENCY` | Soft per-token in-flight cap; at-cap tokens are used only when nothing else is free | `8` |
+| `DEEPSEEKER_QUARANTINE_AFTER_403` | Consecutive 403s that take a token out of rotation until you restore it (`0` disables escalation) | `3` |
+| `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` | Retries of one turn across the pool before the upstream error is surfaced to the client | `3` |
 
 ## Auth Token Setup
 
@@ -119,11 +123,11 @@ cp .env.example .env
 
 ## Features
 
-- **Multi-Token Pooling**: Random active token rotation.
+- **Multi-Token Pooling**: Selects the least-in-flight token (oldest-idle tie-break) under a soft per-token concurrency cap, so concurrent requests spread across accounts instead of stampeding onto one.
 - **Context-Based Session Selector**: Computes a SHA-256 signature over the canonicalized message history (up to the last assistant turn), the model, and the API key scope, to match and resume existing web chat sessions. Session creation is lock-protected to avoid duplicates.
 - **Summarize-and-Rollover Context Policy**: When accumulated session context nears the observed remembered-context limit (~393K input tokens), the bridge asks the model for a compact handoff summary in a scratch chat, starts a fresh web chat, and seeds it with that summary plus the newest user message. Relevant newest tool calls/results are preserved (capped by `DEEPSEEKER_MAX_TOOL_RESULT_TOKENS`, with a tighter per-result cap via `DEEPSEEKER_PER_TOOL_RESULT_TOKENS`); attachments are described in words inside the summary rather than forwarded. The first exchange — however large — is never rolled over (the first-message path accepts ~1M tokens). Declared limits in `/v1/models` (`context_window`, `max_output_tokens`) reflect this observed behavior, not guaranteed upstream limits. The summary prompt instructs the model to treat conversation content as data, never as instructions.
 - **Full History Injection**: Inject full conversation history into new sessions when session signature is not in DB or when account fails over.
-- **Automatic Rate-Limit Recovery**: Auto-marks tokens `RATE_LIMITED` on HTTP 401/403/429, provisions a new token, transfers full context (including files), and continues seamless chat with a single retry.
+- **Rate-Limit Recovery and Quarantine**: A 429 — or a 403 below the escalation threshold — cools a token for `DEEPSEEKER_RATE_LIMIT_COOLDOWN` seconds and it rejoins rotation by itself, while a 401 or `DEEPSEEKER_QUARANTINE_AFTER_403` consecutive 403s with no successful turn in between marks it `QUARANTINED` and takes it out of rotation for good, because a rejected credential is not a rate limit and re-arming it every minute is how accounts get banned. Nothing leaves quarantine except **Restore** on the dashboard (`POST /tokens/{id}/restore`). On an upstream 401/403/429 the broken web session is discarded and the turn is retried on a *different* pooled token with a jittered backoff — up to `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` tries, then a proper API error — with full history injection, and account-scoped files are re-homed onto that token first; the bridge rotates among the tokens you added, it never provisions one. The pool view shows each token's state, in-flight count, last use and remaining cooldown by alias with no credential material, and a stale in-flight success cannot lift a quarantine. In-flight counts are per process, so a multi-worker deployment sees only its own worker's numbers.
 - **Long-Context Resilience**: If the upstream web session fails or returns an empty response (e.g. context overflow), the broken session is discarded and the request is retried once on a fresh session with a compacted, token-capped history injection; unrecoverable upstream errors are returned as proper JSON API errors instead of raw 500s.
 - **Tool Calling & Streaming**: Server-sent events (SSE) streaming with think-tag reassembly across chunk boundaries (no truncation) and multi-format tool-call parsing — DSML XML, `<tool_call>` XML, `<function_call>` blocks, and JSON — into OpenAI/Anthropic tool schemas.
 - **File & Vision Support**: Base64/URL image extraction (with SSRF protection) and document upload streaming. Images and documents are referenced directly via `ref_file_ids` — the vision file-forking step (`fork_file_task`) was removed because `v4.1flash` handles vision natively.
