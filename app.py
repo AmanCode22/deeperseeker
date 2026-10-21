@@ -213,6 +213,28 @@ def _enforce_exposure_policy():
 
 _enforce_exposure_policy()
 
+# P0-2 (Day 20): the startup log states exactly what is running. The version
+# comes from the installed package metadata (pyproject), the build commit is
+# stamped by the release workflow as a build arg -> env, and both degrade
+# gracefully for source checkouts (version "dev", commit "-").
+try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    try:
+        APP_VERSION = _pkg_version("deeperseeker")
+    except PackageNotFoundError:
+        APP_VERSION = "dev"
+except ImportError:  # pragma: no cover
+    APP_VERSION = "dev"
+BUILD_COMMIT = (os.getenv("DEEPSEEKER_BUILD_COMMIT") or "-")[:12]
+logger.info(
+    "deeperseeker %s (commit %s) starting — Python %s",
+    APP_VERSION,
+    BUILD_COMMIT,
+    __import__("sys").version.split()[0],
+)
+
 # The token used for this request, logged as "key: <alias>".
 # Must stay a dict: BaseHTTPMiddleware runs the endpoint in a child task, and
 # only in place mutation of the same object reaches the access log context.
