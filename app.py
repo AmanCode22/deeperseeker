@@ -54,6 +54,7 @@ from functions import (
     get_token,
     get_tokens,
     init_db,
+    is_context_limit_error,
     mark_active,
     mark_limited,
     mask_api_key,
@@ -802,6 +803,7 @@ async def handle_chat(
     _attempt=0,
     _auth_rotated=False,
     _exclude_token=None,
+    _context_retried=False,
     is_responses=False,
     response_opts=None,
 ):
@@ -861,7 +863,7 @@ async def handle_chat(
                         await _db(delete_sessions_for_chat, token_id, session_id)
                         new_session_id = await create_new_chat(new_tok["token"])
                         rot_owner = await _own_chat_lock(new_session_id)
-                        if needs_rollover(messages):
+                        if _context_retried or needs_rollover(messages, tools):
                             scratch_chat = await create_new_chat(new_tok["token"])
                             summary_gen = send_message(
                                 scratch_chat,
@@ -1106,7 +1108,7 @@ async def handle_chat(
                 # that summary via build_prompt(rollover_summary=...). A single large
                 # first exchange is untouched (the first-message path accepts ~1M
                 # tokens); this only fires for accumulated session context.
-                if needs_rollover(messages):
+                if _context_retried or needs_rollover(messages, tools):
                     scratch_chat = await create_new_chat(tok["token"])
                     summary_gen = send_message(
                         scratch_chat,
@@ -1183,7 +1185,9 @@ async def handle_chat(
                 # parent_message_id (which would fork the upstream exchange).
                 parent_message_id = fresh["parent_message_id"]
 
-        if parent_message_id != 0 and needs_rollover(messages):
+        if parent_message_id != 0 and (
+            _context_retried or needs_rollover(messages, tools)
+        ):
             logger.info(
                 "Context rollover: accumulated context over limit; purging session mappings for chat %s",
                 session_id,
@@ -1404,6 +1408,7 @@ async def handle_chat(
                         _attempt=_attempt,
                         _auth_rotated=True,
                         _exclude_token=token_id,
+                        _context_retried=_context_retried,
                         is_responses=is_responses,
                         response_opts=response_opts,
                     )
@@ -1427,6 +1432,22 @@ async def handle_chat(
             # envelope — redacted body, trace id, status contract — instead of
             # the raw exception dump.
             return _terminal_error_response(e, is_anthropic)
+        # DSH fix: a context-class failure is not a token problem — the
+        # context belongs to the upstream CHAT, so the plain retry (fresh
+        # chat, 24K-capped history) recovered the request but amputated the
+        # conversation, and the lossy reset is what made agent harnesses
+        # experience 'context limit' deaths. Classify it and make the retry
+        # a FORCED summary rollover instead: the fresh chat is seeded with a
+        # model-generated handoff summary, keeping full continuity. One
+        # context retry per turn — if the summary path also fails, the
+        # remaining budget retries normally.
+        context_class = is_context_limit_error(e)
+        if context_class:
+            logger.warning(
+                "Context-class upstream failure on chat %s (%s); the retry will force a summary rollover",
+                session_id,
+                _redact_secret_material(str(e))[:200],
+            )
         # PR #26 review fix (Blocker 2 — retry self-deadlock): the recursive
         # call can resolve to the SAME chat (the retry re-derives the session
         # from whatever the persistence layer still returns). Recursing while
@@ -1454,6 +1475,7 @@ async def handle_chat(
             _attempt=_attempt + 1,
             _auth_rotated=_auth_rotated,
             _exclude_token=token_id,
+            _context_retried=_context_retried or context_class,
             is_responses=is_responses,
             response_opts=response_opts,
         )
