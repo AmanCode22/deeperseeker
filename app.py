@@ -49,6 +49,7 @@ from functions import (
     get_auth_token,
     get_file_content,
     get_file_token,
+    get_pool_view,
     get_token,
     get_tokens,
     init_db,
@@ -58,6 +59,7 @@ from functions import (
     parse_tools,
     pick_token,
     record_file,
+    restore_token,
     save_session,
     send_message,
     upload_file,
@@ -3412,7 +3414,9 @@ async def dashboard(request: Request):
         get_current_admin(request)
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
-    tokens = await _db(get_tokens)
+    # P0-3: the pool view carries state, load and timers — and no credential
+    # field, so nothing secret can reach the page source.
+    tokens = await _db(get_pool_view)
     return templates.TemplateResponse(request, "dashboard.html", {"tokens": tokens})
 
 
@@ -3437,6 +3441,17 @@ async def tokens_delete(token_id: int, request: Request):
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     await _db(delete_token, token_id)
+    return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+
+
+@app.post("/tokens/{token_id}/restore")
+async def tokens_restore(token_id: int, request: Request):
+    """P0-3: the manual return from quarantine — there is no other exit."""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    await _db(restore_token, token_id)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 

@@ -747,6 +747,70 @@ def mark_active(token_id):
     conn.close()
 
 
+def _format_span(seconds):
+    """Compact elapsed time for the pool view: 42s, 7m, 3h, 2d."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def get_pool_view():
+    """Per-token operator view of the pool (P0-3).
+
+    State, load and timers as ready-to-render strings, and no credential field
+    at all: the token column is deliberately absent, because this output goes
+    straight into HTML a browser caches and a screenshot carries away.
+    Formatting happens here so templates/dashboard.html renders state without
+    computing any — a template that computes is one that can grow a secret.
+    """
+    now = time.time()
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, alias, status, rate_limited_until, last_used, consecutive_403 "
+        "FROM tokens ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    view = []
+    for tid, alias, status, until, last_used, streak in rows:
+        streak = streak or 0
+        if status == "QUARANTINED":
+            state_class, cooldown = "err", "—"
+            note = "quarantined — manual return required"
+        elif status == "RATE_LIMITED" and until and until > now:
+            state_class = "warn"
+            cooldown = f"{_format_span(until - now)} left"
+            note = "cooling down, recovers automatically"
+        elif status == "RATE_LIMITED":
+            state_class, cooldown = "warn", "expired"
+            note = "rejoins rotation on the next pick"
+        else:
+            state_class, cooldown = "ok", "—"
+            note = "in rotation"
+        if streak and status != "QUARANTINED":
+            note = f"{note}, 403 streak {streak}"
+        age = "never" if not last_used else f"{_format_span(now - last_used)} ago"
+        view.append(
+            {
+                "id": tid,
+                "label": alias if alias else f"untagged #{tid}",
+                "status": status,
+                "state_class": state_class,
+                "state_note": note,
+                "in_flight": _in_flight.get(tid, 0),
+                "last_used": age,
+                "cooldown": cooldown,
+                "can_restore": status == "QUARANTINED",
+            }
+        )
+    return view
+
+
 def find_session(sig):
     conn = get_db()
     row = conn.execute(
