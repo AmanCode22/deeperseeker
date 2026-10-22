@@ -33,7 +33,7 @@ only-include = [
     "templates",
     "wasm",
     "scripts",
-    "official_api.py
+    "official_api.py"
 ]
 
 [build-system]
