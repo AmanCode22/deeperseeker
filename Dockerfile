@@ -12,7 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY pyproject.toml uv.lock README.md ./
 COPY requirements*.in requirements*.txt ./
-RUN uv sync
+RUN uv sync --no-install-project    # deps only — no project wheel without source
+COPY . .
+RUN uv sync                          # install the project now that source exists
 
 COPY . .
 
