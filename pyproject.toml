@@ -32,6 +32,8 @@ only-include = [
     "static",
     "templates",
     "wasm",
+    "scripts",
+    "official_api.py
 ]
 
 [build-system]
