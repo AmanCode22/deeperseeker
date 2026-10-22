@@ -102,17 +102,32 @@ docker pull ghcr.io/amancode22/deeperseeker:6.0 \
 Tags: the full version from `pyproject.toml` (e.g. `6.0`), the major line (e.g. `6`), and `latest` — all three always come from that one field, so an image tag can never disagree with the package version. The same directory works with `podman pull`/`podman run` unchanged.
 
 ### Option 2 — Docker Compose
+Suggested in issue https://github.com/AmanCode22/deeperseeker/issues/3; works with podman-compose too.
 
-Suggested in issue [#3](https://github.com/AmanCode22/deeperseeker/issues/3); works with `podman-compose` too.
+Compose ships with ```build: .``` so you can run from source — but to run a released version, point it at the prebuilt image: add one  line under ```build: .``` in docker-compose.yml:
+
+```    image: ghcr.io/amancode22/deeperseeker:6.0   # run the release; build: stays as a fallback```
+
+With both keys present, docker compose pull fetches the release image and build: is only used if you explicitly pass --build.
 
 ```bash
-cp .env.example .env        # fill in DEEPSEEKER_ADMIN_PASSWORD
-docker compose up -d        # or: podman-compose up -d
+
+cp .env.example .env          # set DEEPSEEKER_ADMIN_PASSWORD (compose refuses to boot without it)
+docker compose pull           # released multi-arch image (amd64 + arm64)
+docker compose up -d
+docker compose logs --since 1m deeperseeker   # identity line: version + build commit
+Verify, then leave it running:
+```
+```bash
+
+curl http://127.0.0.1:4000/health
+curl -H "Authorization: Bearer <DEEPSEEKER_API_KEY>" 'http://127.0.0.1:4000/health?deep=1'  # real upstream round trip incl. PoW
 ```
 
-Note: `docker-compose.yml` binds to `127.0.0.1:4000` only (local access) — change the ports mapping if you need to expose it.
-
-Dashboard: `http://localhost:4000/`
+- State lives in the named volume deeperseeker_data (/app/data) — survives restarts and upgrades; never docker compose down -v.
+- Upgrade = bump the image: tag (e.g. 6.0 → 7.0), then docker compose pull && docker compose up -d.
+- From source instead: remove the image: line (or docker compose up -d --build) to build locally.
+- The compose file binds 127.0.0.1:4000 only — change the ports mapping if you must expose it, and set real credentials first (see Security defaults).
 
 ### Option 3 — Local Python with uv (recommended for development)
 
