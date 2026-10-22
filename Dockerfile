@@ -10,11 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-
 COPY pyproject.toml uv.lock ./
-
-# Install dependencies first (owned by root, world-readable/executable —
-# nothing in site-packages needs to be writable at run time).
+COPY requirements*.in requirements*.txt ./
 RUN uv sync
 
 COPY . .
