@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md ./
 COPY requirements*.in requirements*.txt ./
 RUN uv sync
 
