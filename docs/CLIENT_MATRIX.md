@@ -21,7 +21,7 @@ and any quirks observed (field omissions, retries, body mangling):
 | Claude Desktop | 1.46388.2 | Working | Working | Working | 2026-10-22 | setup guide: [CLAUDE_DESKTOP_SETUP.md](../CLAUDE_DESKTOP_SETUP.md) used and works fine. |
 | OpenAI Python SDK | — | UNVERIFIED | UNVERIFIED | UNVERIFIED | — | — |
 | Anthropic Python SDK | — | UNVERIFIED | UNVERIFIED | UNVERIFIED | — | check usage fields + stop reasons |
-| Claude Code | 2.1.251 |  | Working | Working | Working | Works perfectly |
+| Claude Code | 2.1.251 | Working | Working | Working | 2026-10-22 | Works perfectly |
 | LobeChat / Chatbox | — | UNVERIFIED | UNVERIFIED | UNVERIFIED | — | chat + stream |
 
 No row above is a claim; every UNVERIFIED cell awaits its dated run. When you
