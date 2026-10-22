@@ -5,7 +5,7 @@
 
 A self-hosted reverse proxy that turns a DeepSeek web session into an **OpenAI- and Anthropic-compatible API** — FastAPI underneath, with streaming, tool calling, files and vision.
 
-**English** · [简体中文](README.md.cn)
+**English** · [简体中文](README.zh-CN.md)
 
 ## Table of contents
 
