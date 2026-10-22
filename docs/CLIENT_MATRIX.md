@@ -18,10 +18,10 @@ and any quirks observed (field omissions, retries, body mangling):
 
 | Client | Version | Chat | Stream | Tool call | Date | Caveats |
 |---|---|---|---|---|---|---|
-| Claude Desktop | — | UNVERIFIED | UNVERIFIED | UNVERIFIED | — | setup guide: [CLAUDE_DESKTOP_SETUP.md](../CLAUDE_DESKTOP_SETUP.md) — run the ladder above and replace this row |
+| Claude Desktop | 1.46388.2 | Working | Working | Working | 2026-10-22 | setup guide: [CLAUDE_DESKTOP_SETUP.md](../CLAUDE_DESKTOP_SETUP.md) used and works fine. |
 | OpenAI Python SDK | — | UNVERIFIED | UNVERIFIED | UNVERIFIED | — | — |
 | Anthropic Python SDK | — | UNVERIFIED | UNVERIFIED | UNVERIFIED | — | check usage fields + stop reasons |
-| Cline / Claude Code | — | UNVERIFIED | UNVERIFIED | UNVERIFIED | — | one real session incl. a tool call and a file flow |
+| Claude Code | 2.1.251 |  | Working | Working | Working | Works perfectly |
 | LobeChat / Chatbox | — | UNVERIFIED | UNVERIFIED | UNVERIFIED | — | chat + stream |
 
 No row above is a claim; every UNVERIFIED cell awaits its dated run. When you
