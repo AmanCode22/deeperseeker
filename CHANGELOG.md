@@ -30,7 +30,7 @@ main.
 - Token pool lifecycle: 401 quarantines a token immediately; repeated 403s escalate to quarantine (`DEEPSEEKER_QUARANTINE_AFTER_403`); nothing leaves quarantine except Restore on the dashboard. Pool state view on the dashboard with masked aliases. (PR, P0-3, closes #32)
 - Security defaults: an unset API key is generated, printed once and persisted; default admin credentials meeting a non-loopback bind refuse to start, naming the fix (`DEEPSEEKER_ALLOW_DEFAULT_ADMIN=1` is the explicit override). (B9 + PR, P0-8)
 - The container runs as an unprivileged user (uid 10001); only `/app/data` is writable. (PR, P0-8)
-- Multi-arch release images on every `v*` tag: `ghcr.io/<owner>/<repo>` (amd64 + arm64), tags `<version>` / `<major>` / `latest`, digest printed in the run log; image HEALTHCHECK + startup identity line (version + build commit). (PR, P0-2)
+- Multi-arch release images on every `v*` tag: `ghcr.io/amancode22/deeperseeker` (amd64 + arm64), tags `<version>` / `<major>` / `latest`, digest printed in the run log; image HEALTHCHECK + startup identity line (version + build commit). (PR, P0-2)
 - Deep health probe: `GET /health?deep=1` (auth required) performs one real upstream round trip including PoW and reports reachability + latency; the shallow check stays public. (PR, P0-9)
 - Usage stats on the dashboard: requests, input/output tokens and estimated cost per day × per masked key for the last 30 days; streamed retries count once; cost labeled as a flat-tariff estimate. (PR, P0-6)
 - Official-API passthrough mode: `DEEPSEEKER_MODE=official` + `DEEPSEEKER_OFFICIAL_API_KEY` serves chat/messages/models from the official API — the exit door when the bridge breaks. Explicit mode, no silent fallback. (PR, P0-7)
