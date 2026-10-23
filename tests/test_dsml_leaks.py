@@ -241,3 +241,19 @@ def test_invoke_less_edit_missing_required_path_still_named():
         ]
     finally:
         request_tools.reset(token)
+
+
+def test_bare_invoke_without_name_is_inferred():
+    token = request_tools.set(TOOLS)
+    try:
+        text = (
+            f'<{B}invoke>\n<{B}parameter name="i" string="true">Checking enable control'
+            f'</{B}parameter name="path" string="true">src/dashboard.ts</{B}parameter>\n'
+            f'<{B}parameter name="pattern" string="true">disabled|enable</{B}parameter>\n</{B}invoke>'
+        )
+        tools, _ = parse_tools(text)
+        assert [(t["function"]["name"], json.loads(t["function"]["arguments"])) for t in tools] == [
+            ("grep", {"i": "Checking enable control", "path": "src/dashboard.ts", "pattern": "disabled|enable"})
+        ]
+    finally:
+        request_tools.reset(token)

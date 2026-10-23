@@ -1302,8 +1302,9 @@ def parse_tools(text):
         "input",
     }
     # Call starts: invoke openers (also "</…invoke name=…>", the model mixes up
-    # open/close) and DSML function_calls blocks with no invoke at all, whose
-    # tool name is inferred from the parameters.
+    # open/close), DSML function_calls blocks with no invoke at all, and a bare
+    # "<｜｜DSML｜｜invoke>" without a name; their tool name is inferred from the
+    # parameters.
     starts = [
         (m, m.group(1).strip())
         for m in re.finditer(
@@ -1314,7 +1315,7 @@ def parse_tools(text):
     ] + [
         (m, None)
         for m in re.finditer(
-            r"<[｜\|]{0,2}DSML[｜\|]{0,2}\s*(?:function_calls?|tool_calls?|calls)\s*>",
+            r"<[｜\|]{0,2}DSML[｜\|]{0,2}\s*(?:function_calls?|tool_calls?|calls|invoke)\s*>",
             text,
             re.IGNORECASE,
         )
