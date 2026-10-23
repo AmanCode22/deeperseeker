@@ -35,6 +35,7 @@ security = HTTPBasic()
 
 
 from functions import (
+    request_tools,
     CookieGenerationError,
     StreamToolParser,
     UpstreamError,
@@ -807,6 +808,7 @@ async def handle_chat(
     is_responses=False,
     response_opts=None,
 ):
+    request_tools.set(tools)
     auth_token = await _db(get_auth_token)
     if not auth_token:
         return JSONResponse(
