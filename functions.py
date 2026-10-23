@@ -1190,13 +1190,14 @@ def _code_fence_spans(text):
 
 
 # Openers may come as "</｜｜DSML｜｜ parameter name=...>" (the model mixes up
-# open/close), as 'parameter="x"' without name, or without "parameter name=" at all ("<｜｜DSML｜｜command" string=...>),
+# open/close), as 'parameter="x"' without name, or without "parameter name=" at all
+# ('<｜｜DSML｜｜command" string=...>', '<｜｜DSML｜｜ old_string="true">') ("<｜｜DSML｜｜command" string=...>),
 # and a value ends at the proper closer, the next parameter, or ANY DSML marker
 # (bare "</｜｜DSML｜｜>", truncated "</｜｜DSML｜｜ ", "</｜｜DSML｜｜ calls>",
 # "<"-less "｜｜DSML｜｜parameter>"): markers never belong in a value.
 _DSML_PARAM_RE = re.compile(
     r"(?:</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)(?:\s+name\s*=|\s*=)\s*[\x27\x22]([^\x27\x22]+)[\x27\x22]"
-    r"|</?[｜\|]{1,2}DSML[｜\|]{1,2}\s*([A-Za-z_][\w\-]*)[\x27\x22])([^>]*)>"
+    r"|</?[｜\|]{1,2}DSML[｜\|]{1,2}\s*(?!(?:parameter|invoke|function_calls?|tool_calls?|calls)\b)([A-Za-z_][\w\-]*)(?=[\x27\x22]|\s*=\s*[\x27\x22](?:true|false)[\x27\x22]))([^>]*)>"
     r"(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|(?=(?:</?)?[｜\|]{1,2}DSML|</?[｜\|]{0,2}DSML[｜\|])|$)",
     re.DOTALL | re.IGNORECASE,
 )
@@ -1214,7 +1215,8 @@ def _dsml_params(body):
             flags=re.IGNORECASE,
         ).strip()
         # string="true" marks a literal string; don't turn "42"/"true" into JSON.
-        if re.search(r"string=[\x27\x22]true", pm.group(3), re.IGNORECASE):
+        # ('<｜｜DSML｜｜old_string="true">' puts the type right after the name.)
+        if re.search(r"(?:string\s*=|^\s*=)\s*[\x27\x22]true", pm.group(3), re.IGNORECASE):
             args[p_name] = p_val
             continue
         try:

@@ -206,3 +206,21 @@ def test_invoke_less_block_then_slash_invoke():
         assert "DSML" not in clean
     finally:
         request_tools.reset(token)
+
+
+def test_parameter_name_as_tag_with_type_value():
+    text = (
+        f'<{B} calls>\n<{B} invoke name="edit">\n'
+        f'<{B} parameter name="i" string="true">Sanitizing message</{B} parameter>\n'
+        f'<{B} old_string="true">  const a = 1;</｜DSML｜｜ parameter>\n'
+        f'<{B} new_string="true">  const a = 2;</｜DSML｜｜ parameter>\n'
+        f'<{B} path="true">src/freepi.ts</{B}>\n</{B} invoke>\n'
+        f'<{B} calls>\n<{B} invoke name="bash">\n'
+        f'<{B} command="true">grep -n "res.json()" src/freepi.ts</{B} i="Finding reads"{B}>\n</{B} calls>'
+    )
+    tools, _ = parse_tools(text)
+    got = [(t["function"]["name"], json.loads(t["function"]["arguments"])) for t in tools]
+    assert got == [
+        ("edit", {"i": "Sanitizing message", "old_string": "const a = 1;", "new_string": "const a = 2;", "path": "src/freepi.ts"}),
+        ("bash", {"command": 'grep -n "res.json()" src/freepi.ts'}),
+    ]
