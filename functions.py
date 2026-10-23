@@ -2024,7 +2024,54 @@ def _raise_sse_error_event(data, recent_lines):
     raise UpstreamError(502, content)
 
 
-async def send_message(
+# DeepSeek generates one message per account at a time; a second concurrent send
+# fails with "A message is being generated" / "Messages too frequent". Queue sends
+# per token instead. Every generation goes through send_message, so this covers all
+# callers.
+_send_locks = {}
+
+
+def token_busy(auth_token):
+    """True while this account is generating (its send lock is held)."""
+    lock = _send_locks.get(auth_token)
+    return bool(lock and lock.locked())
+
+
+async def send_message(chat_id, auth_token, *args, **kwargs):
+    # The upstream stream is drained by its own task, so the lock is released when
+    # DeepSeek finishes even if the consumer abandons this generator mid-stream
+    # (client gone without aclose): holding it across our yields leaked the lock
+    # and wedged every later request on that account.
+    lock = _send_locks.setdefault(auth_token, asyncio.Lock())
+    queue = asyncio.Queue()
+    done = object()
+
+    async def pump():
+        try:
+            async with lock:
+                gen = _send_message_unlocked(chat_id, auth_token, *args, **kwargs)
+                try:
+                    async for chunk in gen:
+                        queue.put_nowait(chunk)
+                finally:
+                    await gen.aclose()
+        except Exception as e:
+            queue.put_nowait(e)
+        finally:
+            queue.put_nowait(done)
+
+    task = asyncio.create_task(pump())
+    try:
+        while (item := await queue.get()) is not done:
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        # A consumer that closes us (disconnect, abort) still cancels the upstream.
+        task.cancel()
+
+
+async def _send_message_unlocked(
     chat_id,
     auth_token,
     message,

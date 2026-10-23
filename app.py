@@ -35,6 +35,7 @@ security = HTTPBasic()
 
 
 from functions import (
+    token_busy,
     CookieGenerationError,
     StreamToolParser,
     UpstreamError,
@@ -846,7 +847,14 @@ async def handle_chat(
         # P0-3: anything that is not ACTIVE is unusable for this session, so a
         # quarantined token bound by a stored signature rotates away like a
         # cooled-down one. (Rate-limited is still transient; quarantine is not.)
-        if not tok or tok["status"] != "ACTIVE":
+        # A conversation whose account is busy generating moves to an
+        # idle account (fresh chat, full history) instead of queueing behind it.
+        moved_off_busy = False
+        if tok and tok["status"] == "ACTIVE" and token_busy(tok["token"]):
+            cand = await _db(pick_token)
+            cand_tok = await _db(get_token, cand) if cand and cand != token_id else None
+            moved_off_busy = bool(cand_tok) and not token_busy(cand_tok["token"])
+        if not tok or tok["status"] != "ACTIVE" or moved_off_busy:
             new_token_id = await _db(pick_token)
             if new_token_id and (not tok or new_token_id != token_id):
                 new_tok = await _db(get_token, new_token_id)
