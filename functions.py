@@ -1246,15 +1246,19 @@ def _tool_schemas():
 
 def _infer_tool_name(args, schemas):
     """The one tool whose schema accepts exactly these argument names."""
-    fits = []
-    for name, params in schemas.items():
-        props = set(params.get("properties") or {})
-        required = set(params.get("required") or [])
-        if set(args) <= props and required <= set(args):
-            fits.append((len(props - set(args)), name))
-    fits.sort()
-    if fits and (len(fits) == 1 or fits[0][0] < fits[1][0]):
-        return fits[0][1]
+    # First require every required field; if the model also dropped one of those,
+    # still name the one tool that accepts these arguments, so the client reports
+    # the missing field instead of an unknown tool.
+    for need_required in (True, False):
+        fits = []
+        for name, params in schemas.items():
+            props = set(params.get("properties") or {})
+            required = set(params.get("required") or [])
+            if set(args) <= props and (not need_required or required <= set(args)):
+                fits.append((len(props - set(args)), name))
+        fits.sort()
+        if fits and (len(fits) == 1 or fits[0][0] < fits[1][0]):
+            return fits[0][1]
     return None
 
 

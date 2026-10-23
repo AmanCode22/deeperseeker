@@ -109,6 +109,7 @@ TOOLS = [
     tool("read", ["i", "path", "offset", "limit"], ["path"]),
     tool("grep", ["i", "pattern", "path"], ["pattern"]),
     tool("bash", ["i", "command", "timeout"], ["command"]),
+    tool("edit", ["i", "path", "old_string", "new_string"], ["path", "old_string", "new_string"]),
 ]
 
 
@@ -224,3 +225,19 @@ def test_parameter_name_as_tag_with_type_value():
         ("edit", {"i": "Sanitizing message", "old_string": "const a = 1;", "new_string": "const a = 2;", "path": "src/freepi.ts"}),
         ("bash", {"command": 'grep -n "res.json()" src/freepi.ts'}),
     ]
+
+
+def test_invoke_less_edit_missing_required_path_still_named():
+    token = request_tools.set(TOOLS)
+    try:
+        text = (
+            f'<｜DSML｜｜ calls>\n<｜DSML｜｜ parameter name="i" string="true">Deriving constant'
+            f'</｜DSML｜｜ parameter name="new_string" string="true">const A = 1;\nlet s;</｜DSML｜｜ parameter>\n'
+            f'<｜DSML｜｜ parameter="old_string" string="true">let s;</｜DSML｜｜>\n</{B}>\n</{B}>'
+        )
+        tools, _ = parse_tools(text)
+        assert [(t["function"]["name"], sorted(json.loads(t["function"]["arguments"]))) for t in tools] == [
+            ("edit", ["i", "new_string", "old_string"])
+        ]
+    finally:
+        request_tools.reset(token)
