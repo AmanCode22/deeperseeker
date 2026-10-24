@@ -1279,6 +1279,28 @@ def _repair_tool_names(tools):
     return tools
 
 
+
+
+# The request's reasoning effort ("high", "max", ...) when thinking is on, set by
+# the chat endpoints; build_prompt turns it into a think-harder instruction.
+request_effort = contextvars.ContextVar("request_effort", default=None)
+
+
+def effort_level(body):
+    """The client's effort string, wherever the dialect puts it."""
+    cands = [body.get("reasoning_effort"), body.get("effort")]
+    for key in ("reasoning", "output_config", "thinking"):
+        v = body.get(key)
+        if isinstance(v, dict):
+            cands += [v.get("effort"), v.get("reasoning_effort"), v.get("level")]
+        elif key == "thinking" and isinstance(v, str):
+            cands.append(v)
+    for c in cands:
+        if isinstance(c, str) and c.strip():
+            return c.strip().lower()
+    return None
+
+
 def parse_tools(text):
     tools = []
     clean_text = text

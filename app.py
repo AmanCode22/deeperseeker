@@ -35,7 +35,12 @@ security = HTTPBasic()
 
 
 from functions import (
+<<<<<<< fix/tool-calling
     request_tools,
+=======
+    effort_level,
+    request_effort,
+>>>>>>> main
     CookieGenerationError,
     StreamToolParser,
     UpstreamError,
@@ -3071,6 +3076,7 @@ async def chat_completions(request: Request):
     messages = body.get("messages", [])
     model = resolve_model(body.get("model"))
     thinking = is_thinking_enabled(body, request)
+    request_effort.set(effort_level(body) if thinking else None)
     search = body.get("search", False)
     stream = body.get("stream", False)
     tools = body.get("tools", None)
@@ -3336,6 +3342,7 @@ async def openai_responses(request: Request):
         messages.insert(0, {"role": "system", "content": inst_text})
 
     thinking = is_thinking_enabled(body, request)
+    request_effort.set(effort_level(body) if thinking else None)
     search = bool(body.get("search", False))
     stream = bool(body.get("stream", False))
     raw_tools = body.get("tools", None)
