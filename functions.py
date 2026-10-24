@@ -1189,6 +1189,98 @@ def _code_fence_spans(text):
     ]
 
 
+# Openers may come as "</｜｜DSML｜｜ parameter name=...>" (the model mixes up
+# open/close), as 'parameter="x"' without name, or without "parameter name=" at all
+# ('<｜｜DSML｜｜command" string=...>', '<｜｜DSML｜｜ old_string="true">') ("<｜｜DSML｜｜command" string=...>),
+# and a value ends at the proper closer, the next parameter, or ANY DSML marker
+# (bare "</｜｜DSML｜｜>", truncated "</｜｜DSML｜｜ ", "</｜｜DSML｜｜ calls>",
+# "<"-less "｜｜DSML｜｜parameter>"): markers never belong in a value.
+_DSML_PARAM_RE = re.compile(
+    r"(?:</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)(?:\s+name\s*=|\s*=)\s*[\x27\x22]([^\x27\x22]+)[\x27\x22]"
+    r"|</?[｜\|]{1,2}DSML[｜\|]{1,2}\s*(?!(?:parameter|invoke|function_calls?|tool_calls?|calls)\b)([A-Za-z_][\w\-]*)(?=[\x27\x22]|\s*=\s*[\x27\x22](?:true|false)[\x27\x22]))([^>]*)>"
+    r"(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|(?=(?:</?)?[｜\|]{1,2}DSML|</?[｜\|]{0,2}DSML[｜\|])|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _dsml_params(body):
+    args = {}
+    for pm in _DSML_PARAM_RE.finditer(body):
+        p_name = (pm.group(1) or pm.group(2)).strip()
+        p_val = pm.group(4).strip()
+        p_val = re.sub(
+            r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>",
+            "",
+            p_val,
+            flags=re.IGNORECASE,
+        ).strip()
+        # string="true" marks a literal string; don't turn "42"/"true" into JSON.
+        # ('<｜｜DSML｜｜old_string="true">' puts the type right after the name.)
+        if re.search(r"(?:string\s*=|^\s*=)\s*[\x27\x22]true", pm.group(3), re.IGNORECASE):
+            args[p_name] = p_val
+            continue
+        try:
+            args[p_name] = json.loads(p_val)
+        except Exception:
+            args[p_name] = p_val
+    return args
+
+
+# The request's tool list, set by handle_chat, so parse_tools can recover a call
+# whose tool name the model dropped (a function_calls block without an invoke).
+request_tools = contextvars.ContextVar("request_tools", default=None)
+
+
+def _tool_schemas():
+    schemas = {}
+    for t in request_tools.get() or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        name = fn.get("name")
+        params = fn.get("parameters") or fn.get("input_schema") or {}
+        if name and isinstance(params, dict):
+            schemas[name] = params
+    return schemas
+
+
+def _infer_tool_name(args, schemas):
+    """The one tool whose schema accepts exactly these argument names."""
+    # First require every required field; if the model also dropped one of those,
+    # still name the one tool that accepts these arguments, so the client reports
+    # the missing field instead of an unknown tool.
+    for need_required in (True, False):
+        fits = []
+        for name, params in schemas.items():
+            props = set(params.get("properties") or {})
+            required = set(params.get("required") or [])
+            if set(args) <= props and (not need_required or required <= set(args)):
+                fits.append((len(props - set(args)), name))
+        fits.sort()
+        if fits and (len(fits) == 1 or fits[0][0] < fits[1][0]):
+            return fits[0][1]
+    return None
+
+
+def _repair_tool_names(tools):
+    schemas = _tool_schemas()
+    if not schemas:
+        return tools
+    for t in tools:
+        fn = t["function"]
+        if fn["name"] in schemas:
+            continue
+        try:
+            args = json.loads(fn["arguments"])
+        except Exception:
+            continue
+        if isinstance(args, dict):
+            fn["name"] = _infer_tool_name(args, schemas) or fn["name"]
+    return tools
+
+
+
+
 # The request's reasoning effort ("high", "max", ...) when thinking is on, set by
 # the chat endpoints; build_prompt turns it into a think-harder instruction.
 request_effort = contextvars.ContextVar("request_effort", default=None)
@@ -1231,44 +1323,51 @@ def parse_tools(text):
         "url",
         "input",
     }
-    tool_matches = list(
-        re.finditer(
-            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|invoke|function_calls?)\s+(?:name|tool)=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>",
+    # Call starts: invoke openers (also "</…invoke name=…>", the model mixes up
+    # open/close), DSML function_calls blocks with no invoke at all, and a bare
+    # "<｜｜DSML｜｜invoke>" without a name; their tool name is inferred from the
+    # parameters.
+    starts = [
+        (m, m.group(1).strip())
+        for m in re.finditer(
+            r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:tool_calls?|invoke|function_calls?)(?:\s+(?:name|tool)\s*=|\s*=)\s*[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>",
             text,
             re.IGNORECASE,
         )
+    ] + [
+        (m, None)
+        for m in re.finditer(
+            r"<[｜\|]{0,2}DSML[｜\|]{0,2}\s*(?:function_calls?|tool_calls?|calls|invoke)\s*>",
+            text,
+            re.IGNORECASE,
+        )
+    ]
+    real_tool_matches = sorted(
+        (st for st in starts if not fenced(st[0].start())), key=lambda st: st[0].start()
     )
-    real_tool_matches = [tm for tm in tool_matches if not fenced(tm.start())]
 
     if real_tool_matches:
-        for i, tm in enumerate(real_tool_matches):
-            candidate_name = tm.group(1).strip()
+        schemas = _tool_schemas()
+        for i, (tm, candidate_name) in enumerate(real_tool_matches):
             start_idx = tm.end()
+            # 'invoke name="i" string="true">…': the model fused the invoke with its
+            # first parameter; read it as a parameter and infer the tool name.
+            if (
+                candidate_name
+                and "string=" in tm.group(0)
+                and schemas
+                and candidate_name not in schemas
+            ):
+                start_idx = tm.start()
+                candidate_name = None
             end_idx = (
-                real_tool_matches[i + 1].start()
+                real_tool_matches[i + 1][0].start()
                 if i + 1 < len(real_tool_matches)
                 else len(text)
             )
             body = text[start_idx:end_idx]
             args = {}
-            p_matches = re.finditer(
-                r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=[\x27\x22]([^\x27\x22]+)[\x27\x22][^>]*>(.*?)(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)>|(?=<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:parameter|tool_call|param|invoke)\s+name=)|$)",
-                body,
-                flags=re.DOTALL | re.IGNORECASE,
-            )
-            for pm in p_matches:
-                p_name = pm.group(1).strip()
-                p_val = pm.group(2).strip()
-                p_val = re.sub(
-                    r"</?(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>",
-                    "",
-                    p_val,
-                    flags=re.IGNORECASE,
-                ).strip()
-                try:
-                    args[p_name] = json.loads(p_val)
-                except Exception:
-                    args[p_name] = p_val
+            args = _dsml_params(body)
             tag_param_matches = re.finditer(
                 r"<([A-Za-z0-9_\-]+)>(.*?)(?:</\1>|$)",
                 body,
@@ -1288,8 +1387,9 @@ def parse_tools(text):
                         args[t_name] = json.loads(t_val)
                     except Exception:
                         args[t_name] = t_val
-            if candidate_name:
-                norm = normalize_tool_call(candidate_name, args)
+            if candidate_name or args:
+                # A wrapper with no parameters just precedes its invoke; skip it.
+                norm = normalize_tool_call(candidate_name or "function_calls", args)
                 if norm:
                     tools.append(norm)
 
@@ -1549,6 +1649,7 @@ def parse_tools(text):
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
     clean_text = _strip_wrapper_tags(clean_text).strip()
+    tools = _repair_tool_names(tools)
     return tools, clean_text
 
 
@@ -1585,8 +1686,10 @@ _ORPHAN_CLOSER_RE = re.compile(
 # streamed to the client as literal text. Note the tag-name slot is required to
 # be EMPTY: "<｜｜DSML｜｜ invoke ...>" does not match and is left for the entry
 # regex.
+# The ">" is optional: the model also leaks truncated markers like
+# "<｜｜DSML｜｜ </｜｜DSML｜｜ " as prose.
 _BARE_DSML_MARKER_RE = re.compile(
-    r"</?[｜\|]{0,2}DSML[｜\|]{0,2}\s*>",
+    r"</?[｜\|]{0,2}DSML[｜\|]{0,2}+\s*+(?![A-Za-z_])[>＞]?",
     re.IGNORECASE,
 )
 
