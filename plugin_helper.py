@@ -583,8 +583,9 @@ async def generate_signature(messages, model, scope=""):
 
 # DeepSeek web has one thinking mode (DeepThink on/off), so effort above medium is
 # approximated by asking for more reasoning; measured ~1.1-2.4x longer thinking.
+# "high" gets no instruction: in agent sessions it multiplied reasoning length
+# (median 452 -> 7401 chars) and long reasoning hit DeepSeek's cut-off (INCOMPLETE).
 EFFORT_INSTRUCTIONS = {
-    "high": "[REASONING EFFORT: high] Think carefully before answering: check edge cases and verify your result.",
     "max": (
         "[REASONING EFFORT: max] Before answering, reason exhaustively in your thinking: try at least two "
         "different approaches, check edge cases, verify every step and re-check the final answer "
