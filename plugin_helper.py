@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from functions import count_tokens, get_session, upload_file
+from functions import count_tokens, get_session, request_effort, upload_file
 
 # Token budgets for injected history when (re)building a session prompt.
 MAX_HISTORY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_HISTORY_TOKENS", "24000"))
@@ -581,6 +581,26 @@ async def generate_signature(messages, model, scope=""):
     return generate_signature_sync(messages, model, scope)
 
 
+# DeepSeek web has one thinking mode (DeepThink on/off), so effort above medium is
+# approximated by asking for more reasoning; measured ~1.1-2.4x longer thinking.
+# "high" gets no instruction: in agent sessions it multiplied reasoning length
+# (median 452 -> 7401 chars) and long reasoning hit DeepSeek's cut-off (INCOMPLETE).
+EFFORT_INSTRUCTIONS = {
+    "max": (
+        "[REASONING EFFORT: max] Before answering, reason exhaustively in your thinking: try at least two "
+        "different approaches, check edge cases, verify every step and re-check the final answer "
+        "independently. Take as long as needed."
+    ),
+}
+for _alias in ("xhigh", "ultra", "extreme"):
+    EFFORT_INSTRUCTIONS[_alias] = EFFORT_INSTRUCTIONS["max"]
+
+
+def _with_effort(prompt):
+    instruction = EFFORT_INSTRUCTIONS.get(request_effort.get() or "")
+    return prompt + instruction + "\n" if instruction else prompt
+
+
 async def build_prompt(
     messages, tools, model, is_first_message=False, rollover_summary=None
 ):
@@ -620,7 +640,7 @@ async def build_prompt(
                 "[... beginning of the message truncated to fit the context limit ...]",
             )
             final_prompt += f"[USER]\n{user_msg}\n\n"
-        return final_prompt.strip() + "\n\n"
+        return _with_effort(final_prompt.strip() + "\n\n")
     if is_first_message:
         final_prompt = await append_fresh_session_runtime(
             final_prompt, messages, tools_extract
@@ -736,4 +756,4 @@ async def build_prompt(
         if tools_extract:
             final_prompt += TOOL_USE_INSTRUCTIONS + "\n"
 
-    return final_prompt
+    return _with_effort(final_prompt)
