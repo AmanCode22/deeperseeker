@@ -1,6 +1,6 @@
 [project]
 name = "deeperseeker"
-version = "6.0"
+version = "7.0"
 description = "DeepSeek website reverse-proxy server with FastAPI, supporting OpenAI & Anthropic API standards."
 readme = "README.md"
 authors = [

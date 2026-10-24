@@ -36,6 +36,9 @@ security = HTTPBasic()
 
 
 from functions import (
+    effort_level,
+    request_effort,
+    request_tools,
     token_busy,
     CookieGenerationError,
     StreamToolParser,
@@ -814,6 +817,7 @@ async def handle_chat(
     is_responses=False,
     response_opts=None,
 ):
+    request_tools.set(tools)
     _stream_retry.set(
         None
         if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS
@@ -3118,6 +3122,7 @@ async def chat_completions(request: Request):
     messages = body.get("messages", [])
     model = resolve_model(body.get("model"))
     thinking = is_thinking_enabled(body, request)
+    request_effort.set(effort_level(body) if thinking else None)
     search = body.get("search", False)
     stream = body.get("stream", False)
     tools = body.get("tools", None)
@@ -3383,6 +3388,7 @@ async def openai_responses(request: Request):
         messages.insert(0, {"role": "system", "content": inst_text})
 
     thinking = is_thinking_enabled(body, request)
+    request_effort.set(effort_level(body) if thinking else None)
     search = bool(body.get("search", False))
     stream = bool(body.get("stream", False))
     raw_tools = body.get("tools", None)

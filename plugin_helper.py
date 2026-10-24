@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from functions import count_tokens, get_session, upload_file
+from functions import count_tokens, get_session, request_effort, upload_file
 
 # Token budgets for injected history when (re)building a session prompt.
 MAX_HISTORY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_HISTORY_TOKENS", "24000"))
@@ -169,11 +169,22 @@ def build_summary_request_prompt(messages):
     )
 
 
+# DeepSeek is trained on its DSML tool format and keeps writing it (its own
+# earlier calls stay in the upstream chat history), so ask for exactly that
+# instead of a competing <tool_call> JSON format the model mixes it with.
 TOOL_USE_INSTRUCTIONS = (
-    "TOOL USE INSTRUCTIONS:\n"
-    "You have access to tools. When you need to call a tool, output ONLY the tool call XML block and nothing else:\n"
-    '<tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>\n'
-    "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool."
+    "TOOL USE INSTRUCTIONS (from the API harness, not part of any tool result):\n"
+    "To call tools, end your reply with exactly this block and write nothing after it:\n"
+    "<｜｜DSML｜｜function_calls>\n"
+    '<｜｜DSML｜｜invoke name="tool_name">\n'
+    '<｜｜DSML｜｜parameter name="text_param" string="true">plain text value</｜｜DSML｜｜parameter>\n'
+    '<｜｜DSML｜｜parameter name="other_param" string="false">{"json": ["value"]}</｜｜DSML｜｜parameter>\n'
+    "</｜｜DSML｜｜invoke>\n"
+    "</｜｜DSML｜｜function_calls>\n"
+    "Rules: close every parameter with </｜｜DSML｜｜parameter> before the next one starts; "
+    'string="true" for strings, string="false" for numbers, booleans, arrays and objects (valid JSON); '
+    "several invoke blocks may go inside one function_calls block; never put DSML tags inside a value; "
+    "only use tool and parameter names from the tool list."
 )
 
 
@@ -275,11 +286,21 @@ async def extract_tool_results(messages, latest_only=False):
                 break
         if last_ast_idx != -1:
             target_messages = messages[last_ast_idx + 1 :]
+    # DSML calls carry no ids, so the model can't match parallel results to its calls
+    # by "Call ID" alone; echo each call's arguments next to its result.
+    call_args = {}
+    for m in messages:
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict) and isinstance(tc.get("function"), dict):
+                call_args[tc.get("id")] = (
+                    tc["function"].get("name"),
+                    str(tc["function"].get("arguments") or "")[:300],
+                )
     tools_final = []
     for i in target_messages:
         if i.get("role") == "tool":
-            name = i.get("name", "tool")
             call_id = i.get("tool_call_id", "")
+            name = i.get("name") or call_args.get(call_id, ("tool",))[0] or "tool"
             content = i.get("content", "")
             if isinstance(content, list):
                 content = " ".join(
@@ -288,7 +309,11 @@ async def extract_tool_results(messages, latest_only=False):
                     if isinstance(c, dict) and c.get("type") == "text"
                 )
             content = _trim_to_budget(str(content), PER_TOOL_RESULT_TOKENS)
-            tools_final.append(f"Tool: {name} (Call ID: {call_id})\nResult: {content}")
+            args = call_args.get(call_id, (None, ""))[1]
+            header = f"Tool: {name} (Call ID: {call_id})"
+            if args:
+                header += f"\nArguments: {args}"
+            tools_final.append(f"{header}\nResult: {content}")
     return "\n\n".join(tools_final) if tools_final else None
 
 
@@ -581,6 +606,26 @@ async def generate_signature(messages, model, scope=""):
     return generate_signature_sync(messages, model, scope)
 
 
+# DeepSeek web has one thinking mode (DeepThink on/off), so effort above medium is
+# approximated by asking for more reasoning; measured ~1.1-2.4x longer thinking.
+# "high" gets no instruction: in agent sessions it multiplied reasoning length
+# (median 452 -> 7401 chars) and long reasoning hit DeepSeek's cut-off (INCOMPLETE).
+EFFORT_INSTRUCTIONS = {
+    "max": (
+        "[REASONING EFFORT: max] Before answering, reason exhaustively in your thinking: try at least two "
+        "different approaches, check edge cases, verify every step and re-check the final answer "
+        "independently. Take as long as needed."
+    ),
+}
+for _alias in ("xhigh", "ultra", "extreme"):
+    EFFORT_INSTRUCTIONS[_alias] = EFFORT_INSTRUCTIONS["max"]
+
+
+def _with_effort(prompt):
+    instruction = EFFORT_INSTRUCTIONS.get(request_effort.get() or "")
+    return prompt + instruction + "\n" if instruction else prompt
+
+
 async def build_prompt(
     messages, tools, model, is_first_message=False, rollover_summary=None
 ):
@@ -620,7 +665,7 @@ async def build_prompt(
                 "[... beginning of the message truncated to fit the context limit ...]",
             )
             final_prompt += f"[USER]\n{user_msg}\n\n"
-        return final_prompt.strip() + "\n\n"
+        return _with_effort(final_prompt.strip() + "\n\n")
     if is_first_message:
         final_prompt = await append_fresh_session_runtime(
             final_prompt, messages, tools_extract
@@ -736,4 +781,4 @@ async def build_prompt(
         if tools_extract:
             final_prompt += TOOL_USE_INSTRUCTIONS + "\n"
 
-    return final_prompt
+    return _with_effort(final_prompt)
