@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import logging
 import mimetypes
@@ -35,12 +36,10 @@ security = HTTPBasic()
 
 
 from functions import (
-<<<<<<< fix/tool-calling
-    request_tools,
-=======
     effort_level,
     request_effort,
->>>>>>> main
+    request_tools,
+    token_busy,
     CookieGenerationError,
     StreamToolParser,
     UpstreamError,
@@ -795,6 +794,11 @@ async def _preflight_stream(gen):
 # returns the upstream error (502-class) with the redacted trace.
 MAX_UPSTREAM_ATTEMPTS = max(1, int(os.getenv("DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS", "3")))
 
+# How to restart the current chat request on another account; set by handle_chat
+# and used by stream_response when DeepSeek drops the stream before any visible
+# output reached the client (None once the attempt budget is spent).
+_stream_retry = contextvars.ContextVar("stream_retry", default=None)
+
 
 async def handle_chat(
     messages,
@@ -814,6 +818,25 @@ async def handle_chat(
     response_opts=None,
 ):
     request_tools.set(tools)
+    _stream_retry.set(
+        None
+        if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS
+        else lambda failed_token: handle_chat(
+            messages,
+            model,
+            thinking,
+            search,
+            stream,
+            tools,
+            is_anthropic,
+            req_model,
+            scope,
+            _attempt=_attempt + 1,
+            _exclude_token=failed_token,
+            is_responses=is_responses,
+            response_opts=response_opts,
+        )
+    )
     auth_token = await _db(get_auth_token)
     if not auth_token:
         return JSONResponse(
@@ -853,7 +876,14 @@ async def handle_chat(
         # P0-3: anything that is not ACTIVE is unusable for this session, so a
         # quarantined token bound by a stored signature rotates away like a
         # cooled-down one. (Rate-limited is still transient; quarantine is not.)
-        if not tok or tok["status"] != "ACTIVE":
+        # A conversation whose account is busy generating moves to an
+        # idle account (fresh chat, full history) instead of queueing behind it.
+        moved_off_busy = False
+        if tok and tok["status"] == "ACTIVE" and token_busy(tok["token"]):
+            cand = await _db(pick_token)
+            cand_tok = await _db(get_token, cand) if cand and cand != token_id else None
+            moved_off_busy = bool(cand_tok) and not token_busy(cand_tok["token"])
+        if not tok or tok["status"] != "ACTIVE" or moved_off_busy:
             new_token_id = await _db(pick_token)
             if new_token_id and (not tok or new_token_id != token_id):
                 new_tok = await _db(get_token, new_token_id)
@@ -1588,6 +1618,7 @@ async def stream_response(
     is_thinking = False
     aborted = False
     failed = False
+    sent_content = False  # visible text reached the client (reasoning does not count)
     try:
         async for chunk in _hold_think_tags(gen):
             if not chunk:
@@ -1617,6 +1648,7 @@ async def stream_response(
 
             for r in parser.feed(chunk):
                 if "text" in r:
+                    sent_content = True
                     yield f"data: {json.dumps(_chat_chunk([_choice({'content': r['text']})], cid=cid, created=created, model=model))}\n\n"
         await _db(mark_active, token_id)
     except (asyncio.CancelledError, GeneratorExit):
@@ -1646,8 +1678,22 @@ async def stream_response(
         else:
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.exception("stream_response failed")
-        with suppress(Exception):
-            yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
+        # Dropped before any visible text or tool call reached the client: run the
+        # request again on another account and stream that instead of the error.
+        retry = _stream_retry.get()
+        retried = None
+        if not sent_content and retry is not None:
+            logger.warning(
+                "stream_response: upstream failed before any output, retrying on another account"
+            )
+            with suppress(Exception):
+                retried = await retry(token_id)
+        if isinstance(retried, StreamingResponse):
+            async for part in retried.body_iterator:
+                yield part
+        else:
+            with suppress(Exception):
+                yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
     finally:
         parsed_tools, clean_text = parse_tools(full_text)
         clean_text = re.sub(
