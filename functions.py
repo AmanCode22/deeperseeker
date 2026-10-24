@@ -2103,6 +2103,11 @@ async def _send_message_unlocked(
 
     think_open = False
     got_output = False
+    # DeepSeek ends a reply it cut short (seen mid-thinking on long contexts) with
+    # status INCOMPLETE. With no answer text yet that is a failed turn, not a
+    # finished one: an empty "stop" makes agent clients end the turn.
+    incomplete = False
+    got_response = False
     resp = await post_with_failover(
         "/api/v0/chat/completion",
         headers=headers,
@@ -2124,8 +2129,14 @@ async def _send_message_unlocked(
         parsed_events = []
         line_buf = b""
 
+        def _check_incomplete():
+            if incomplete and not got_response:
+                raise UpstreamError(
+                    502, "DeepSeek stopped the reply before any answer (status INCOMPLETE)"
+                )
+
         async def _emit_from_event(data):
-            nonlocal think_open, got_output
+            nonlocal think_open, got_output, incomplete, got_response
             if isinstance(data, dict) and data.get("type") == "error":
                 _raise_sse_error_event(data, recent_lines)
 
@@ -2133,15 +2144,29 @@ async def _send_message_unlocked(
                 for op in data["v"]:
                     if not isinstance(op, dict):
                         continue
-                    if op.get("p") == "quasi_status" and op.get("v") == "FINISHED":
-                        continue
+                    if op.get("p") == "quasi_status":
+                        incomplete = incomplete or op.get("v") == "INCOMPLETE"
+                        continue  # a status word, never content
                     async for chunk in _emit_from_event(op):
                         yield chunk
+                return
+
+            # Any other status field ("response/status", ".../status") carries a
+            # status word such as INCOMPLETE or WIP, never content.
+            p_name, p_val = str(data.get("p") or ""), data.get("v")
+            if (
+                p_name.endswith("status")
+                and isinstance(p_val, str)
+                and p_val.isupper()
+                and p_val != "FINISHED"
+            ):
+                incomplete = incomplete or p_val == "INCOMPLETE"
                 return
 
             if data.get("p") == "response/status" and data.get("v") == "FINISHED":
                 if think_open:
                     yield "\n</think>\n\n"
+                _check_incomplete()
                 if not got_output:
                     _raise_empty_sse_response(recent_lines, parsed_events)
                 raise _SseStreamFinished()
@@ -2161,6 +2186,7 @@ async def _send_message_unlocked(
                                 yield "\n</think>\n\n"
                                 think_open = False
                             got_output = True
+                            got_response = got_response or bool(fragment.get("content"))
                             yield fragment.get("content", "")
                 return
 
@@ -2173,6 +2199,7 @@ async def _send_message_unlocked(
                                 yield "\n</think>\n\n"
                                 think_open = False
                             got_output = True
+                            got_response = got_response or bool(fragment.get("content"))
                             yield fragment.get("content", "")
                         elif fragment.get("type") == "THINK":
                             if not think_open:
@@ -2188,6 +2215,7 @@ async def _send_message_unlocked(
             v = data.get("v")
             if isinstance(v, str) and v:
                 got_output = True
+                got_response = got_response or not think_open
                 yield v
 
         async def _consume_sse_line(decoded_line: str):
@@ -2234,6 +2262,7 @@ async def _send_message_unlocked(
 
         if think_open:
             yield "\n</think>\n\n"
+        _check_incomplete()
         if not got_output:
             _raise_empty_sse_response(recent_lines, parsed_events)
 
