@@ -1681,8 +1681,11 @@ _TOOL_END_TAG_RE = re.compile(
 # "<｜｜DSML｜｜ invoke name=...>". Entry detection cannot rely on plain
 # substring start tags; this regex accepts bars, the DSML marker and the
 # space in any combination.
+# Also enters on "</…invoke name=…>": the model opens an invoke with a closing
+# tag. Only with name=, so a real "</invoke>" closer never opens a block.
 _STREAM_ENTRY_RE = re.compile(
-    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
+    r"<(?:/(?=[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*invoke\s+name\s*=))?"
+    r"[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
     re.IGNORECASE,
 )
 

@@ -298,6 +298,39 @@ def test_text_after_proper_invoke_closer_is_kept():
     assert clean == "Kurz prüfen."
 
 
+def test_stream_slash_invoke_opener_enters_tool_mode():
+    # Live (2026-10-25), streamed: the 2nd invoke opens with "</…invoke name=…>"
+    # and the block ends with an opener instead of a closer. The web_search query
+    # used to stream out as reply text.
+    text = (
+        "Ich versuche es gezielter.\n\n"
+        f"<{B}function_calls>\n"
+        f'<{B}invoke name="terminal">\n'
+        f'<{B}parameter name="command" string="true">sing-box version 2>&1</{B}parameter>\n'
+        f"</{B}invoke>\n"
+        f'</{B}invoke name="web_search">\n'
+        f'<{B}parameter name="query" string="true">SagerNet sing-box releases latest version tag</{B}parameter>\n'
+        f"</{B}invoke>\n"
+        f"<{B}function_calls>"
+    )
+    parser = StreamToolParser()
+    results = []
+    for i in range(0, len(text), 7):
+        results += parser.feed(text[i : i + 7])
+    results += parser.flush()
+    shown = "".join(r.get("text", "") for r in results)
+    calls = [
+        (r["tool"]["function"]["name"], json.loads(r["tool"]["function"]["arguments"]))
+        for r in results
+        if "tool" in r
+    ]
+    assert shown.strip() == "Ich versuche es gezielter."
+    assert calls == [
+        ("terminal", {"command": "sing-box version 2>&1"}),
+        ("web_search", {"query": "SagerNet sing-box releases latest version tag"}),
+    ]
+
+
 def test_lone_wrapper_tag_is_not_a_tool_call():
     for tag in ("function_calls", "calls", "invoke", "tool_calls"):
         tools, _ = parse_tools(f"<{B}{tag}>")
