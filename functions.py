@@ -1401,7 +1401,9 @@ def parse_tools(text):
             flags=re.DOTALL | re.IGNORECASE,
         ).strip()
         clean_text = re.sub(
-            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)>|$)",
+            # Also "</…invoke name=…>": the model mixes up open/close for an opener.
+            r"(?:<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)[^>]*>|</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*invoke\s+name\s*=[^>]*>)"
+            r".*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)>|$)",
             "",
             clean_text,
             flags=re.DOTALL | re.IGNORECASE,

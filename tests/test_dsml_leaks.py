@@ -257,3 +257,42 @@ def test_bare_invoke_without_name_is_inferred():
         ]
     finally:
         request_tools.reset(token)
+
+
+def test_slash_invoke_openers_do_not_leak_commands_as_text():
+    # Live (2026-10-25): every invoke after the first opened as "</…invoke name=…>".
+    # All three calls were parsed, but the 2nd and 3rd commands stayed in the
+    # visible text.
+    text = (
+        f"<{B}function_calls>\n"
+        f'<{B}invoke name="terminal">\n'
+        f'<{B}parameter name="command" string="true">tailscale status</{B}parameter>\n'
+        f"</{B}invoke>\n"
+        f'</{B}invoke name="terminal">\n'
+        f'<{B}parameter name="command" string="true">systemctl is-active tailscaled</{B}parameter>\n'
+        f"</{B}invoke>\n"
+        f'</{B}invoke name="terminal">\n'
+        f'<{B}parameter name="command" string="true">uptime</{B}parameter>\n'
+        f"</{B}invoke>\n"
+        f"</{B}function_calls>"
+    )
+    tools, clean = parse_tools(text)
+    assert [json.loads(t["function"]["arguments"])["command"] for t in tools] == [
+        "tailscale status",
+        "systemctl is-active tailscaled",
+        "uptime",
+    ]
+    assert clean == ""
+
+
+def test_text_after_proper_invoke_closer_is_kept():
+    text = (
+        f"Kurz prüfen.\n<{B}function_calls>\n"
+        f'<{B}invoke name="terminal">\n'
+        f'<{B}parameter name="command" string="true">uptime</{B}parameter>\n'
+        f"</{B}invoke>\n"
+        f"</{B}function_calls>"
+    )
+    tools, clean = parse_tools(text)
+    assert len(tools) == 1
+    assert clean == "Kurz prüfen."
