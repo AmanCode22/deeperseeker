@@ -297,3 +297,19 @@ def test_corrupted_dsml_marker_split_across_chunks_not_leaked():
 def test_ascii_pipe_preserved_in_prose():
     _, clean = parse_tools("run: grep -E 'disabled|enable' file | sort")
     assert "disabled|enable" in clean and "| sort" in clean
+
+
+def test_corrupted_dsml_marker_stripped_from_tool_arg():
+    # The corrupted closer must not survive inside a tool-call argument value
+    # (e.g. a file path), or the tool call fails with a bogus path.
+    from functions import normalize_tool_call
+    call = normalize_tool_call("Edit", {"file_path": "shell/core/Theme.qml</｜｜DSML｜｜ >"})
+    args = json.loads(call["function"]["arguments"])
+    assert args["file_path"] == "shell/core/Theme.qml", args
+
+
+def test_ascii_pipe_preserved_in_tool_arg():
+    from functions import normalize_tool_call
+    call = normalize_tool_call("Bash", {"command": "grep -E 'a|b' f | sort"})
+    args = json.loads(call["function"]["arguments"])
+    assert args["command"] == "grep -E 'a|b' f | sort", args

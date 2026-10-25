@@ -1143,6 +1143,7 @@ def normalize_tool_call(tool_data_or_name, args_if_name=None):
 
     if not name or not isinstance(name, str):
         return None
+    args = _clean_tool_arg(args)
     if isinstance(args, (dict, list)):
         args_str = json.dumps(args)
     elif isinstance(args, str):
@@ -1708,6 +1709,22 @@ _WRAPPER_TAG_RE = re.compile(
 # any <...> token containing a fullwidth pipe U+FF5C, which never appears in
 # legitimate prose. ASCII '|' is deliberately NOT matched (tables, code).
 _FULLWIDTH_PIPE_TAG_RE = re.compile(r"<[^<>]*\uff5c[^<>]*>")
+
+
+def _clean_tool_arg(value):
+    # Strip corrupted DSML markers that leaked INTO a tool-call argument
+    # value (e.g. a path parsed as "shell/core/Theme.qml</\uff5c\uff5cDSML\uff5c\uff5c >").
+    # Only touches strings that actually contain a fullwidth pipe U+FF5C, so
+    # normal arguments are untouched. Recurses into dicts/lists.
+    if isinstance(value, str):
+        if "\uff5c" in value:
+            value = _FULLWIDTH_PIPE_TAG_RE.sub("", value).strip()
+        return value
+    if isinstance(value, dict):
+        return {k: _clean_tool_arg(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clean_tool_arg(v) for v in value]
+    return value
 
 
 def _strip_stray_markers(text: str) -> str:
