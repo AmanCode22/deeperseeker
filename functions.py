@@ -2271,6 +2271,11 @@ async def _send_message_unlocked(
                     if op.get("p") == "quasi_status":
                         incomplete = incomplete or op.get("v") == "INCOMPLETE"
                         continue  # a status word, never content
+                    base, sub = data.get("p"), op.get("p")
+                    if base and sub and not sub.startswith(base + "/"):
+                        # Sub-op paths are relative to the BATCH path:
+                        # {"p":"response","o":"BATCH","v":[{"p":"fragments",...}]}
+                        op = {**op, "p": f"{base}/{sub}"}
                     async for chunk in _emit_from_event(op):
                         yield chunk
                 return
@@ -2314,7 +2319,7 @@ async def _send_message_unlocked(
                             yield fragment.get("content", "")
                 return
 
-            if data.get("p") == "response/fragments" and data.get("o") == "APPEND":
+            if data.get("p") == "response/fragments" and data.get("o") in ("APPEND", None):
                 fragments = data.get("v")
                 if isinstance(fragments, list):
                     for fragment in fragments:
