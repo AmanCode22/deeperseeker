@@ -296,3 +296,9 @@ def test_text_after_proper_invoke_closer_is_kept():
     tools, clean = parse_tools(text)
     assert len(tools) == 1
     assert clean == "Kurz prüfen."
+
+
+def test_lone_wrapper_tag_is_not_a_tool_call():
+    for tag in ("function_calls", "calls", "invoke", "tool_calls"):
+        tools, _ = parse_tools(f"<{B}{tag}>")
+        assert tools == [], tag

@@ -1301,6 +1301,18 @@ def effort_level(body):
     return None
 
 
+# Structural DSML tag names: a lone wrapper tag is never a call to a tool of
+# that name (unless the client really defines one).
+_DSML_WRAPPER_NAMES = {
+    "function_calls", "function_call", "tool_calls", "tool_call",
+    "calls", "invoke", "parameter", "param",
+}
+
+
+def _is_wrapper_name(name, args):
+    return not args and name.lower() in _DSML_WRAPPER_NAMES and name not in _tool_schemas()
+
+
 def parse_tools(text):
     tools = []
     clean_text = text
@@ -1431,7 +1443,7 @@ def parse_tools(text):
                     args[p_name] = json.loads(p_val)
                 except Exception:
                     args[p_name] = p_val
-            norm = normalize_tool_call(tool_name, args)
+            norm = None if _is_wrapper_name(tool_name, args) else normalize_tool_call(tool_name, args)
             if norm:
                 tools.append(norm)
         if not tools:
@@ -1469,7 +1481,7 @@ def parse_tools(text):
                         r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", desc_match.group(1)
                     ).strip("\x22\x27() ")
                     args["description"] = clean_desc
-                norm = normalize_tool_call(tool_name, args)
+                norm = None if _is_wrapper_name(tool_name, args) else normalize_tool_call(tool_name, args)
                 if norm:
                     tools.append(norm)
         if tools:
