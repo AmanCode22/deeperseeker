@@ -37,6 +37,7 @@ security = HTTPBasic()
 
 from functions import (
     effort_level,
+    reply_id,
     request_effort,
     request_tools,
     token_busy,
@@ -778,6 +779,12 @@ async def _record_usage_safe(scope, surface, model, in_tokens, out_tokens):
         return None
 
 
+def _resp_parent(parent_message_id):
+    """Parent for the turn after this reply: the reply's real id when DeepSeek
+    reported it (a fork gets ids after everything already in the chat)."""
+    return reply_id.get() or next_parent(parent_message_id)
+
+
 async def _preflight_stream(gen):
     """Consume the first chunk eagerly so upstream errors surface before streaming starts."""
     try:
@@ -900,6 +907,7 @@ async def handle_chat(
                         await _db(delete_sessions_for_chat, token_id, session_id)
                         new_session_id = await create_new_chat(new_tok["token"])
                         rot_owner = await _own_chat_lock(new_session_id)
+                        await _db(save_session, sig, new_token_id, new_session_id, 0)
                         if _context_retried or needs_rollover(messages, tools):
                             scratch_chat = await create_new_chat(new_tok["token"])
                             summary_gen = send_message(
@@ -927,6 +935,7 @@ async def handle_chat(
                         )
                         for fid in file_ids:
                             await _db(record_file, fid, new_token_id)
+                        reply_id.set(None)
                         gen = send_message(
                             new_session_id,
                             new_tok["token"],
@@ -1061,17 +1070,10 @@ async def handle_chat(
 
                         await _db(
                             save_session,
-                            sig,
-                            new_token_id,
-                            new_session_id,
-                            next_parent(0),
-                        )
-                        await _db(
-                            save_session,
                             next_sig,
                             new_token_id,
                             new_session_id,
-                            next_parent(0),
+                            _resp_parent(0),
                         )
                         if (
                             is_responses
@@ -1084,7 +1086,7 @@ async def handle_chat(
                                 r_id,
                                 new_token_id,
                                 new_session_id,
-                                next_parent(0),
+                                _resp_parent(0),
                             )
                             _store_response_history(r_id, next_messages)
                         if rot_owner is not None:
@@ -1217,9 +1219,8 @@ async def handle_chat(
                 if fresh and fresh["session_id"] == session_id:
                     parent_message_id = fresh["parent_message_id"]
             else:
-                # Same chat: adopt the stored parent so a request that was
-                # queued behind a completed turn never re-sends a stale
-                # parent_message_id (which would fork the upstream exchange).
+                # Same chat: adopt the stored parent (the fork point of this
+                # request's history; a reply never moves it).
                 parent_message_id = fresh["parent_message_id"]
 
         if parent_message_id != 0 and (
@@ -1287,6 +1288,7 @@ async def handle_chat(
             messages, tools or [], model, is_first, rollover_summary=rollover_summary
         )
 
+        reply_id.set(None)
         gen = send_message(
             session_id,
             tok["token"],
@@ -1371,14 +1373,11 @@ async def handle_chat(
             next_sig = await generate_signature(next_messages, model, scope)
 
             await _db(
-                save_session, sig, token_id, session_id, next_parent(parent_message_id)
-            )
-            await _db(
                 save_session,
                 next_sig,
                 token_id,
                 session_id,
-                next_parent(parent_message_id),
+                _resp_parent(parent_message_id),
             )
             if (
                 is_responses
@@ -1391,7 +1390,7 @@ async def handle_chat(
                     r_id,
                     token_id,
                     session_id,
-                    next_parent(parent_message_id),
+                    _resp_parent(parent_message_id),
                 )
                 _store_response_history(r_id, next_messages)
             # P0-6: one row per completed turn, B7 semantics (cleaned reply
@@ -1716,14 +1715,11 @@ async def stream_response(
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
             await _db(
-                save_session, sig, token_id, session_id, next_parent(parent_message_id)
-            )
-            await _db(
                 save_session,
                 next_sig,
                 token_id,
                 session_id,
-                next_parent(parent_message_id),
+                _resp_parent(parent_message_id),
             )
 
         if not aborted and not failed:
@@ -1898,14 +1894,11 @@ async def stream_anthropic_response(
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
             await _db(
-                save_session, sig, token_id, session_id, next_parent(parent_message_id)
-            )
-            await _db(
                 save_session,
                 next_sig,
                 token_id,
                 session_id,
-                next_parent(parent_message_id),
+                _resp_parent(parent_message_id),
             )
 
         # Declared BEFORE _tb so the helper's closure reads top-down — it used
@@ -2641,21 +2634,18 @@ async def stream_responses_response(
             next_messages.append(ast_msg)
             next_sig = generate_signature_sync(next_messages, model, scope)
             await _db(
-                save_session, sig, token_id, session_id, next_parent(parent_message_id)
-            )
-            await _db(
                 save_session,
                 next_sig,
                 token_id,
                 session_id,
-                next_parent(parent_message_id),
+                _resp_parent(parent_message_id),
             )
             await _db(
                 save_session,
                 resp_id,
                 token_id,
                 session_id,
-                next_parent(parent_message_id),
+                _resp_parent(parent_message_id),
             )
             _store_response_history(resp_id, next_messages)
 

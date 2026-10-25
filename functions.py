@@ -1230,6 +1230,11 @@ def _dsml_params(body):
 # whose tool name the model dropped (a function_calls block without an invoke).
 request_tools = contextvars.ContextVar("request_tools", default=None)
 
+# The id DeepSeek gave the reply of the last send_message in this request (from
+# the first SSE event). Ids are chat-global, so a reply sent from a fork point is
+# not at parent + 2.
+reply_id = contextvars.ContextVar("reply_id", default=None)
+
 
 def _tool_schemas():
     schemas = {}
@@ -2354,6 +2359,8 @@ async def _send_message_unlocked(
                 parsed_events.append(data)
                 if len(parsed_events) > _SSE_RECENT_LINES:
                     del parsed_events[0]
+                if "response_message_id" in data:
+                    reply_id.set(data["response_message_id"])
             try:
                 async for chunk in _emit_from_event(data):
                     yield chunk
