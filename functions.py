@@ -1301,6 +1301,18 @@ def effort_level(body):
     return None
 
 
+# Structural DSML tag names: a lone wrapper tag is never a call to a tool of
+# that name (unless the client really defines one).
+_DSML_WRAPPER_NAMES = {
+    "function_calls", "function_call", "tool_calls", "tool_call",
+    "calls", "invoke", "parameter", "param",
+}
+
+
+def _is_wrapper_name(name, args):
+    return not args and name.lower() in _DSML_WRAPPER_NAMES and name not in _tool_schemas()
+
+
 def parse_tools(text):
     tools = []
     clean_text = text
@@ -1401,7 +1413,9 @@ def parse_tools(text):
             flags=re.DOTALL | re.IGNORECASE,
         ).strip()
         clean_text = re.sub(
-            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)>|$)",
+            # Also "</…invoke name=…>": the model mixes up open/close for an opener.
+            r"(?:<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)[^>]*>|</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*invoke\s+name\s*=[^>]*>)"
+            r".*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)>|$)",
             "",
             clean_text,
             flags=re.DOTALL | re.IGNORECASE,
@@ -1429,7 +1443,7 @@ def parse_tools(text):
                     args[p_name] = json.loads(p_val)
                 except Exception:
                     args[p_name] = p_val
-            norm = normalize_tool_call(tool_name, args)
+            norm = None if _is_wrapper_name(tool_name, args) else normalize_tool_call(tool_name, args)
             if norm:
                 tools.append(norm)
         if not tools:
@@ -1467,7 +1481,7 @@ def parse_tools(text):
                         r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", desc_match.group(1)
                     ).strip("\x22\x27() ")
                     args["description"] = clean_desc
-                norm = normalize_tool_call(tool_name, args)
+                norm = None if _is_wrapper_name(tool_name, args) else normalize_tool_call(tool_name, args)
                 if norm:
                     tools.append(norm)
         if tools:
@@ -1667,8 +1681,11 @@ _TOOL_END_TAG_RE = re.compile(
 # "<｜｜DSML｜｜ invoke name=...>". Entry detection cannot rely on plain
 # substring start tags; this regex accepts bars, the DSML marker and the
 # space in any combination.
+# Also enters on "</…invoke name=…>": the model opens an invoke with a closing
+# tag. Only with name=, so a real "</invoke>" closer never opens a block.
 _STREAM_ENTRY_RE = re.compile(
-    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
+    r"<(?:/(?=[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*invoke\s+name\s*=))?"
+    r"[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
     re.IGNORECASE,
 )
 
@@ -2271,6 +2288,11 @@ async def _send_message_unlocked(
                     if op.get("p") == "quasi_status":
                         incomplete = incomplete or op.get("v") == "INCOMPLETE"
                         continue  # a status word, never content
+                    base, sub = data.get("p"), op.get("p")
+                    if base and sub and not sub.startswith(base + "/"):
+                        # Sub-op paths are relative to the BATCH path:
+                        # {"p":"response","o":"BATCH","v":[{"p":"fragments",...}]}
+                        op = {**op, "p": f"{base}/{sub}"}
                     async for chunk in _emit_from_event(op):
                         yield chunk
                 return
@@ -2314,7 +2336,7 @@ async def _send_message_unlocked(
                             yield fragment.get("content", "")
                 return
 
-            if data.get("p") == "response/fragments" and data.get("o") == "APPEND":
+            if data.get("p") == "response/fragments" and data.get("o") in ("APPEND", None):
                 fragments = data.get("v")
                 if isinstance(fragments, list):
                     for fragment in fragments:
