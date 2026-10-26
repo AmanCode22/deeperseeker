@@ -22,7 +22,7 @@ click==8.5.0
     # via uvicorn
 deepseek-tokenizer==0.3.0
     # via -r requirements.in
-fastapi==0.143.2
+fastapi==0.161.1
     # via -r requirements.in
 frozenlist==1.8.0
     # via
