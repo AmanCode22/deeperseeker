@@ -70,8 +70,6 @@ packaging==26.3
     #   build
     #   pytest
     #   wheel
-pip==26.2.1
-    # via pip-tools
 pip-tools==7.6.2
     # via -r requirements-dev.in
 playwright==1.64.0
@@ -106,8 +104,6 @@ python-multipart==0.0.32
     # via -r requirements.in
 ruff==0.17.1
     # via -r requirements-dev.in
-setuptools==84.2.0
-    # via pip-tools
 starlette==1.7.0
     # via fastapi
 typing-extensions==4.16.0
@@ -125,7 +121,7 @@ typing-inspection==0.4.4
     #   pydantic
 uvicorn==0.54.0
     # via -r requirements.in
-wasmtime==49.0.0
+wasmtime==50.0.1
     # via -r requirements.in
 wheel==0.48.0
     # via pip-tools
