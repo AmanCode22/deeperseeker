@@ -70,11 +70,9 @@ packaging==26.3
     #   build
     #   pytest
     #   wheel
-pip==26.2.1
-    # via pip-tools
 pip-tools==7.6.2
     # via -r requirements-dev.in
-playwright==1.64.0
+playwright==1.64.1
     # via -r requirements-waf-backup.in
 pluggy==1.6.0
     # via pytest
@@ -106,8 +104,6 @@ python-multipart==0.0.32
     # via -r requirements.in
 ruff==0.17.1
     # via -r requirements-dev.in
-setuptools==84.1.0
-    # via pip-tools
 starlette==1.7.0
     # via fastapi
 typing-extensions==4.16.0
