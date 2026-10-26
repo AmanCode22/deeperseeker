@@ -257,3 +257,59 @@ def test_bare_invoke_without_name_is_inferred():
         ]
     finally:
         request_tools.reset(token)
+
+
+# 2026-10-25 regression: the model degenerates and emits DSML markers with a
+# stray char between the fullwidth bars (e.g. "<｜触｜DSML｜｜ calls>") or floods
+# bare "</｜｜DSML｜｜>" closers. These evade the structured DSML regexes, so a
+# catch-all strips any <...> token containing a fullwidth pipe (U+FF5C). ASCII
+# '|' is deliberately NOT matched.
+CORRUPT = "<｜触｜DSML｜｜ calls>"  # stray CJK char between the bars
+
+
+def test_corrupted_dsml_marker_stripped_from_prose():
+    tools, clean = parse_tools(f"Hallo {CORRUPT}Welt</｜｜DSML｜｜>")
+    assert tools == []
+    assert "｜" not in clean and "DSML" not in clean
+    assert "Hallo" in clean and "Welt" in clean
+
+
+def test_corrupted_dsml_marker_not_streamed_as_text():
+    p = StreamToolParser()
+    out = p.feed(f"Probing.{CORRUPT}done") + p.flush()
+    text = "".join(o.get("text", "") for o in out)
+    assert "｜" not in text and "DSML" not in text
+    assert "Probing." in text and "done" in text
+
+
+def test_corrupted_dsml_marker_split_across_chunks_not_leaked():
+    s = f"ok {CORRUPT} end"
+    p = StreamToolParser()
+    out = []
+    for i in range(0, len(s), 3):
+        out += p.feed(s[i : i + 3])
+    out += p.flush()
+    text = "".join(o.get("text", "") for o in out)
+    assert "｜" not in text and "DSML" not in text and "触" not in text
+    assert "ok" in text and "end" in text
+
+
+def test_ascii_pipe_preserved_in_prose():
+    _, clean = parse_tools("run: grep -E 'disabled|enable' file | sort")
+    assert "disabled|enable" in clean and "| sort" in clean
+
+
+def test_corrupted_dsml_marker_stripped_from_tool_arg():
+    # The corrupted closer must not survive inside a tool-call argument value
+    # (e.g. a file path), or the tool call fails with a bogus path.
+    from functions import normalize_tool_call
+    call = normalize_tool_call("Edit", {"file_path": "shell/core/Theme.qml</｜｜DSML｜｜ >"})
+    args = json.loads(call["function"]["arguments"])
+    assert args["file_path"] == "shell/core/Theme.qml", args
+
+
+def test_ascii_pipe_preserved_in_tool_arg():
+    from functions import normalize_tool_call
+    call = normalize_tool_call("Bash", {"command": "grep -E 'a|b' f | sort"})
+    args = json.loads(call["function"]["arguments"])
+    assert args["command"] == "grep -E 'a|b' f | sort", args
