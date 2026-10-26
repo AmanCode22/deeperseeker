@@ -106,7 +106,7 @@ python-multipart==0.0.32
     # via -r requirements.in
 ruff==0.17.1
     # via -r requirements-dev.in
-setuptools==84.2.0
+setuptools==84.1.0
     # via pip-tools
 starlette==1.7.0
     # via fastapi
