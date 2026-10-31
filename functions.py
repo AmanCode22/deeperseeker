@@ -333,6 +333,40 @@ class UpstreamError(Exception):
         super().__init__(f"HTTP {self.status}: {self.body}")
 
 
+class UpstreamBizError(UpstreamError):
+    """HTTP 200 whose envelope carries a business-level error.
+
+    DeepSeek answers several endpoints with 200 + `{"code": N, "data": null}`
+    (or `data.biz_data: null`) when the account is flagged, its web session
+    was killed, or the per-account "messages too frequent" wall is hit. The
+    old code indexed straight into biz_data and died with
+    `'NoneType' object is not subscriptable`, which is not an UpstreamError —
+    so the token never rotated and the dead account stayed pinned forever.
+
+    Subclassing UpstreamError means `_upstream_http_code()` already reads
+    `.status`, and handle_chat's rotation path (401/403/429) picks it up with
+    no changes there.
+    """
+
+
+def _biz_data(payload, what="response"):
+    """Return `payload["data"]["biz_data"]` or raise UpstreamBizError.
+
+    Auth-shaped business messages map to 401 so the token is quarantined /
+    rotated; everything else maps to 429 so it cools down and rotates. Both
+    are statuses handle_chat already understands.
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    biz = data.get("biz_data") if isinstance(data, dict) else None
+    if biz:
+        return biz
+    payload = payload if isinstance(payload, dict) else {}
+    code = payload.get("code")
+    msg = payload.get("msg") or payload.get("message") or "empty biz_data"
+    status = 401 if re.search(r"login|auth|token|session|expire", str(msg), re.I) else 429
+    raise UpstreamBizError(status, f"{what}: code={code} msg={msg}")
+
+
 def _read_cookie_file():
     """Return valid (unexpired) cookies, or None."""
     try:
@@ -1995,7 +2029,7 @@ async def create_challange_pow(target_path, auth_token):
     )
     async with response:
         data = await response.json()
-    return data["data"]["biz_data"]["challenge"]
+    return _biz_data(data, "chat/create_pow_challenge")["challenge"]
 
 
 def write_string_pow(text, alloc_func, memory, store):
@@ -2039,7 +2073,7 @@ async def create_new_chat(auth_token):
     )
     async with response:
         data = await response.json()
-    return data["data"]["biz_data"]["chat_session"]["id"]
+    return _biz_data(data, "chat_session/create")["chat_session"]["id"]
 
 
 _EMPTY_SSE_DEFAULT = (
@@ -2452,9 +2486,9 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
     )
     async with response:
         resp_json = await response.json()
-    file_id = resp_json["data"]["biz_data"]["id"]
+    js_data = _biz_data(resp_json, "file/upload_file")
+    file_id = js_data["id"]
     yield ("uploaded", file_id)
-    js_data = resp_json["data"]["biz_data"]
     status = js_data["status"]
     headers = get_headers(auth_token)
     deadline = time.time() + 300
@@ -2467,7 +2501,7 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
             # cookies=cookie,  # Backup WAF fallback
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
-            js_data = (await resp.json())["data"]["biz_data"]["files"][0]
+            js_data = _biz_data(await resp.json(), "file/fetch_files")["files"][0]
         status = js_data["status"]
     if status == "SUCCESS":
         tp_data = datetime.fromtimestamp(js_data["updated_at"], UTC)
@@ -2496,7 +2530,7 @@ async def get_file_content(auth_token, file_id):
         timeout=aiohttp.ClientTimeout(total=30),
     ) as resp:
         resp_json = await resp.json()
-    js_data = resp_json["data"]["biz_data"]["files"][0]
+    js_data = _biz_data(resp_json, "file/fetch_files")["files"][0]
     yield mimetypes.guess_type(js_data["file_name"])[0]
     deadline = time.time() + 60
     while (
@@ -2511,7 +2545,7 @@ async def get_file_content(auth_token, file_id):
             # cookies=cookie,  # Backup WAF fallback
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
-            js_data = (await resp.json())["data"]["biz_data"]["files"][0]
+            js_data = _biz_data(await resp.json(), "file/fetch_files")["files"][0]
     if not js_data.get("signed_path"):
         return
     file_path = "https://files.deepseeksvc.com/api" + js_data["signed_path"] + "&ty=r"
