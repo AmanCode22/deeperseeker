@@ -21,7 +21,6 @@ import aiohttp  # noqa: E402
 import app as app_module  # noqa: E402
 from functions import UpstreamBizError, UpstreamError, _biz_data  # noqa: E402
 
-
 # --------------------------------------------------------------------------
 # count_tokens route
 # --------------------------------------------------------------------------
