@@ -210,6 +210,7 @@ Copy `.env.example` to `.env` and edit your secret values. The table below is th
   - `GET /v1/files/{file_id}/content`
 - **Anthropic Base**: `http://localhost:4000`
   - `POST /v1/messages` (also at `/messages`)
+  - `POST /v1/messages/count_tokens` (also at `/messages/count_tokens`)
   - `POST /v1/files/upload`
 - **Auth Key**: configured in `.env` (`DEEPSEEKER_API_KEY`)
 
