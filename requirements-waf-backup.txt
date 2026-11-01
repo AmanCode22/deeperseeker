@@ -79,7 +79,7 @@ typing-inspection==0.4.4
     #   pydantic
 uvicorn==0.54.0
     # via -r requirements.in
-wasmtime==49.0.0
+wasmtime==50.0.1
     # via -r requirements.in
 yarl==1.25.1
     # via aiohttp
