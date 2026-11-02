@@ -96,7 +96,7 @@ pytest==9.1.1
     # via
     #   -r requirements-tests.in
     #   pytest-asyncio
-pytest-asyncio==1.4.0
+pytest-asyncio==1.4.1
     # via -r requirements-tests.in
 python-dotenv==1.2.4
     # via -r requirements.in
