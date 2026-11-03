@@ -4,9 +4,9 @@ import asyncio
 import json
 
 import pytest
+from test_sse_upstream import _collect_send_message
 
 import functions
-from test_sse_upstream import _collect_send_message
 
 
 def _sse(*events):

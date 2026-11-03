@@ -36,11 +36,6 @@ security = HTTPBasic()
 
 
 from functions import (
-    effort_level,
-    reply_id,
-    request_effort,
-    request_tools,
-    token_busy,
     CookieGenerationError,
     StreamToolParser,
     UpstreamError,
@@ -52,6 +47,7 @@ from functions import (
     data_dir,
     delete_sessions_for_chat,
     delete_token,
+    effort_level,
     find_session,
     get_auth_token,
     get_file_content,
@@ -69,9 +65,13 @@ from functions import (
     pick_token,
     record_file,
     record_usage,
+    reply_id,
+    request_effort,
+    request_tools,
     restore_token,
     save_session,
     send_message,
+    token_busy,
     upload_file,
     usage_by_day_key,
 )
@@ -539,6 +539,45 @@ def _release_chat_lock_stream(gen, owner, slot=None):
     return _wrapped()
 
 
+# Hard ceiling on one upstream turn. The shared ClientSession uses
+# ClientTimeout(total=None, connect=15, sock_read=600), and sock_read resets on
+# every keepalive byte — a slowly-dripping upstream never trips it, so a single
+# request could hang until the client gave up (the access log has 19.7-minute
+# /v1/messages entries). DEADLINE is for the UPSTREAM work only: the SSE
+# generators outlive handle_chat's return, so it is applied inside them and
+# cancelled on exit, never around the route.
+DEADLINE = max(1, int(os.getenv("DEEPSEEKER_REQUEST_DEADLINE", "600")))
+
+
+def _with_deadline(gen, what="upstream", seconds=None):
+    """Cancel `gen` and raise UpstreamError(504) once `seconds` elapse."""
+
+    async def _wrapped():
+        limit = DEADLINE if seconds is None else seconds
+        try:
+            async with asyncio.timeout(limit):
+                async for chunk in gen:
+                    yield chunk
+        except TimeoutError:
+            logger.warning("%s exceeded %ss deadline; cancelled", what, limit)
+            raise UpstreamError(504, f"{what} deadline exceeded ({limit}s)") from None
+
+    return _wrapped()
+
+
+def _is_truncated_stream_error(exc):
+    """True when upstream hung up mid-stream (aiohttp payload/transfer errors).
+
+    These arrive after the SSE headers are already on the wire, so the client
+    sees a dead socket unless the generator emits a terminal error frame first.
+    """
+    import aiohttp
+
+    return isinstance(
+        exc, (aiohttp.ClientPayloadError, aiohttp.ClientError)
+    ) and not isinstance(exc, TimeoutError)
+
+
 def get_current_admin(request: Request):
     sid = request.cookies.get("session_id")
     if not sid or sid not in SESSIONS or time.time() - SESSIONS[sid] > SESSION_TTL:
@@ -807,6 +846,92 @@ MAX_UPSTREAM_ATTEMPTS = max(1, int(os.getenv("DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS",
 _stream_retry = contextvars.ContextVar("stream_retry", default=None)
 
 
+def _setup_retry_kwargs(
+    messages,
+    model,
+    thinking,
+    search,
+    stream,
+    tools,
+    is_anthropic,
+    req_model,
+    scope,
+    _attempt,
+    _auth_rotated,
+    _context_retried,
+    is_responses,
+    response_opts,
+):
+    """The handle_chat call this attempt would make, as a dict — so a
+    setup-phase failure can hand it back to handle_chat with the attempt
+    budget advanced and the dead token excluded."""
+    return dict(
+        messages=messages,
+        model=model,
+        thinking=thinking,
+        search=search,
+        stream=stream,
+        tools=tools,
+        is_anthropic=is_anthropic,
+        req_model=req_model,
+        scope=scope,
+        _attempt=_attempt,
+        _auth_rotated=_auth_rotated,
+        _context_retried=_context_retried,
+        is_responses=is_responses,
+        response_opts=response_opts,
+    )
+
+
+async def _setup_failure_outcome(e, token_id, retry_kwargs):
+    """Classify a failure that happened while PREPARING a turn, not sending it.
+
+    Preparing means `create_new_chat` / `create_challange_pow` / `upload_file`:
+    the hops that run before `send_message`. Those calls live outside the try
+    that owns token rotation, so an auth failure there (upstream answers HTTP
+    200 with `code=40003 INVALID_TOKEN`, which `_biz_data` turns into
+    `UpstreamBizError(401)`) escaped handle_chat entirely and surfaced as a
+    bare 500 — and, worse, the dead token was never marked, so it kept being
+    picked and every later turn failed the same way.
+
+    Returns the retry_kwargs dict to re-enter handle_chat with, or the terminal
+    response when the budget is spent.
+
+    DELIBERATELY does not call handle_chat itself (it did, and that was the
+    bug): the create-path caller holds `_sig_locks[sig]`, an asyncio.Lock is
+    not reentrant, so the retry blocked forever on the lock it already owned
+    and every request hung until the client gave up. Callers must invoke this,
+    then leave their lock, then retry.
+    """
+    code = _upstream_http_code(e)
+    auth_class = code in (401, 403, 429)
+    if token_id is not None and auth_class:
+        await _db(mark_limited, token_id, code)
+        logger.warning(
+            "Upstream HTTP %s while preparing the turn (token #%s): %s",
+            code,
+            token_id,
+            _redact_secret_material(str(e))[:200],
+        )
+    else:
+        logger.error(
+            "Upstream failure while preparing the turn (token #%s): %s",
+            token_id,
+            _redact_secret_material(str(e))[:300],
+            exc_info=e,
+        )
+    attempt = retry_kwargs.get("_attempt", 0)
+    if attempt + 1 >= MAX_UPSTREAM_ATTEMPTS:
+        return _terminal_error_response(e, retry_kwargs.get("is_anthropic", False))
+    retry_kwargs["_attempt"] = attempt + 1
+    retry_kwargs["_auth_rotated"] = bool(
+        retry_kwargs.get("_auth_rotated")
+    ) or auth_class
+    if token_id is not None:
+        retry_kwargs["_exclude_token"] = token_id
+    return retry_kwargs
+
+
 async def handle_chat(
     messages,
     model,
@@ -936,14 +1061,17 @@ async def handle_chat(
                         for fid in file_ids:
                             await _db(record_file, fid, new_token_id)
                         reply_id.set(None)
-                        gen = send_message(
-                            new_session_id,
-                            new_tok["token"],
-                            prompt,
-                            0,
-                            thinking,
-                            search,
-                            file_ids,
+                        gen = _with_deadline(
+                            send_message(
+                                new_session_id,
+                                new_tok["token"],
+                                prompt,
+                                0,
+                                thinking,
+                                search,
+                                file_ids,
+                            ),
+                            "upstream stream (rotation)",
                         )
                         gen = await _preflight_stream(gen)
                     except Exception as e:
@@ -1103,6 +1231,7 @@ async def handle_chat(
             )
     else:
         create_lock = _take_lock("sig", _sig_locks, sig, SIG_LOCKS_MAX)
+        setup_retry = None
         async with create_lock:
             sess = await _db(find_session, sig)
             if not sess:
@@ -1147,34 +1276,73 @@ async def handle_chat(
                 # that summary via build_prompt(rollover_summary=...). A single large
                 # first exchange is untouched (the first-message path accepts ~1M
                 # tokens); this only fires for accumulated session context.
-                if _context_retried or needs_rollover(messages, tools):
-                    scratch_chat = await create_new_chat(tok["token"])
-                    summary_gen = send_message(
-                        scratch_chat,
-                        tok["token"],
-                        build_summary_request_prompt(messages),
-                        0,
-                        False,
-                        False,
-                        [],
-                    )
-                    summary = strip_summary_tags(await collect_response(summary_gen))
-                    rollover_summary = summary[
-                        : MAX_SUMMARY_TOKENS * 4
-                    ]  # ~4 chars/token cap
-                    logger.info(
-                        "Context rollover: handoff summary of ~%d tokens prepared in scratch chat %s",
-                        count_tok(rollover_summary),
-                        scratch_chat,
-                    )
+                # The upstream chat is created HERE, before the try that owns
+                # token rotation further down — so an auth failure on this hop
+                # (HTTP 200 + code=40003 INVALID_TOKEN) used to escape as a
+                # bare 500 with the dead token never marked. Route it through
+                # the same classifier the send path uses.
+                try:
+                    if _context_retried or needs_rollover(messages, tools):
+                        scratch_chat = await create_new_chat(tok["token"])
+                        summary_gen = send_message(
+                            scratch_chat,
+                            tok["token"],
+                            build_summary_request_prompt(messages),
+                            0,
+                            False,
+                            False,
+                            [],
+                        )
+                        summary = strip_summary_tags(
+                            await collect_response(summary_gen)
+                        )
+                        rollover_summary = summary[
+                            : MAX_SUMMARY_TOKENS * 4
+                        ]  # ~4 chars/token cap
+                        logger.info(
+                            "Context rollover: handoff summary of ~%d tokens prepared in scratch chat %s",
+                            count_tok(rollover_summary),
+                            scratch_chat,
+                        )
 
-                session_id = await create_new_chat(tok["token"])
-                await _db(save_session, sig, token_id, session_id, 0)
-                parent_message_id = 0
+                    session_id = await create_new_chat(tok["token"])
+                    await _db(save_session, sig, token_id, session_id, 0)
+                    parent_message_id = 0
+                except Exception as e:
+                    # Classify here, RETRY OUTSIDE the lock: the retry
+                    # re-enters handle_chat, which takes this same
+                    # non-reentrant asyncio.Lock — recursing in here hung
+                    # the request instead of rotating (see
+                    # _setup_failure_outcome).
+                    setup_retry = await _setup_failure_outcome(
+                        e,
+                        token_id,
+                        _setup_retry_kwargs(
+                            messages,
+                            model,
+                            thinking,
+                            search,
+                            stream,
+                            tools,
+                            is_anthropic,
+                            req_model,
+                            scope,
+                            _attempt,
+                            _auth_rotated,
+                            _context_retried,
+                            is_responses,
+                            response_opts,
+                        ),
+                    )
             else:
                 token_id = sess["token_id"]
                 session_id = sess["session_id"]
                 parent_message_id = sess["parent_message_id"]
+
+        if setup_retry is not None:
+            if isinstance(setup_retry, dict):
+                return await handle_chat(**setup_retry)
+            return setup_retry
 
     tok = await _db(get_token, token_id)
     if not tok:
@@ -1289,14 +1457,17 @@ async def handle_chat(
         )
 
         reply_id.set(None)
-        gen = send_message(
-            session_id,
-            tok["token"],
-            prompt,
-            parent_message_id,
-            thinking,
-            search,
-            file_ids,
+        gen = _with_deadline(
+            send_message(
+                session_id,
+                tok["token"],
+                prompt,
+                parent_message_id,
+                thinking,
+                search,
+                file_ids,
+            ),
+            "upstream stream",
         )
         gen = await _preflight_stream(gen)
         if stream:
@@ -1674,6 +1845,11 @@ async def stream_response(
             await _db(mark_limited, token_id, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_response upstream HTTP %s: %s", code, e)
+        elif _is_truncated_stream_error(e):
+            # Upstream hung up mid-stream. Log a warning, not a traceback:
+            # nothing here is fixable and the client gets a clean error frame.
+            await _db(delete_sessions_for_chat, token_id, session_id)
+            logger.warning("stream_response upstream stream truncated: %s", e)
         else:
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.exception("stream_response failed")
@@ -1861,6 +2037,9 @@ async def stream_anthropic_response(
             await _db(mark_limited, token_id, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_anthropic_response upstream HTTP %s: %s", code, e)
+        elif _is_truncated_stream_error(e):
+            await _db(delete_sessions_for_chat, token_id, session_id)
+            logger.warning("stream_anthropic_response upstream stream truncated: %s", e)
         else:
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.exception("stream_anthropic_response failed")
@@ -2584,6 +2763,9 @@ async def stream_responses_response(
             await _db(mark_limited, token_id, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_responses_response upstream HTTP %s: %s", code, e)
+        elif _is_truncated_stream_error(e):
+            await _db(delete_sessions_for_chat, token_id, session_id)
+            logger.warning("stream_responses_response upstream stream truncated: %s", e)
         else:
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.exception("stream_responses_response failed")
@@ -3510,6 +3692,33 @@ def convert_anthropic_messages(messages):
         if has_content or not tool_results:
             openai_msgs.append({"role": m.get("role", "user"), "content": content})
     return openai_msgs
+
+
+@app.post("/v1/messages/count_tokens")
+@app.post("/messages/count_tokens")
+async def anthropic_count_tokens(request: Request):
+    """Anthropic-compatible token count.
+
+    The proxy had no such route, so Claude Code's ~16 parallel count probes
+    per turn all 404'd and the client fell back to its own estimates. The
+    count is the DeepSeek tokenizer over the same text the chat path sends:
+    flattened system prompt plus message text. Tools are not counted — that
+    only ever costs a few hundred tokens of estimate error.
+    """
+    if not check_key(request):
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
+    body = await _json_body(request)
+    text = _messages_text(body.get("messages") or [])
+    system = body.get("system")
+    if isinstance(system, list):
+        system = " ".join(
+            c.get("text", "")
+            for c in system
+            if isinstance(c, dict) and c.get("type") == "text"
+        )
+    if system:
+        text = str(system) + "\n" + text
+    return JSONResponse({"input_tokens": count_tok(text)})
 
 
 @app.post("/v1/messages")

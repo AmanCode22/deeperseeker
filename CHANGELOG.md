@@ -4,6 +4,20 @@ All notable user-visible changes. One bullet per change, each citing its PR
 or issue — no citation, no bullet. Dates are the day the change landed on
 main.
 
+## [Unreleased]
+
+### Fixed
+
+- First message of a chat no longer sends `parent_message_id` (upstream began rejecting `0` with biz_code 26 "invalid message id" on 2026-10-31, and edges disagree on whether `null` is accepted). Follow-up turns keep the `parent = previous response id` chain. (PR #92)
+- An upstream failure delivered as `application/json` on the SSE endpoint (as that biz_code 26 was) now names its code and message in the raised error and logs the response content-type with the raw non-SSE body, instead of surfacing as an anonymous empty stream. (PR #92)
+- Upstream business errors (HTTP 200 with `code=40003 INVALID_TOKEN`, "messages too frequent", a killed web session) surface as a typed 401/429 and rotate the token instead of raising `TypeError` inside the route and pinning the dead account forever. The pre-turn create hops (`create_new_chat`, `create_challange_pow`) go through the same classifier, outside the per-signature lock so the retry cannot deadlock. (PR #92)
+- Upstream hang-ups mid-stream log a warning and emit the terminal error frame instead of a traceback and a dead socket. (PR #92)
+- A single upstream turn is bounded by `DEEPSEEKER_REQUEST_DEADLINE` (default 600 s); a slowly-dripping upstream no longer holds a request until the client gives up. (PR #92)
+
+### Added
+
+- `POST /v1/messages/count_tokens` (also at `/messages/count_tokens`) — Claude Code's context probes returned 404 before. (PR #92)
+
 ## [6.0] — 2026-10-21
 
 ### Fixed
