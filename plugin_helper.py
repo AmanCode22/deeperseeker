@@ -184,7 +184,12 @@ TOOL_USE_INSTRUCTIONS = (
     "Rules: close every parameter with </｜｜DSML｜｜parameter> before the next one starts; "
     'string="true" for strings, string="false" for numbers, booleans, arrays and objects (valid JSON); '
     "several invoke blocks may go inside one function_calls block; never put DSML tags inside a value; "
-    "only use tool and parameter names from the tool list."
+    "only use tool and parameter names from the tool list.\n"
+    "CRITICAL: to run a shell command, Python, or ANY code, you MUST use a tool call in the format "
+    "above. NEVER write a command, script, or code block as your normal message text: message text "
+    "is shown to the user as-is and is NOT executed. If your reply would otherwise begin with "
+    "something like 'cd ', 'python3 ', '#!/', a heredoc (<<'EOF'), or a fenced code block, that "
+    "work belongs inside a tool call, not in the message."
 )
 
 
