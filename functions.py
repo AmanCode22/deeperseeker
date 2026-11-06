@@ -333,6 +333,40 @@ class UpstreamError(Exception):
         super().__init__(f"HTTP {self.status}: {self.body}")
 
 
+class UpstreamBizError(UpstreamError):
+    """HTTP 200 whose envelope carries a business-level error.
+
+    DeepSeek answers several endpoints with 200 + `{"code": N, "data": null}`
+    (or `data.biz_data: null`) when the account is flagged, its web session
+    was killed, or the per-account "messages too frequent" wall is hit. The
+    old code indexed straight into biz_data and died with
+    `'NoneType' object is not subscriptable`, which is not an UpstreamError —
+    so the token never rotated and the dead account stayed pinned forever.
+
+    Subclassing UpstreamError means `_upstream_http_code()` already reads
+    `.status`, and handle_chat's rotation path (401/403/429) picks it up with
+    no changes there.
+    """
+
+
+def _biz_data(payload, what="response"):
+    """Return `payload["data"]["biz_data"]` or raise UpstreamBizError.
+
+    Auth-shaped business messages map to 401 so the token is quarantined /
+    rotated; everything else maps to 429 so it cools down and rotates. Both
+    are statuses handle_chat already understands.
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    biz = data.get("biz_data") if isinstance(data, dict) else None
+    if biz:
+        return biz
+    payload = payload if isinstance(payload, dict) else {}
+    code = payload.get("code")
+    msg = payload.get("msg") or payload.get("message") or "empty biz_data"
+    status = 401 if re.search(r"login|auth|token|session|expire", str(msg), re.I) else 429
+    raise UpstreamBizError(status, f"{what}: code={code} msg={msg}")
+
+
 def _read_cookie_file():
     """Return valid (unexpired) cookies, or None."""
     try:
@@ -1231,6 +1265,11 @@ def _dsml_params(body):
 # whose tool name the model dropped (a function_calls block without an invoke).
 request_tools = contextvars.ContextVar("request_tools", default=None)
 
+# The id DeepSeek gave the reply of the last send_message in this request (from
+# the first SSE event). Ids are chat-global, so a reply sent from a fork point is
+# not at parent + 2.
+reply_id = contextvars.ContextVar("reply_id", default=None)
+
 
 def _tool_schemas():
     schemas = {}
@@ -1300,6 +1339,18 @@ def effort_level(body):
         if isinstance(c, str) and c.strip():
             return c.strip().lower()
     return None
+
+
+# Structural DSML tag names: a lone wrapper tag is never a call to a tool of
+# that name (unless the client really defines one).
+_DSML_WRAPPER_NAMES = {
+    "function_calls", "function_call", "tool_calls", "tool_call",
+    "calls", "invoke", "parameter", "param",
+}
+
+
+def _is_wrapper_name(name, args):
+    return not args and name.lower() in _DSML_WRAPPER_NAMES and name not in _tool_schemas()
 
 
 def parse_tools(text):
@@ -1402,7 +1453,9 @@ def parse_tools(text):
             flags=re.DOTALL | re.IGNORECASE,
         ).strip()
         clean_text = re.sub(
-            r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)[^>]*>.*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)>|$)",
+            # Also "</…invoke name=…>": the model mixes up open/close for an opener.
+            r"(?:<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)[^>]*>|</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*invoke\s+name\s*=[^>]*>)"
+            r".*?(?:</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(?:invoke|function_call)>|$)",
             "",
             clean_text,
             flags=re.DOTALL | re.IGNORECASE,
@@ -1430,7 +1483,7 @@ def parse_tools(text):
                     args[p_name] = json.loads(p_val)
                 except Exception:
                     args[p_name] = p_val
-            norm = normalize_tool_call(tool_name, args)
+            norm = None if _is_wrapper_name(tool_name, args) else normalize_tool_call(tool_name, args)
             if norm:
                 tools.append(norm)
         if not tools:
@@ -1468,7 +1521,7 @@ def parse_tools(text):
                         r"</?[｜\|]{2}DSML[｜\|]{2}[^>]*>", "", desc_match.group(1)
                     ).strip("\x22\x27() ")
                     args["description"] = clean_desc
-                norm = normalize_tool_call(tool_name, args)
+                norm = None if _is_wrapper_name(tool_name, args) else normalize_tool_call(tool_name, args)
                 if norm:
                     tools.append(norm)
         if tools:
@@ -1668,8 +1721,11 @@ _TOOL_END_TAG_RE = re.compile(
 # "<｜｜DSML｜｜ invoke name=...>". Entry detection cannot rely on plain
 # substring start tags; this regex accepts bars, the DSML marker and the
 # space in any combination.
+# Also enters on "</…invoke name=…>": the model opens an invoke with a closing
+# tag. Only with name=, so a real "</invoke>" closer never opens a block.
 _STREAM_ENTRY_RE = re.compile(
-    r"<[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
+    r"<(?:/(?=[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*invoke\s+name\s*=))?"
+    r"[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
     re.IGNORECASE,
 )
 
@@ -2000,7 +2056,7 @@ async def create_challange_pow(target_path, auth_token):
     )
     async with response:
         data = await response.json()
-    return data["data"]["biz_data"]["challenge"]
+    return _biz_data(data, "chat/create_pow_challenge")["challenge"]
 
 
 def write_string_pow(text, alloc_func, memory, store):
@@ -2044,7 +2100,7 @@ async def create_new_chat(auth_token):
     )
     async with response:
         data = await response.json()
-    return data["data"]["biz_data"]["chat_session"]["id"]
+    return _biz_data(data, "chat_session/create")["chat_session"]["id"]
 
 
 _EMPTY_SSE_DEFAULT = (
@@ -2141,7 +2197,28 @@ def _scan_recent_sse_errors(parsed_events):
     return None
 
 
-def _raise_empty_sse_response(recent_lines, parsed_events):
+def _non_sse_biz_error(non_sse_tail):
+    """Return (code, msg) if the non-SSE body tail holds a JSON error envelope.
+
+    Upstream answers some protocol failures on the SSE endpoint with a plain
+    `application/json` envelope (`{"code":26,"msg":"invalid message id",...}`)
+    instead of an event stream. The parser sees zero `data:` lines and the
+    failure surfaces as an anonymous empty stream; this recovers the reason so
+    the error message says what actually went wrong.
+    """
+    for line in reversed(non_sse_tail or []):
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and (obj.get("code") or obj.get("msg")):
+            return obj.get("code"), obj.get("msg") or obj.get("message")
+    return None, None
+
+
+def _raise_empty_sse_response(
+    recent_lines, parsed_events, resp_ct="", non_sse_tail=None
+):
     err = _scan_recent_sse_errors(parsed_events)
     if err:
         code, msg = err
@@ -2154,10 +2231,18 @@ def _raise_empty_sse_response(recent_lines, parsed_events):
         msg = _EMPTY_SSE_CONTEXT
     else:
         msg = _EMPTY_SSE_DEFAULT
+    # Log the response type and the raw non-SSE body so the next upstream
+    # protocol change is identifiable from one request, not an hour of guessing.
+    tail = non_sse_tail or []
     logger.warning(
-        "DeepSeek SSE ended without assistant output; last events: %s",
+        "DeepSeek SSE ended without assistant output; ct=%s non_sse=%s; last events: %s",
+        resp_ct or "-",
+        (" | ".join(tail[-3:])[:400] or "-"),
         recent_lines[-_SSE_RECENT_LINES:],
     )
+    biz_code, biz_msg = _non_sse_biz_error(tail)
+    if biz_code is not None or biz_msg:
+        raise UpstreamError(502, f"{msg}: code={biz_code} msg={biz_msg}")
     raise UpstreamError(502, msg)
 
 
@@ -2233,8 +2318,6 @@ async def _send_message_unlocked(
 ):
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
-    if parent_message_id == 0:
-        parent_message_id = None
     file_ids = file_ids_ or []
 
     headers = get_headers(
@@ -2242,7 +2325,6 @@ async def _send_message_unlocked(
     )
     json_data = {
         "chat_session_id": chat_id,
-        "parent_message_id": parent_message_id,
         "model_type": DEFAULT_MODEL_TYPE,
         "prompt": message,
         "ref_file_ids": file_ids,
@@ -2251,6 +2333,12 @@ async def _send_message_unlocked(
         "preempt": False,
         "action": None,
     }
+    # Since 2026-10-31 upstream rejects parent_message_id=0 with biz_code 26
+    # "invalid message id", and edges disagree about whether null is tolerated.
+    # Omitting the key on the first turn is the only shape that works on all
+    # of them; later turns still chain off the previous response id.
+    if parent_message_id:
+        json_data["parent_message_id"] = parent_message_id
 
     think_open = False
     got_output = False
@@ -2278,6 +2366,12 @@ async def _send_message_unlocked(
 
         recent_lines = []
         parsed_events = []
+        # Non-SSE body lines (no `data: ` prefix). Upstream answers some
+        # protocol failures with a plain application/json envelope on this
+        # endpoint; keeping the raw lines is what makes those diagnosable.
+        non_sse_tail = []
+        # getattr: response doubles used by tests may not expose headers.
+        resp_ct = (getattr(resp, "headers", None) or {}).get("content-type") or ""
         line_buf = b""
 
         def _check_incomplete():
@@ -2298,6 +2392,11 @@ async def _send_message_unlocked(
                     if op.get("p") == "quasi_status":
                         incomplete = incomplete or op.get("v") == "INCOMPLETE"
                         continue  # a status word, never content
+                    base, sub = data.get("p"), op.get("p")
+                    if base and sub and not sub.startswith(base + "/"):
+                        # Sub-op paths are relative to the BATCH path:
+                        # {"p":"response","o":"BATCH","v":[{"p":"fragments",...}]}
+                        op = {**op, "p": f"{base}/{sub}"}
                     async for chunk in _emit_from_event(op):
                         yield chunk
                 return
@@ -2319,7 +2418,9 @@ async def _send_message_unlocked(
                     yield "\n</think>\n\n"
                 _check_incomplete()
                 if not got_output:
-                    _raise_empty_sse_response(recent_lines, parsed_events)
+                    _raise_empty_sse_response(
+                        recent_lines, parsed_events, resp_ct, non_sse_tail
+                    )
                 raise _SseStreamFinished()
 
             if "v" in data and isinstance(data["v"], dict) and "response" in data["v"]:
@@ -2341,7 +2442,7 @@ async def _send_message_unlocked(
                             yield fragment.get("content", "")
                 return
 
-            if data.get("p") == "response/fragments" and data.get("o") == "APPEND":
+            if data.get("p") == "response/fragments" and data.get("o") in ("APPEND", None):
                 fragments = data.get("v")
                 if isinstance(fragments, list):
                     for fragment in fragments:
@@ -2371,6 +2472,9 @@ async def _send_message_unlocked(
 
         async def _consume_sse_line(decoded_line: str):
             if not decoded_line.startswith("data: "):
+                non_sse_tail.append(_redact_sse_line(decoded_line))
+                if len(non_sse_tail) > _SSE_RECENT_LINES:
+                    del non_sse_tail[0]
                 return
             _remember_sse_line(recent_lines, decoded_line)
             try:
@@ -2381,6 +2485,8 @@ async def _send_message_unlocked(
                 parsed_events.append(data)
                 if len(parsed_events) > _SSE_RECENT_LINES:
                     del parsed_events[0]
+                if "response_message_id" in data:
+                    reply_id.set(data["response_message_id"])
             try:
                 async for chunk in _emit_from_event(data):
                     yield chunk
@@ -2415,7 +2521,9 @@ async def _send_message_unlocked(
             yield "\n</think>\n\n"
         _check_incomplete()
         if not got_output:
-            _raise_empty_sse_response(recent_lines, parsed_events)
+            _raise_empty_sse_response(
+                recent_lines, parsed_events, resp_ct, non_sse_tail
+            )
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):
@@ -2450,9 +2558,9 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
     )
     async with response:
         resp_json = await response.json()
-    file_id = resp_json["data"]["biz_data"]["id"]
+    js_data = _biz_data(resp_json, "file/upload_file")
+    file_id = js_data["id"]
     yield ("uploaded", file_id)
-    js_data = resp_json["data"]["biz_data"]
     status = js_data["status"]
     headers = get_headers(auth_token)
     deadline = time.time() + 300
@@ -2465,7 +2573,7 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
             # cookies=cookie,  # Backup WAF fallback
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
-            js_data = (await resp.json())["data"]["biz_data"]["files"][0]
+            js_data = _biz_data(await resp.json(), "file/fetch_files")["files"][0]
         status = js_data["status"]
     if status == "SUCCESS":
         tp_data = datetime.fromtimestamp(js_data["updated_at"], UTC)
@@ -2494,7 +2602,7 @@ async def get_file_content(auth_token, file_id):
         timeout=aiohttp.ClientTimeout(total=30),
     ) as resp:
         resp_json = await resp.json()
-    js_data = resp_json["data"]["biz_data"]["files"][0]
+    js_data = _biz_data(resp_json, "file/fetch_files")["files"][0]
     yield mimetypes.guess_type(js_data["file_name"])[0]
     deadline = time.time() + 60
     while (
@@ -2509,7 +2617,7 @@ async def get_file_content(auth_token, file_id):
             # cookies=cookie,  # Backup WAF fallback
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
-            js_data = (await resp.json())["data"]["biz_data"]["files"][0]
+            js_data = _biz_data(await resp.json(), "file/fetch_files")["files"][0]
     if not js_data.get("signed_path"):
         return
     file_path = "https://files.deepseeksvc.com/api" + js_data["signed_path"] + "&ty=r"
