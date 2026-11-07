@@ -497,17 +497,17 @@ class UpstreamError(Exception):
     mapping whenever a wording changed. Callers read .status directly; str()
     keeps the familiar 'HTTP <status>: <body>' shape for logs."""
 
-    def __init__(self, status, body=""):
+    def __init__(self, status, body="", retry_after=None):
         self.status = int(status)
         self.body = str(body)
+        self.retry_after = retry_after
         super().__init__(f"HTTP {self.status}: {self.body}")
 
 
 class UpstreamBizError(UpstreamError):
     def __init__(self, status, body, biz_code=None, retry_after=None):
-        super().__init__(status, body)
+        super().__init__(status, body, retry_after=retry_after)
         self.biz_code = biz_code
-        self.retry_after = retry_after
 
 
 def _biz_data(payload, what="response"):
@@ -1094,6 +1094,20 @@ def update_token_credentials(
         conn.execute(f"UPDATE tokens SET {', '.join(updates)} WHERE {clause}", params)
         conn.commit()
     conn.close()
+
+
+def invalidate_token_cookies(token_id_or_token):
+    if not token_id_or_token:
+        return
+    with contextlib.suppress(Exception):
+        conn = get_db()
+        clause = "id = ?" if isinstance(token_id_or_token, int) else "token = ?"
+        conn.execute(
+            f"UPDATE tokens SET cookies = NULL WHERE {clause}",
+            (token_id_or_token,),
+        )
+        conn.commit()
+        conn.close()
 
 
 def get_tokens():
@@ -3082,6 +3096,32 @@ def _find_pow_answer_blocking(challange_data):
     return result if result != 0xFFFFFFFFFFFFFFFF else None
 
 
+async def _safe_json(response, context="upstream", auth_token=None):
+    ct = (getattr(response, "headers", None) or {}).get("Content-Type", "").lower()
+    if response.status == 202 or "text/html" in ct:
+        if auth_token:
+            invalidate_token_cookies(auth_token)
+            asyncio.create_task(get_isolated_cookies_for_token(auth_token))
+        raise UpstreamError(
+            429,
+            f"AWS WAF challenge (HTTP {response.status} text/html) on {context}: refreshing WAF cookie",
+            retry_after=15,
+        )
+    try:
+        return await response.json()
+    except aiohttp.ContentTypeError as e:
+        if auth_token:
+            invalidate_token_cookies(auth_token)
+            asyncio.create_task(get_isolated_cookies_for_token(auth_token))
+        status = getattr(e, "status", response.status) or 502
+        eff_status = 429 if status == 202 else (status if 400 <= status <= 599 else 502)
+        raise UpstreamError(
+            eff_status,
+            f"Upstream returned non-JSON response ({status}) on {context}: {e}",
+            retry_after=15 if eff_status == 429 else None,
+        ) from e
+
+
 async def create_challange_pow(target_path, auth_token):
     cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
     headers = get_headers(auth_token, device_id=device_id)
@@ -3095,7 +3135,7 @@ async def create_challange_pow(target_path, auth_token):
         **kwargs,
     )
     async with response:
-        data = await response.json()
+        data = await _safe_json(response, "create_pow_challenge", auth_token)
     return _biz_data(data, "chat/create_pow_challenge")["challenge"]
 
 
@@ -3141,7 +3181,7 @@ async def create_new_chat(auth_token):
         **kwargs,
     )
     async with response:
-        data = await response.json()
+        data = await _safe_json(response, "chat_session/create", auth_token)
     return _biz_data(data, "chat_session/create")["chat_session"]["id"]
 
 
@@ -3483,6 +3523,15 @@ async def _send_message_unlocked(
         **post_kwargs,
     )
     async with resp:
+        resp_ct = (getattr(resp, "headers", None) or {}).get("content-type") or ""
+        if resp.status == 202 or (resp.status != 200 and "text/html" in str(resp_ct).lower()):
+            invalidate_token_cookies(auth_token)
+            asyncio.create_task(get_isolated_cookies_for_token(auth_token))
+            raise UpstreamError(
+                429,
+                f"AWS WAF challenge (HTTP {resp.status} text/html): refreshing WAF cookie",
+                retry_after=15,
+            )
         if resp.status != 200:
             error_text = await resp.text()
             logger.warning(
@@ -3499,8 +3548,6 @@ async def _send_message_unlocked(
         # protocol failures with a plain application/json envelope on this
         # endpoint; keeping the raw lines is what makes those diagnosable.
         non_sse_tail = []
-        # getattr: response doubles used by tests may not expose headers.
-        resp_ct = (getattr(resp, "headers", None) or {}).get("content-type") or ""
         line_buf = b""
 
         def _check_incomplete():
@@ -3690,7 +3737,7 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         **post_kwargs,
     )
     async with response:
-        resp_json = await response.json()
+        resp_json = await _safe_json(response, "upload_file", auth_token)
     js_data = _biz_data(resp_json, "file/upload_file")
     file_id = js_data["id"]
     yield ("uploaded", file_id)

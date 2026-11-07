@@ -60,6 +60,7 @@ from functions import (
     get_token,
     get_tokens,
     init_db,
+    invalidate_token_cookies,
     is_context_limit_error,
     is_json_object_format,
     json_mode_coerce,
@@ -645,6 +646,12 @@ def _upstream_http_code(exc):
     if biz in (50006, "50006"):
         return 429
     status = getattr(exc, "status", None)
+    if status == 202 or (
+        isinstance(exc, Exception)
+        and "202" in str(exc)
+        and ("mimetype" in str(exc) or "text/html" in str(exc) or "WAF" in str(exc))
+    ):
+        return 429
     if isinstance(status, int) and 400 <= status <= 599:
         return status
     return None
@@ -653,6 +660,8 @@ def _upstream_http_code(exc):
 async def _record_upstream_limit(token_id, exc, code):
     biz = getattr(exc, "biz_code", None)
     retry_after = getattr(exc, "retry_after", None)
+    if "WAF" in str(exc) or "202" in str(exc):
+        await _db(invalidate_token_cookies, token_id)
     if biz == 40303 or code == 40303 or "40303" in str(exc):
         chairman_xi_social_credit_dock_duration = retry_after or 1800
         await _db(
