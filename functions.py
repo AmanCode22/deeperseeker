@@ -134,6 +134,8 @@ def init_db():
         conn.execute("ALTER TABLE tokens ADD COLUMN shumei_id TEXT")
     if "device_id" not in existing_cols:
         conn.execute("ALTER TABLE tokens ADD COLUMN device_id TEXT")
+    if "park_reason" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN park_reason TEXT")
     if "last_used" not in existing_session_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN last_used REAL")
     if "sent_prompt" not in existing_session_cols:
@@ -909,6 +911,121 @@ async def warmup_all_tokens_cookies():
 
 
 
+async def solve_captcha_interactive(token_id: int) -> bool:
+    """Launch a real visible Playwright browser for the given token on chat.deepseek.com.
+
+    Injects the user's auth_token into localStorage and any existing cookies,
+    allowing the operator to solve any Cloudflare/Shumei/Chairman Xi captcha
+    interactively with their mouse. Once the window is closed or captcha is
+    solved, saves the updated cookies and restores the token to ACTIVE.
+    """
+    if async_playwright is None:
+        logger.error("Solve Captcha failed: playwright is not installed")
+        return False
+
+    tok = get_token(token_id)
+    if not tok:
+        logger.error("Solve Captcha failed: token id=%s not found", token_id)
+        return False
+
+    auth_token = tok["token"]
+    launch_kwargs = {
+        "headless": False,
+        "args": [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    }
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(**launch_kwargs)
+            try:
+                ua = get_browser_user_agent()
+                context = await browser.new_context(
+                    user_agent=ua,
+                    viewport={"width": 1280, "height": 840},
+                )
+
+                if tok.get("cookies"):
+                    with contextlib.suppress(Exception):
+                        data = json.loads(tok["cookies"])
+                        c_dict = data.get("cookie") if isinstance(data, dict) else None
+                        if c_dict and isinstance(c_dict, dict):
+                            playwright_cookies = [
+                                {
+                                    "name": k,
+                                    "value": str(v),
+                                    "domain": ".deepseek.com",
+                                    "path": "/",
+                                }
+                                for k, v in c_dict.items()
+                            ]
+                            await context.add_cookies(playwright_cookies)
+
+                await context.add_init_script(f"""
+                    try {{
+                        localStorage.setItem("userToken", JSON.stringify({{"value": {json.dumps(auth_token)}, "__version": "0"}}));
+                    }} catch(e) {{}}
+                """)
+
+                page = await context.new_page()
+                logger.info(
+                    "Solve Captcha: opened visible browser for token #%d on chat.deepseek.com",
+                    token_id,
+                )
+                await page.goto(
+                    "https://chat.deepseek.com/", wait_until="domcontentloaded"
+                )
+
+                deadline = time.time() + 600
+                last_cookies = []
+                while time.time() < deadline:
+                    with contextlib.suppress(Exception):
+                        last_cookies = await context.cookies()
+                    if page.is_closed() or not context.pages:
+                        break
+                    await asyncio.sleep(1.0)
+
+            finally:
+                with contextlib.suppress(Exception):
+                    await browser.close()
+
+            if last_cookies:
+                final_cookies = {}
+                expiry = None
+                for i in last_cookies:
+                    if i.get("name") == "aws-waf-token":
+                        expiry = i.get("expires")
+                    final_cookies[i["name"]] = i["value"]
+                final_cookies["ds_cookie_preference"] = (
+                    "%257B%2522level%2522%253A%2522all%2522%257D"
+                )
+                if not expiry or expiry < 0:
+                    expiry = time.time() + 1800
+                shumei_id = extract_shumei_device_id(final_cookies)
+                dev_id = tok.get("device_id") or str(
+                    uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{auth_token}")
+                )
+                update_token_credentials(
+                    token_id,
+                    cookies={"cookie": final_cookies, "expiry": expiry},
+                    shumei_id=shumei_id,
+                    device_id=dev_id,
+                )
+                logger.info(
+                    "Solve Captcha: updated credentials for token #%d; awaiting operator Restore",
+                    token_id,
+                )
+
+            return True
+    except Exception as e:
+        logger.error("Solve Captcha error for token #%d: %s", token_id, e)
+        return False
+
+
+
 async def get_cookies_safely():
     with contextlib.suppress(Exception):
         return await get_cookies()
@@ -979,7 +1096,7 @@ def update_token_credentials(
 
 def get_tokens():
     conn = get_db()
-    rows = conn.execute("SELECT id, alias, token, status, cookies, shumei_id, device_id FROM tokens").fetchall()
+    rows = conn.execute("SELECT id, alias, token, status, cookies, shumei_id, device_id, park_reason FROM tokens").fetchall()
     conn.close()
     return [{"id": r[0], "alias": r[1], "token": r[2], "status": r[3]} for r in rows]
 
@@ -987,7 +1104,7 @@ def get_tokens():
 def get_token(token_id):
     conn = get_db()
     row = conn.execute(
-        "SELECT id, alias, token, status, cookies, shumei_id, device_id FROM tokens WHERE id = ?", (token_id,)
+        "SELECT id, alias, token, status, cookies, shumei_id, device_id, park_reason FROM tokens WHERE id = ?", (token_id,)
     ).fetchone()
     conn.close()
     if row:
@@ -1102,10 +1219,10 @@ def pick_token(exclude=None):
     for tid, status, until, last_used in rows:
         if status == "QUARANTINED":
             continue  # terminal: only restore_token() puts it back (P0-3)
-        if status == "RATE_LIMITED" and until is not None and until > now:
-            continue  # still cooling down
-        if status == "RATE_LIMITED":
-            recovered.append(tid)  # cooldown expired -> auto-recover below
+        if status in ("RATE_LIMITED", "PARKED") and until is not None and until > now:
+            continue
+        if status in ("RATE_LIMITED", "PARKED"):
+            recovered.append(tid)
         available.append((tid, last_used or 0.0))
 
     pickable = [entry for entry in available if entry[0] not in excluded] or available
@@ -1138,7 +1255,7 @@ def pick_token(exclude=None):
     # already treat "no token" as the not-configured case.
     conn = get_db()
     row = conn.execute(
-        "SELECT id FROM tokens WHERE status != 'QUARANTINED' "
+        "SELECT id FROM tokens WHERE status NOT IN ('QUARANTINED', 'PARKED') "
         "ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
     ).fetchone()
     conn.close()
@@ -1165,6 +1282,37 @@ def mark_quarantined(token_id, reason):
     conn.close()
 
 
+def mark_parked(token_id, reason, duration=86400):
+    secs = int(duration) if duration and duration > 0 else 86400
+    secs = min(secs, 7 * 86400)
+    until = time.time() + secs
+    logger.warning(
+        "Token #%d PARKED for %ds (%s)",
+        token_id,
+        secs,
+        reason,
+    )
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = ?, park_reason = ? WHERE id = ?",
+        ("PARKED", until, str(reason or ""), token_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE = (
+    "Account social credit is critically low: Chairman Xi requested captcha verification."
+)
+
+
+def chairman_xi_penalize_social_credit(token_id, penalty_duration=1800):
+    social_credit_dock_seconds = (
+        int(penalty_duration) if penalty_duration and penalty_duration > 0 else 1800
+    )
+    mark_parked(token_id, CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE, social_credit_dock_seconds)
+
+
 def restore_token(token_id):
     """The only exit from quarantine (P0-3): an explicit operator action.
 
@@ -1175,7 +1323,7 @@ def restore_token(token_id):
     conn = get_db()
     conn.execute(
         "UPDATE tokens SET status = ?, rate_limited_until = NULL, "
-        "consecutive_403 = 0 WHERE id = ?",
+        "consecutive_403 = 0, park_reason = NULL WHERE id = ?",
         ("ACTIVE", token_id),
     )
     conn.commit()
@@ -1198,20 +1346,22 @@ def _bump_403_streak(token_id):
     return row[0] if row else 0
 
 
-def mark_limited(token_id, code=None):
-    """Record an upstream failure against a token — the pool's one door.
-
-    Without `code` this is exactly the landed B3 behavior: a RATE_LIMITED
-    cooldown that recovers by itself. With the upstream status (P0-3):
-
-      * 401 -> QUARANTINED immediately. A rejected credential is never
-        transient, and cooling it for 60s just re-arms the same dead account.
-      * 403 -> cooldown as today, plus QUARANTINED once QUARANTINE_AFTER_403
-        consecutive 403s pile up with no successful turn in between.
-      * anything else (429) -> cooldown, as landed.
-    """
-    if code == 401:
-        mark_quarantined(token_id, "upstream 401 (auth rejected)")
+def mark_limited(token_id, code=None, cooldown=None):
+    if code in (401, 40001, 40002, 40003):
+        mark_quarantined(token_id, f"upstream {code} (auth rejected)")
+        return
+    if code in (40012, "40012"):
+        mark_parked(token_id, "upstream 40012 (banned)", 86400)
+        return
+    if code in (40029, "40029"):
+        mark_parked(token_id, "upstream 40029 (ip restricted)", 1800)
+        return
+    if code in (40303, "40303"):
+        chairman_xi_penalize_social_credit(token_id, cooldown or 1800)
+        return
+    if code in (50006, "50006"):
+        secs = int(cooldown) if cooldown and cooldown > 0 else 3600
+        mark_parked(token_id, "upstream 50006 (muted)", secs)
         return
     if code == 403:
         streak = _bump_403_streak(token_id)
@@ -1222,11 +1372,13 @@ def mark_limited(token_id, code=None):
                 f"{streak} consecutive upstream 403s (threshold {threshold})",
             )
             return
-    until = time.time() + TOKEN_COOLDOWN_SECONDS
+    secs = int(cooldown) if cooldown and cooldown > 0 else TOKEN_COOLDOWN_SECONDS
+    secs = min(secs, 7 * 86400)
+    until = time.time() + secs
     logger.warning(
         "Token #%d marked RATE_LIMITED for %ds (recovers automatically)",
         token_id,
-        TOKEN_COOLDOWN_SECONDS,
+        secs,
     )
     conn = get_db()
     conn.execute(
@@ -1248,7 +1400,7 @@ def mark_active(token_id):
     conn = get_db()
     conn.execute(
         "UPDATE tokens SET status = ?, rate_limited_until = NULL, last_used = ?, "
-        "consecutive_403 = 0 WHERE id = ? AND status != 'QUARANTINED'",
+        "consecutive_403 = 0 WHERE id = ? AND status NOT IN ('QUARANTINED', 'PARKED')",
         ("ACTIVE", time.time(), token_id),
     )
     conn.commit()
@@ -1378,17 +1530,38 @@ def get_pool_view():
     now = time.time()
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, alias, status, rate_limited_until, last_used, consecutive_403 "
+        "SELECT id, alias, status, rate_limited_until, last_used, consecutive_403, park_reason "
         "FROM tokens ORDER BY id"
     ).fetchall()
     conn.close()
 
     view = []
-    for tid, alias, status, until, last_used, streak in rows:
+    for tid, alias, status, until, last_used, streak, park_reason in rows:
         streak = streak or 0
+        is_captcha = status == "PARKED" and (
+            "captcha" in str(park_reason or "").lower()
+            or "social credit" in str(park_reason or "").lower()
+            or "chairman xi" in str(park_reason or "").lower()
+            or (until and (until - now) <= 1805 and (until - now) > 0)
+        )
         if status == "QUARANTINED":
             state_class, cooldown = "err", "—"
             note = "quarantined — manual return required"
+        elif status == "PARKED" and until and until > now:
+            state_class = "warn"
+            cooldown = f"{_format_span(until - now)} left"
+            note = (
+                f"parked ({park_reason})"
+                if park_reason
+                else "parked — auto or manual return"
+            )
+        elif status == "PARKED":
+            state_class, cooldown = "warn", "expired"
+            note = (
+                f"parking expired ({park_reason}) — rejoins rotation on next pick"
+                if park_reason
+                else "parking expired — rejoins rotation on next pick"
+            )
         elif status == "RATE_LIMITED" and until and until > now:
             state_class = "warn"
             cooldown = f"{_format_span(until - now)} left"
@@ -1399,7 +1572,7 @@ def get_pool_view():
         else:
             state_class, cooldown = "ok", "—"
             note = "in rotation"
-        if streak and status != "QUARANTINED":
+        if streak and status not in ("QUARANTINED", "PARKED"):
             note = f"{note}, 403 streak {streak}"
         age = "never" if not last_used else f"{_format_span(now - last_used)} ago"
         view.append(
@@ -1412,7 +1585,9 @@ def get_pool_view():
                 "in_flight": _in_flight.get(tid, 0),
                 "last_used": age,
                 "cooldown": cooldown,
-                "can_restore": status == "QUARANTINED",
+                "can_restore": status in ("QUARANTINED", "PARKED"),
+                "can_solve_captcha": bool(is_captcha),
+                "park_reason": park_reason or "",
             }
         )
     return view

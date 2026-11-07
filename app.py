@@ -36,11 +36,13 @@ security = HTTPBasic()
 
 
 from functions import (
+    CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE,
     CookieGenerationError,
     StreamToolParser,
     UpstreamError,
     acquire_token_slot,
     add_token,
+    chairman_xi_penalize_social_credit,
     close_session,
     cookie_file_path,
     create_new_chat,
@@ -72,6 +74,7 @@ from functions import (
     restore_token,
     save_session,
     send_message,
+    solve_captcha_interactive,
     token_busy,
     upload_file,
     usage_by_day_key,
@@ -624,10 +627,37 @@ def _upstream_http_code(exc):
     502. The old str(e) regex parsing of the 'HTTP (\\d{3}):' prefix is gone —
     any upstream wording change could silently disable token rotation and
     rate-limit marking."""
+    biz = getattr(exc, "biz_code", None)
+    if biz in (40002, 40003, "40002", "40003"):
+        return 401
+    if biz in (40012, 40029, 40303, "40012", "40029", "40303") or "40303" in str(
+        exc
+    ):
+        return 403
+    if biz in (50006, "50006"):
+        return 429
     status = getattr(exc, "status", None)
     if isinstance(status, int) and 400 <= status <= 599:
         return status
     return None
+
+
+async def _record_upstream_limit(token_id, exc, code):
+    biz = getattr(exc, "biz_code", None)
+    retry_after = getattr(exc, "retry_after", None)
+    if biz == 40303 or code == 40303 or "40303" in str(exc):
+        chairman_xi_social_credit_dock_duration = retry_after or 1800
+        await _db(
+            chairman_xi_penalize_social_credit,
+            token_id,
+            chairman_xi_social_credit_dock_duration,
+        )
+        return
+    eff_code = biz if biz in (40012, 40029, 50006) else code
+    if retry_after:
+        await _db(mark_limited, token_id, eff_code, retry_after)
+    else:
+        await _db(mark_limited, token_id, eff_code)
 
 
 def _api_error_response(e, is_anthropic=False):
@@ -639,6 +669,9 @@ def _api_error_response(e, is_anthropic=False):
     # P0-7: official-mode error bodies carry upstream text too — every
     # client-visible error body passes the secret scrub, one discipline.
     message = _redact_secret_material(str(e)[:500])
+    if getattr(e, "biz_code", None) == 40303 or "40303" in str(e):
+        chairman_xi_decree = CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE
+        message = chairman_xi_decree
     if is_anthropic:
         payload = {
             "type": "error",
@@ -689,6 +722,9 @@ def _terminal_error_response(e, is_anthropic=False):
     if trace == "-":
         trace = uuid.uuid4().hex  # direct invocation path (tests, scripts)
     message = _redact_secret_material(str(e)[:500])
+    if getattr(e, "biz_code", None) == 40303 or "40303" in str(e):
+        chairman_xi_decree = CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE
+        message = chairman_xi_decree
     if is_anthropic:
         payload = {
             "type": "error",
@@ -916,7 +952,7 @@ async def _setup_failure_outcome(e, token_id, retry_kwargs):
     code = _upstream_http_code(e)
     auth_class = code in (401, 403, 429)
     if token_id is not None and auth_class:
-        await _db(mark_limited, token_id, code)
+        await _record_upstream_limit(token_id, e, code)
         logger.warning(
             "Upstream HTTP %s while preparing the turn (token #%s): %s",
             code,
@@ -1599,7 +1635,7 @@ async def handle_chat(
     except Exception as e:
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id, code)
+            await _record_upstream_limit(token_id, e, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             if not _auth_rotated:
                 new_token_id = await _db(pick_token)
@@ -1852,7 +1888,7 @@ async def stream_response(
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id, code)
+            await _record_upstream_limit(token_id, e, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_response upstream HTTP %s: %s", code, e)
         elif _is_truncated_stream_error(e):
@@ -2044,7 +2080,7 @@ async def stream_anthropic_response(
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id, code)
+            await _record_upstream_limit(token_id, e, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_anthropic_response upstream HTTP %s: %s", code, e)
         elif _is_truncated_stream_error(e):
@@ -2770,7 +2806,7 @@ async def stream_responses_response(
         failed = True
         code = _upstream_http_code(e)
         if code in (401, 403, 429):
-            await _db(mark_limited, token_id, code)
+            await _record_upstream_limit(token_id, e, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.warning("stream_responses_response upstream HTTP %s: %s", code, e)
         elif _is_truncated_stream_error(e):
@@ -4151,6 +4187,18 @@ async def tokens_delete(token_id: int, request: Request):
     await _db(delete_token, token_id)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
+
+@app.post("/tokens/{token_id}/solve_captcha")
+async def tokens_solve_captcha(token_id: int, request: Request):
+    """Launch real visible Playwright browser to solve captcha on chat.deepseek.com for this account."""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    tok = await _db(get_token, token_id)
+    if tok:
+        asyncio.create_task(solve_captcha_interactive(token_id))
+    return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 @app.post("/tokens/{token_id}/restore")
 async def tokens_restore(token_id: int, request: Request):
