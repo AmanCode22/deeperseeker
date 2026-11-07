@@ -120,6 +120,18 @@ def test_biz_data_null_biz_data_maps_non_auth_to_429():
         raise AssertionError("expected UpstreamBizError")
 
 
+def test_biz_data_40029_maps_to_429():
+    payload = {"code": 40029, "msg": "TOO_MANY_REQUESTS", "data": None}
+    try:
+        _biz_data(payload, "file/fetch_files")
+    except UpstreamBizError as e:
+        assert e.status == 429, e.status
+        assert e.biz_code == 40029
+        assert app_module._upstream_http_code(e) == 429
+    else:
+        raise AssertionError("expected UpstreamBizError")
+
+
 def test_biz_data_non_dict_payload_is_an_error_not_a_crash():
     for payload in (None, [], "oops", 0):
         try:
@@ -232,6 +244,7 @@ TESTS = [
     test_biz_data_returns_biz_data_when_present,
     test_biz_data_null_data_raises_and_maps_auth_to_401,
     test_biz_data_null_biz_data_maps_non_auth_to_429,
+    test_biz_data_40029_maps_to_429,
     test_biz_data_non_dict_payload_is_an_error_not_a_crash,
     test_upstream_biz_error_status_is_seen_by_the_rotation_path,
     test_with_deadline_passes_chunks_through_unchanged,

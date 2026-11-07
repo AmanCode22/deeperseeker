@@ -639,11 +639,11 @@ def _upstream_http_code(exc):
     biz = getattr(exc, "biz_code", None)
     if biz in (40002, 40003, "40002", "40003"):
         return 401
-    if biz in (40012, 40029, 40303, "40012", "40029", "40303") or "40303" in str(
+    if biz in (40012, 40303, "40012", "40303") or "40303" in str(
         exc
     ):
         return 403
-    if biz in (50006, "50006"):
+    if biz in (40029, 50006, "40029", "50006"):
         return 429
     status = getattr(exc, "status", None)
     if status == 202 or (
@@ -1693,7 +1693,7 @@ async def handle_chat(
             await _record_upstream_limit(token_id, e, code)
             await _db(delete_sessions_for_chat, token_id, session_id)
             if not _auth_rotated:
-                new_token_id = await _db(pick_token)
+                new_token_id = await _db(pick_token, exclude={token_id})
                 if new_token_id and new_token_id != token_id:
                     logger.warning(
                         "Upstream HTTP %s on token #%s (session %s); rotating to token #%s",

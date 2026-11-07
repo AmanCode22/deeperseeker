@@ -529,7 +529,7 @@ def _biz_data(payload, what="response"):
         40002: 401,
         40003: 401,
         40012: 403,
-        40029: 403,
+        40029: 429,
         40303: 403,
         50006: 429,
         40006: 502,
@@ -537,10 +537,12 @@ def _biz_data(payload, what="response"):
     retry_after = None
     if code == 40012:
         retry_after = 86400
-    elif code in (40029, 40303):
+    elif code == 40303:
         retry_after = 1800
     elif code == 50006:
         retry_after = 3600
+    elif code == 40029:
+        retry_after = TOKEN_COOLDOWN_SECONDS
 
     if code in code_map:
         status = code_map[code]
@@ -1303,10 +1305,19 @@ def pick_token(exclude=None):
     # pool of nothing but dead credentials this returns None, and the callers
     # already treat "no token" as the not-configured case.
     conn = get_db()
-    row = conn.execute(
-        "SELECT id FROM tokens WHERE status NOT IN ('QUARANTINED', 'PARKED') "
-        "ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
-    ).fetchone()
+    row = None
+    if excluded:
+        placeholders = ",".join("?" for _ in excluded)
+        row = conn.execute(
+            f"SELECT id FROM tokens WHERE status NOT IN ('QUARANTINED', 'PARKED') AND id NOT IN ({placeholders}) "
+            "ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1",
+            list(excluded),
+        ).fetchone()
+    if not row:
+        row = conn.execute(
+            "SELECT id FROM tokens WHERE status NOT IN ('QUARANTINED', 'PARKED') "
+            "ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
+        ).fetchone()
     conn.close()
     return row[0] if row else None
 
@@ -1401,9 +1412,6 @@ def mark_limited(token_id, code=None, cooldown=None):
         return
     if code in (40012, "40012"):
         mark_parked(token_id, "upstream 40012 (banned)", 86400)
-        return
-    if code in (40029, "40029"):
-        mark_parked(token_id, "upstream 40029 (ip restricted)", 1800)
         return
     if code in (40303, "40303"):
         chairman_xi_penalize_social_credit(token_id, cooldown or 1800)
@@ -1669,7 +1677,7 @@ async def probe_token(auth_token: str) -> dict:
                 if code == 40012:
                     return {"status": "banned", "code": code, "msg": js.get("msg") or "user banned"}
                 if code == 40029:
-                    return {"status": "ip_restricted", "code": code, "msg": js.get("msg") or "ip restricted"}
+                    return {"status": "rate_limited", "code": code, "msg": js.get("msg") or "too many requests"}
                 if code == 40303:
                     return {
                         "status": "challenge_required",
@@ -3368,7 +3376,7 @@ def _raise_empty_sse_response(
             40002: 401,
             40003: 401,
             40012: 403,
-            40029: 403,
+            40029: 429,
             40303: 403,
             50006: 429,
             40006: 502,
@@ -3376,10 +3384,12 @@ def _raise_empty_sse_response(
         retry_after = None
         if biz_code in (40012, "40012"):
             retry_after = 86400
-        elif biz_code in (40029, "40029", 40303, "40303"):
+        elif biz_code in (40303, "40303"):
             retry_after = 1800
         elif biz_code in (50006, "50006"):
             retry_after = 3600
+        elif biz_code in (40029, "40029"):
+            retry_after = TOKEN_COOLDOWN_SECONDS
         status = code_map.get(
             biz_code, 403 if str(biz_code).startswith("403") else 502
         )
