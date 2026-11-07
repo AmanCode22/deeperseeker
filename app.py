@@ -52,6 +52,7 @@ from functions import (
     get_auth_token,
     get_file_content,
     get_file_token,
+    get_isolated_cookies_for_token,
     get_pool_view,
     get_token,
     get_tokens,
@@ -74,6 +75,7 @@ from functions import (
     token_busy,
     upload_file,
     usage_by_day_key,
+    warmup_all_tokens_cookies,
 )
 
 
@@ -337,10 +339,18 @@ async def _db(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
+async def _warmup_cookies_startup():
+    try:
+        await warmup_all_tokens_cookies()
+    except Exception as e:
+        logger.warning("Startup cookie warmup error: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await _db(init_db)
     _install_key_access_formatter()
+    asyncio.create_task(_warmup_cookies_startup())
     yield
     # Stage 1 minor list: release the shared aiohttp ClientSession so shutdown
     # does not leak its connector sockets.
@@ -4126,7 +4136,9 @@ async def tokens_add(request: Request):
     auth_token = form.get("auth_token", "").strip().strip("'\"")
     alias = form.get("alias", "").strip() or None
     if auth_token:
-        await _db(add_token, auth_token, alias)
+        tok_id = await _db(add_token, auth_token, alias)
+        if tok_id and auth_token:
+            asyncio.create_task(get_isolated_cookies_for_token(auth_token))
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 
@@ -4167,8 +4179,7 @@ async def health(request: Request):
         cookies_valid = bool(exp and exp > time.time())
     except Exception:
         cookies_valid = False
-    # WAF cookies are deprecated in favor of Android headers (which do not require cookies).
-    # Token presence determines service readiness; cookie status is kept for backup visibility.
+    # Token presence determines service readiness; cookie status is kept for visibility.
     ok = active > 0
     # P0-9 contract (PR #62 review fix, Low): an unauthenticated deep request
     # is refused with 401 BEFORE any upstream traffic — the shallow check

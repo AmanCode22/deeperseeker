@@ -11,6 +11,8 @@ import re
 import sqlite3
 import string
 import time
+import urllib.parse
+import uuid
 from datetime import UTC, datetime
 
 import aiohttp
@@ -126,8 +128,16 @@ def init_db():
     existing_session_cols = {
         row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
     }
+    if "cookies" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN cookies TEXT")
+    if "shumei_id" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN shumei_id TEXT")
+    if "device_id" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN device_id TEXT")
     if "last_used" not in existing_session_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN last_used REAL")
+    if "sent_prompt" not in existing_session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN sent_prompt TEXT")
     # P0-6 (Day 29): usage stats — one row per COMPLETED turn (client-visible
     # success), aggregated per day x per masked key at read time. Keeping raw
     # rows instead of pre-aggregated counters makes the numbers auditable and
@@ -268,42 +278,200 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
     )
 
 
-# B11 (Stage 1 audit): the Android client identity used to be hardcoded to one
-# version for ALL tokens — when DeepSeek's app moves, a single stale string
-# degrades every account simultaneously, and identical fingerprints correlate
-# bans. The version is env-configurable now; per-token identity profiles
-# (rotating UA/version/locale) remain a P1.
-DEEPSEEKER_CLIENT_VERSION = os.getenv("DEEPSEEKER_CLIENT_VERSION", "2.4.5")
+# Desktop Chrome client identity sent as x-client-version (B11); bump it when
+# DeepSeek's web frontend updates.
+DEEPSEEKER_CLIENT_VERSION = os.getenv("DEEPSEEKER_CLIENT_VERSION", "2.7.1")
+DEEPSEEKER_CLIENT_LOCALE = os.getenv("DEEPSEEKER_CLIENT_LOCALE", "ru")
+DEEPSEEKER_BROWSER_PLATFORM_DEFAULT = "Linux"
+DEEPSEEKER_BROWSER_UA_DEFAULT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/157.0.0.0 Safari/537.36"
+)
 
 
-def get_headers(auth_token, pow=None):
+def get_browser_user_agent(platform_name: str | None = None) -> str:
+    ua_env = os.getenv("DEEPSEEKER_BROWSER_USER_AGENT")
+    if ua_env:
+        return ua_env
+    plat = platform_name or os.getenv(
+        "DEEPSEEKER_BROWSER_PLATFORM", DEEPSEEKER_BROWSER_PLATFORM_DEFAULT
+    )
+    plat_lower = str(plat).strip().lower()
+    if plat_lower == "windows":
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/157.0.0.0 Safari/537.36"
+        )
+    if plat_lower in ("macos", "darwin", "macintosh"):
+        return (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/157.0.0.0 Safari/537.36"
+        )
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/157.0.0.0 Safari/537.36"
+    )
+
+
+def extract_shumei_device_id(cookies: dict | None) -> str | None:
+    if not cookies or not isinstance(cookies, dict):
+        return os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID")
+    for k, v in cookies.items():
+        if k.startswith(".thumbcache_") and v:
+            unquoted = urllib.parse.unquote(str(v))
+            return unquoted if unquoted.startswith("B") else f"B{unquoted}"
+    return os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID")
+
+
+def is_browser_profile(*args, **kwargs) -> bool:
+    return True
+
+
+def resolve_client_profile(*args, **kwargs) -> str:
+    return "browser"
+
+
+def get_headers(auth_token, pow=None, *args, **kwargs):
+    browser_platform = os.getenv(
+        "DEEPSEEKER_BROWSER_PLATFORM", DEEPSEEKER_BROWSER_PLATFORM_DEFAULT
+    )
+    browser_ua = get_browser_user_agent(browser_platform)
+    locale = os.getenv("DEEPSEEKER_CLIENT_LOCALE", DEEPSEEKER_CLIENT_LOCALE)
+    client_version = os.getenv("DEEPSEEKER_CLIENT_VERSION", DEEPSEEKER_CLIENT_VERSION)
     headers = {
         "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
+        "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         "content-type": "application/json",
         "origin": "https://chat.deepseek.com",
         "referer": "https://chat.deepseek.com/",
-        "user-agent": "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 7)",
-        "x-client-platform": "android",
-        "x-client-version": DEEPSEEKER_CLIENT_VERSION,
-        "x-client-locale": "en_US",
+        "user-agent": browser_ua,
+        "sec-ch-ua": '"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": f'"{browser_platform}"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
         "x-client-bundle-id": "com.deepseek.chat",
+        "x-client-locale": locale,
+        "x-client-platform": "web",
         "x-client-timezone-offset": _TZ_OFFSET,
+        "x-client-version": client_version,
     }
+    device_id = kwargs.get("device_id")
     if auth_token:
         headers["authorization"] = f"Bearer {auth_token}"
+        headers["x-device-id"] = device_id or str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{auth_token}")
+        )
+        headers["x-device-model"] = ""
     if pow:
         headers["x-ds-pow-response"] = pow
     return headers
 
 
+_HIF_LEIM_URL = os.getenv(
+    "DEEPSEEKER_HIF_URL",
+    os.getenv("DEEPSEEKER_HIF_LEIM_URL", "https://hif-leim.deepseek.com/query"),
+)
+_HIF_DLIQ_URL = os.getenv(
+    "DEEPSEEKER_HIF_DLIQ_URL", "https://hif-dliq.deepseek.com/query"
+)
+_HIF_URL = _HIF_LEIM_URL
+
+_hif_caches = {
+    "leim": {"value": None, "expire_at": 0.0, "retry_at": 0.0},
+    "dliq": {"value": None, "expire_at": 0.0, "retry_at": 0.0},
+}
+_hif_cache = _hif_caches["leim"]
+_hif_locks = {
+    "leim": asyncio.Lock(),
+    "dliq": asyncio.Lock(),
+}
+_hif_lock = _hif_locks["leim"]
+
+
+def _get_hif_attest_headers() -> dict[str, str]:
+    browser_platform = os.getenv(
+        "DEEPSEEKER_BROWSER_PLATFORM", DEEPSEEKER_BROWSER_PLATFORM_DEFAULT
+    )
+    browser_ua = get_browser_user_agent(browser_platform)
+    client_version = os.getenv("DEEPSEEKER_CLIENT_VERSION", DEEPSEEKER_CLIENT_VERSION)
+    return {
+        "accept": "*/*",
+        "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "origin": "https://chat.deepseek.com",
+        "referer": "https://chat.deepseek.com/",
+        "user-agent": browser_ua,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        "x-client-platform": "web",
+        "x-client-version": client_version,
+        "x-client-bundle-id": "com.deepseek.chat",
+    }
+
+
+async def get_hif_token(kind: str = "leim") -> str | None:
+    norm_kind = "dliq" if str(kind).lower() == "dliq" else "leim"
+    url = _HIF_DLIQ_URL if norm_kind == "dliq" else _HIF_LEIM_URL
+    cache = _hif_caches[norm_kind]
+    lock = _hif_locks[norm_kind]
+    now = time.time()
+    if cache["value"] and now < cache["expire_at"]:
+        return cache["value"]
+    if now < cache["retry_at"] and not cache["value"]:
+        return None
+
+    async with lock:
+        now = time.time()
+        if cache["value"] and now < cache["expire_at"]:
+            return cache["value"]
+        if now < cache["retry_at"] and not cache["value"]:
+            return None
+        try:
+            session = await get_session()
+            headers = _get_hif_attest_headers()
+            async with session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=5.0)
+            ) as resp:
+                if resp.status == 200:
+                    ttl_header = resp.headers.get("x-hif-ttl")
+                    ttl = (
+                        float(ttl_header)
+                        if ttl_header and ttl_header.isdigit()
+                        else 600.0
+                    )
+                    js = await resp.json()
+                    val = (
+                        ((js.get("data") or {}).get("biz_data") or {}).get("value")
+                        or (js.get("data") if isinstance(js.get("data"), str) else None)
+                        or (js.get("data") or {}).get("token")
+                        or js.get("token")
+                    )
+                    if val:
+                        cache["value"] = str(val)
+                        cache["expire_at"] = now + max(60.0, ttl - 30.0)
+                        return cache["value"]
+        except Exception:
+            pass
+        cache["retry_at"] = now + 60.0
+        return cache["value"]
+
+
+async def get_hif_dliq_token() -> str | None:
+    return await get_hif_token(kind="dliq")
+
+
 # ==============================================================================
-# BACKUP WAF COOKIE GENERATION (DEPRECATED IN FAVOR OF ANDROID CLIENT HEADERS)
+# WAF & SESSION COOKIE GENERATION
 #
-# DeepSeek's backend does not enforce AWS WAF on requests using Android client
-# headers. The Playwright/Chromium cookie generation below is retained as a backup
-# so that if DeepSeek ever tightens WAF rules in the future, it can easily be
-# re-enabled simply by uncommenting cookies=cookie in API calls.
+# DeepSeek's web frontend enforces AWS WAF and Shumei device fingerprinting.
+# The Playwright/Chromium cookie generation below obtains valid WAF and session
+# cookies so requests replicate an authentic desktop browser.
 # ==============================================================================
 
 _cookie_lock = asyncio.Lock()
@@ -334,41 +502,85 @@ class UpstreamError(Exception):
 
 
 class UpstreamBizError(UpstreamError):
-    """HTTP 200 whose envelope carries a business-level error.
-
-    DeepSeek answers several endpoints with 200 + `{"code": N, "data": null}`
-    (or `data.biz_data: null`) when the account is flagged, its web session
-    was killed, or the per-account "messages too frequent" wall is hit. The
-    old code indexed straight into biz_data and died with
-    `'NoneType' object is not subscriptable`, which is not an UpstreamError —
-    so the token never rotated and the dead account stayed pinned forever.
-
-    Subclassing UpstreamError means `_upstream_http_code()` already reads
-    `.status`, and handle_chat's rotation path (401/403/429) picks it up with
-    no changes there.
-    """
+    def __init__(self, status, body, biz_code=None, retry_after=None):
+        super().__init__(status, body)
+        self.biz_code = biz_code
+        self.retry_after = retry_after
 
 
 def _biz_data(payload, what="response"):
-    """Return `payload["data"]["biz_data"]` or raise UpstreamBizError.
-
-    Auth-shaped business messages map to 401 so the token is quarantined /
-    rotated; everything else maps to 429 so it cools down and rotates. Both
-    are statuses handle_chat already understands.
-    """
     data = payload.get("data") if isinstance(payload, dict) else None
     biz = data.get("biz_data") if isinstance(data, dict) else None
     if biz:
+        if isinstance(biz, dict) and (biz.get("is_muted") == 1 or biz.get("biz_code") == 5):
+            mute_until = biz.get("mute_until") or biz.get("end_at")
+            retry_after = None
+            if mute_until:
+                with contextlib.suppress(Exception):
+                    retry_after = max(1, int(float(mute_until) - time.time()))
+            raise UpstreamBizError(429, f"{what}: account muted until {mute_until}", biz_code=5, retry_after=retry_after)
         return biz
     payload = payload if isinstance(payload, dict) else {}
     code = payload.get("code")
     msg = payload.get("msg") or payload.get("message") or "empty biz_data"
-    status = 401 if re.search(r"login|auth|token|session|expire", str(msg), re.I) else 429
-    raise UpstreamBizError(status, f"{what}: code={code} msg={msg}")
+    code_map = {
+        40002: 401,
+        40003: 401,
+        40012: 403,
+        40029: 403,
+        40303: 403,
+        50006: 429,
+        40006: 502,
+    }
+    retry_after = None
+    if code == 40012:
+        retry_after = 86400
+    elif code in (40029, 40303):
+        retry_after = 1800
+    elif code == 50006:
+        retry_after = 3600
+
+    if code in code_map:
+        status = code_map[code]
+    elif re.search(r"login|auth|token|session|expire", str(msg), re.I):
+        status = 401
+    else:
+        status = 429
+    raise UpstreamBizError(status, f"{what}: code={code} msg={msg}", biz_code=code, retry_after=retry_after)
+
+
+def _parse_cookie_env(val: str) -> dict | None:
+    if not val or not val.strip():
+        return None
+    val = val.strip()
+    if val.startswith("{") and val.endswith("}"):
+        with contextlib.suppress(Exception):
+            parsed = json.loads(val)
+            if isinstance(parsed, dict):
+                return parsed
+    res = {}
+    if ";" in val or "=" in val:
+        for part in val.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if k:
+                    res[k] = v
+        if res:
+            return res
+    return {
+        "aws-waf-token": val,
+        "ds_cookie_preference": "%257B%2522level%2522%253A%2522all%2522%257D",
+    }
 
 
 def _read_cookie_file():
     """Return valid (unexpired) cookies, or None."""
+    env_c = _parse_cookie_env(
+        os.getenv("DEEPSEEKER_WAF_COOKIE") or os.getenv("DEEPSEEK_COOKIE") or ""
+    )
+    if env_c:
+        return env_c
     try:
         with open(cookie_file_path()) as f:
             c = json.load(f)
@@ -455,16 +667,27 @@ async def get_cookies():
         raise CookieGenerationError(_cookie_fail["error"])
 
 
-async def _generate_cookies():
+async def _generate_isolated_cookies_payload():
     if async_playwright is None:
         raise CookieGenerationError("playwright is not installed")
-    launch_kwargs = {"headless": False}
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        launch_kwargs["args"] = ["--no-sandbox"]
+    headless = (
+        os.getenv("DEEPSEEKER_COOKIE_HEADLESS", "true").lower()
+        in ("1", "true", "yes")
+    )
+    launch_kwargs = {
+        "headless": headless,
+        "args": [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ],
+    }
     async with async_playwright() as p:
         browser = await p.chromium.launch(**launch_kwargs)
         try:
-            context = await browser.new_context()
+            ua = get_browser_user_agent()
+            context = await browser.new_context(user_agent=ua)
             page = await context.new_page()
             await page.goto(
                 "https://chat.deepseek.com/",
@@ -472,9 +695,23 @@ async def _generate_cookies():
                 timeout=45000,
             )
             await page.wait_for_selector("body", timeout=30000)
+            cookies = []
+            for _ in range(25):
+                cookies = await context.cookies()
+                if any(c.get("name") == "aws-waf-token" for c in cookies):
+                    break
+                await asyncio.sleep(0.4)
+            ls_shumei = None
             with contextlib.suppress(Exception):
-                await page.wait_for_url("**/sign_in*", timeout=30000)
-            cookies = await context.cookies()
+                ls_shumei = await page.evaluate("""() => {
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const k = localStorage.key(i);
+                        if (k && (k.startsWith('.thumbcache') || k === '_sm_di')) {
+                            return localStorage.getItem(k);
+                        }
+                    }
+                    return null;
+                }""")
         finally:
             await browser.close()
     final_cookies = {}
@@ -488,6 +725,15 @@ async def _generate_cookies():
     )
     if not expiry or expiry < 0:
         expiry = time.time() + 1800
+    shumei_id = extract_shumei_device_id(final_cookies)
+    if not shumei_id and ls_shumei:
+        unquoted = urllib.parse.unquote(str(ls_shumei))
+        shumei_id = unquoted if unquoted.startswith("B") else f"B{unquoted}"
+    return final_cookies, expiry, shumei_id
+
+
+async def _generate_cookies():
+    final_cookies, expiry, _ = await _generate_isolated_cookies_payload()
     target = cookie_file_path()
     target_dir = os.path.dirname(os.path.abspath(target))
     os.makedirs(target_dir, exist_ok=True)
@@ -502,6 +748,173 @@ async def _generate_cookies():
     )
 
 
+_token_cookie_locks = {}
+_token_locks_guard = asyncio.Lock()
+
+
+async def _get_token_lock(auth_token: str) -> asyncio.Lock:
+    async with _token_locks_guard:
+        if auth_token not in _token_cookie_locks:
+            _token_cookie_locks[auth_token] = asyncio.Lock()
+        return _token_cookie_locks[auth_token]
+
+
+async def get_isolated_cookies_for_token(
+    auth_token: str | None = None,
+) -> tuple[dict | None, str | None, str | None]:
+    """Return (cookies_dict, shumei_device_id, device_id) isolated per account.
+
+    Guarantees account isolation: accounts in the pool never share cookies,
+    WAF tokens, Shumei risk control device tokens, or x-device-id headers,
+    preventing multi-account correlation and chain bans.
+    """
+    if not auth_token:
+        c = await get_cookies_safely()
+        return c, extract_shumei_device_id(c), None
+
+    now = time.time()
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, cookies, shumei_id, device_id FROM tokens WHERE token = ?",
+        (auth_token,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        c = await get_cookies_safely()
+        dev_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{auth_token}"))
+        return c, extract_shumei_device_id(c), dev_id
+
+    tid = row["id"]
+    cached_cookies = row["cookies"]
+    shumei_id = row["shumei_id"]
+    dev_id = row["device_id"] or str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{auth_token}")
+    )
+
+    if cached_cookies:
+        try:
+            data = json.loads(cached_cookies)
+            if isinstance(data, dict):
+                expiry = data.get("expiry", 0)
+                c_dict = data.get("cookie")
+                if c_dict and isinstance(c_dict, dict) and expiry - now > 120:
+                    return (
+                        c_dict,
+                        shumei_id or extract_shumei_device_id(c_dict),
+                        dev_id,
+                    )
+        except Exception:
+            pass
+
+    lock = await _get_token_lock(auth_token)
+    async with lock:
+        conn = get_db()
+        row2 = conn.execute(
+            "SELECT id, cookies, shumei_id, device_id FROM tokens WHERE token = ?",
+            (auth_token,),
+        ).fetchone()
+        conn.close()
+        if row2 and row2["cookies"]:
+            try:
+                data = json.loads(row2["cookies"])
+                if isinstance(data, dict):
+                    expiry = data.get("expiry", 0)
+                    c_dict = data.get("cookie")
+                    if c_dict and isinstance(c_dict, dict) and expiry - time.time() > 120:
+                        sh_id = row2["shumei_id"] or extract_shumei_device_id(c_dict)
+                        d_id = row2["device_id"] or dev_id
+                        return c_dict, sh_id, d_id
+            except Exception:
+                pass
+
+        if os.getenv("PYTEST_CURRENT_TEST"):
+            global_c = await get_cookies_safely()
+            return global_c, shumei_id or extract_shumei_device_id(global_c), dev_id
+
+        try:
+            final_cookies, expiry, generated_shumei = (
+                await _generate_isolated_cookies_payload()
+            )
+            resolved_shumei = generated_shumei or shumei_id
+            update_token_credentials(
+                tid,
+                cookies={"cookie": final_cookies, "expiry": expiry},
+                shumei_id=resolved_shumei,
+                device_id=dev_id,
+            )
+            return final_cookies, resolved_shumei, dev_id
+        except Exception as e:
+            logger.warning(
+                "Generating isolated cookies failed for token #%s: %s", tid, e
+            )
+            if row2 and row2["cookies"]:
+                with contextlib.suppress(Exception):
+                    stale_data = json.loads(row2["cookies"])
+                    if isinstance(stale_data, dict) and stale_data.get("cookie"):
+                        return (
+                            stale_data["cookie"],
+                            row2["shumei_id"]
+                            or extract_shumei_device_id(stale_data["cookie"]),
+                            dev_id,
+                        )
+            global_c = await get_cookies_safely()
+            return global_c, shumei_id or extract_shumei_device_id(global_c), dev_id
+
+
+async def warmup_all_tokens_cookies():
+    """Background startup warmup: ensure fallback and active tokens have fresh isolated cookies."""
+    if os.getenv("PYTEST_CURRENT_TEST") or os.getenv(
+        "DEEPSEEKER_DISABLE_WARMUP", ""
+    ).lower() in ("1", "true", "yes"):
+        return
+    if not _read_cookie_file():
+        logger.info("Startup: generating default DeepSeek cookies in background...")
+        with contextlib.suppress(Exception):
+            await get_cookies_safely()
+        logger.info("Startup: default DeepSeek cookies ready.")
+
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, token, cookies FROM tokens WHERE status != 'QUARANTINED'"
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return
+
+    now = time.time()
+    for row in rows:
+        tid = row["id"]
+        token_str = row["token"]
+        cookies_json = row["cookies"]
+        is_valid = False
+        if cookies_json:
+            try:
+                data = json.loads(cookies_json)
+                exp = data.get("expiry", 0)
+                if exp - now > 120 and data.get("cookie"):
+                    is_valid = True
+            except Exception:
+                pass
+        if not is_valid and token_str:
+            logger.info("Startup: generating isolated cookies for token id=%s...", tid)
+            try:
+                await get_isolated_cookies_for_token(token_str)
+                logger.info("Startup: token id=%s isolated cookies ready.", tid)
+            except Exception as e:
+                logger.warning(
+                    "Startup: failed to generate cookies for token id=%s: %s", tid, e
+                )
+
+
+
+async def get_cookies_safely():
+    with contextlib.suppress(Exception):
+        return await get_cookies()
+    return None
+
+
 def get_auth_token():
     conn = get_db()
     row = conn.execute("SELECT token FROM tokens LIMIT 1").fetchone()
@@ -511,7 +924,7 @@ def get_auth_token():
     return None
 
 
-def add_token(token, alias=None):
+def add_token(token, alias=None, cookies=None, shumei_id=None, device_id=None):
     conn = get_db()
     if not conn.execute("SELECT 1 FROM tokens WHERE id = 1").fetchone():
         next_id = 1
@@ -523,17 +936,50 @@ def add_token(token, alias=None):
             WHERE t2.id IS NULL
         """).fetchone()
         next_id = row[0] if row and row[0] else 1
+    if not device_id and token:
+        device_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{token}"))
+    cookies_str = (
+        json.dumps(cookies)
+        if isinstance(cookies, dict)
+        else (cookies if isinstance(cookies, str) else None)
+    )
     conn.execute(
-        "INSERT INTO tokens (id, alias, token, status) VALUES (?, ?, ?, 'ACTIVE')",
-        (next_id, alias, token),
+        "INSERT INTO tokens (id, alias, token, status, cookies, shumei_id, device_id) "
+        "VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?)",
+        (next_id, alias, token, cookies_str, shumei_id, device_id),
     )
     conn.commit()
     conn.close()
 
 
+def update_token_credentials(
+    token_id_or_token, cookies=None, shumei_id=None, device_id=None
+):
+    conn = get_db()
+    clause = "id = ?" if isinstance(token_id_or_token, int) else "token = ?"
+    updates = []
+    params = []
+    if cookies is not None:
+        updates.append("cookies = ?")
+        params.append(
+            json.dumps(cookies) if isinstance(cookies, dict) else str(cookies)
+        )
+    if shumei_id is not None:
+        updates.append("shumei_id = ?")
+        params.append(str(shumei_id))
+    if device_id is not None:
+        updates.append("device_id = ?")
+        params.append(str(device_id))
+    if updates:
+        params.append(token_id_or_token)
+        conn.execute(f"UPDATE tokens SET {', '.join(updates)} WHERE {clause}", params)
+        conn.commit()
+    conn.close()
+
+
 def get_tokens():
     conn = get_db()
-    rows = conn.execute("SELECT id, alias, token, status FROM tokens").fetchall()
+    rows = conn.execute("SELECT id, alias, token, status, cookies, shumei_id, device_id FROM tokens").fetchall()
     conn.close()
     return [{"id": r[0], "alias": r[1], "token": r[2], "status": r[3]} for r in rows]
 
@@ -541,7 +987,7 @@ def get_tokens():
 def get_token(token_id):
     conn = get_db()
     row = conn.execute(
-        "SELECT id, alias, token, status FROM tokens WHERE id = ?", (token_id,)
+        "SELECT id, alias, token, status, cookies, shumei_id, device_id FROM tokens WHERE id = ?", (token_id,)
     ).fetchone()
     conn.close()
     if row:
@@ -2044,15 +2490,16 @@ def _find_pow_answer_blocking(challange_data):
 
 
 async def create_challange_pow(target_path, auth_token):
-    headers = get_headers(auth_token)
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    kwargs = {"timeout": aiohttp.ClientTimeout(total=20)}
+    if cookie:
+        kwargs["cookies"] = cookie
     response = await post_with_failover(
         "/api/v0/chat/create_pow_challenge",
         headers=headers,
         json={"target_path": target_path},
-        # cookies=cookie,  # Backup WAF fallback
-        timeout=aiohttp.ClientTimeout(total=20),
+        **kwargs,
     )
     async with response:
         data = await response.json()
@@ -2089,19 +2536,49 @@ async def solve_create_pow(target_path, auth_token):
 
 
 async def create_new_chat(auth_token):
-    headers = get_headers(auth_token)
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    kwargs = {"timeout": aiohttp.ClientTimeout(total=20)}
+    if cookie:
+        kwargs["cookies"] = cookie
     response = await post_with_failover(
         "/api/v0/chat_session/create",
         headers=headers,
-        # cookies=cookie,  # Backup WAF fallback
-        timeout=aiohttp.ClientTimeout(total=20),
+        json={},
+        **kwargs,
     )
     async with response:
         data = await response.json()
     return _biz_data(data, "chat_session/create")["chat_session"]["id"]
 
+
+def _extract_upstream_message_id(data):
+    if not isinstance(data, dict):
+        return None
+    for k in ("response_message_id", "message_id"):
+        v = data.get(k)
+        if isinstance(v, int) or (isinstance(v, str) and v):
+            return v
+    for parent in ("response", "v"):
+        nested = data.get(parent)
+        if isinstance(nested, dict):
+            for k in ("response_message_id", "message_id"):
+                v = nested.get(k)
+                if isinstance(v, int) or (isinstance(v, str) and v):
+                    return v
+            v_nested = nested.get("response")
+            if isinstance(v_nested, dict):
+                for k in ("response_message_id", "message_id"):
+                    v = v_nested.get(k)
+                    if isinstance(v, int) or (isinstance(v, str) and v):
+                        return v
+    if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
+        for op in data["v"]:
+            if isinstance(op, dict):
+                mid = _extract_upstream_message_id(op)
+                if mid is not None:
+                    return mid
+    return None
 
 _EMPTY_SSE_DEFAULT = (
     "Empty response from DeepSeek (no parseable SSE content): "
@@ -2242,7 +2719,30 @@ def _raise_empty_sse_response(
     )
     biz_code, biz_msg = _non_sse_biz_error(tail)
     if biz_code is not None or biz_msg:
-        raise UpstreamError(502, f"{msg}: code={biz_code} msg={biz_msg}")
+        code_map = {
+            40002: 401,
+            40003: 401,
+            40012: 403,
+            40029: 403,
+                50006: 429,
+            40006: 502,
+        }
+        retry_after = None
+        if biz_code in (40012, "40012"):
+            retry_after = 86400
+        elif biz_code in (40029, "40029", 40303, "40303"):
+            retry_after = 1800
+        elif biz_code in (50006, "50006"):
+            retry_after = 3600
+        status = code_map.get(
+            biz_code, 403 if str(biz_code).startswith("403") else 502
+        )
+        raise UpstreamBizError(
+            status,
+            f"{msg}: code={biz_code} msg={biz_msg}",
+            biz_code=int(biz_code) if str(biz_code).isdigit() else biz_code,
+            retry_after=retry_after,
+        )
     raise UpstreamError(502, msg)
 
 
@@ -2316,13 +2816,29 @@ async def _send_message_unlocked(
     search=False,
     file_ids_=None,
 ):
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    reply_id.set(None)
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
     file_ids = file_ids_ or []
 
-    headers = get_headers(
-        auth_token, await solve_create_pow("/api/v0/chat/completion", auth_token)
+    pow_resp = await solve_create_pow(
+        "/api/v0/chat/completion", auth_token
     )
+    headers = get_headers(auth_token, pow_resp, device_id=device_id)
+    hif_env = os.getenv("DEEPSEEKER_HIF_ENABLED")
+    should_hif = (
+        hif_env.lower() in ("true", "1", "yes")
+        if hif_env is not None
+        else True
+    )
+    if should_hif:
+        hif_leim = await get_hif_token("leim")
+        if hif_leim:
+            headers["x-hif-leim"] = hif_leim
+        hif_dliq = await get_hif_token("dliq")
+        if hif_dliq:
+            headers["x-hif-dliq"] = hif_dliq
+    if chat_id:
+        headers["referer"] = f"https://chat.deepseek.com/a/chat/s/{chat_id}"
     json_data = {
         "chat_session_id": chat_id,
         "model_type": DEFAULT_MODEL_TYPE,
@@ -2340,6 +2856,10 @@ async def _send_message_unlocked(
     if parent_message_id:
         json_data["parent_message_id"] = parent_message_id
 
+    resolved_shumei = shumei_id or extract_shumei_device_id(cookie)
+    if resolved_shumei:
+        json_data["shumei_device_id"] = resolved_shumei
+
     think_open = False
     got_output = False
     # DeepSeek ends a reply it cut short (seen mid-thinking on long contexts) with
@@ -2347,11 +2867,14 @@ async def _send_message_unlocked(
     # finished one: an empty "stop" makes agent clients end the turn.
     incomplete = False
     got_response = False
+    post_kwargs = {}
+    if cookie:
+        post_kwargs["cookies"] = cookie
     resp = await post_with_failover(
         "/api/v0/chat/completion",
         headers=headers,
         json=json_data,
-        # cookies=cookie,  # Backup WAF fallback
+        **post_kwargs,
     )
     async with resp:
         if resp.status != 200:
@@ -2485,8 +3008,9 @@ async def _send_message_unlocked(
                 parsed_events.append(data)
                 if len(parsed_events) > _SSE_RECENT_LINES:
                     del parsed_events[0]
-                if "response_message_id" in data:
-                    reply_id.set(data["response_message_id"])
+                mid = _extract_upstream_message_id(data)
+                if mid is not None:
+                    reply_id.set(mid)
             try:
                 async for chunk in _emit_from_event(data):
                     yield chunk
@@ -2527,11 +3051,12 @@ async def _send_message_unlocked(
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
     session = await get_session()
     file_size = len(file_bytes)
-    pow_response = await solve_create_pow("/api/v0/file/upload_file", auth_token)
+    pow_response = await solve_create_pow(
+        "/api/v0/file/upload_file", auth_token
+    )
     boundary = b"----WebKitFormBoundaryTB0pXOQR2RL219Hu"
     safe_name = re.sub(r"[^ -~]", "_", file_name).replace('"', "_") or "file.bin"
     body_parts = [
@@ -2542,19 +3067,21 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         b"\r\n--" + boundary + b"--\r\n",
     ]
     reconstructed_body = b"".join(body_parts)
-    headers = get_headers(auth_token, pow_response)
+    headers = get_headers(auth_token, pow_response, device_id=device_id)
     headers.update(
         {
             "content-type": f"multipart/form-data; boundary={boundary.decode('utf-8')}",
             "x-file-size": str(file_size),
         }
     )
+    post_kwargs = {"timeout": aiohttp.ClientTimeout(total=120)}
+    if cookie:
+        post_kwargs["cookies"] = cookie
     response = await post_with_failover(
         "/api/v0/file/upload_file",
         data=reconstructed_body,
         headers=headers,
-        # cookies=cookie,  # Backup WAF fallback
-        timeout=aiohttp.ClientTimeout(total=120),
+        **post_kwargs,
     )
     async with response:
         resp_json = await response.json()
@@ -2562,16 +3089,18 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
     file_id = js_data["id"]
     yield ("uploaded", file_id)
     status = js_data["status"]
-    headers = get_headers(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
     deadline = time.time() + 300
     while status in ["PENDING", "PARSING"] and time.time() < deadline:
         yield ("uploaded", file_id)
         await asyncio.sleep(0.3)
+        get_kwargs = {"timeout": aiohttp.ClientTimeout(total=30)}
+        if cookie:
+            get_kwargs["cookies"] = cookie
         async with session.get(
             "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
             headers=headers,
-            # cookies=cookie,  # Backup WAF fallback
-            timeout=aiohttp.ClientTimeout(total=30),
+            **get_kwargs,
         ) as resp:
             js_data = _biz_data(await resp.json(), "file/fetch_files")["files"][0]
         status = js_data["status"]
@@ -2591,15 +3120,16 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
 
 
 async def get_file_content(auth_token, file_id):
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
     session = await get_session()
-    headers = get_headers(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    get_kwargs = {"timeout": aiohttp.ClientTimeout(total=30)}
+    if cookie:
+        get_kwargs["cookies"] = cookie
     async with session.get(
         "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
         headers=headers,
-        # cookies=cookie,  # Backup WAF fallback
-        timeout=aiohttp.ClientTimeout(total=30),
+        **get_kwargs,
     ) as resp:
         resp_json = await resp.json()
     js_data = _biz_data(resp_json, "file/fetch_files")["files"][0]
