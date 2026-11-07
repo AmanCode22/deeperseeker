@@ -22,11 +22,40 @@
     <div class="warning">
         If you logout from DeepSeek in browser, this token stops working.
     </div>
-    <form method="post" action="/tokens/add">
+    <form method="post" action="/tokens/add" id="add-token-form">
         <input type="text" name="alias" placeholder="Alias (optional, e.g. personal, work)" style="width:200px">
-        <input type="text" name="auth_token" placeholder="Paste auth token here (no quotes)" style="width:400px">
+        <input type="text" name="auth_token" id="auth-token-input" placeholder="Paste auth token here (quotes & value: trimmed automatically)" style="width:400px">
         <button type="submit">Add Token</button>
     </form>
+    <script>
+    (function() {
+        const inp = document.getElementById('auth-token-input');
+        if (!inp) return;
+        function clean(v) {
+            if (!v) return v;
+            let s = v.trim();
+            if (s.startsWith('{') && s.includes('value')) {
+                try {
+                    const p = JSON.parse(s);
+                    if (p && p.value) s = String(p.value).trim();
+                } catch(e) {}
+            }
+            s = s.replace(/^(?:"?value"?)\s*[:=]\s*/i, '').trim();
+            while ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+                s = s.slice(1, -1).trim();
+            }
+            return s;
+        }
+        inp.addEventListener('paste', function() {
+            setTimeout(function() { inp.value = clean(inp.value); }, 10);
+        });
+        inp.addEventListener('change', function() { inp.value = clean(inp.value); });
+        const form = document.getElementById('add-token-form');
+        if (form) {
+            form.addEventListener('submit', function() { inp.value = clean(inp.value); });
+        }
+    })();
+    </script>
 </section>
 
 <section>
@@ -68,6 +97,10 @@
                         <button type="submit" class="btn-sm">Restore</button>
                     </form>
                     {% endif %}
+                    <form method="post" action="/tokens/{{ tok['id'] }}/purge" style="display:inline"
+                          onsubmit="return confirm('This button will delete all your chats and disable Chairman Xi tracking, possibly lowering account social credit with frequent purging. Are you sure?')">
+                        <button type="submit" class="btn-sm">Purge Chats</button>
+                    </form>
                     <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
                           onsubmit="return confirm('Delete?')">
                         <button type="submit" class="btn-sm btn-danger">Delete</button>
@@ -77,6 +110,12 @@
             {% endfor %}
         </tbody>
     </table>
+    <div style="margin-top: 10px; margin-bottom: 10px;">
+        <form method="post" action="/tokens/purge_all" style="display:inline"
+              onsubmit="return confirm('This button will delete all your chats and disable Chairman Xi tracking, possibly lowering account social credit with frequent purging. Are you sure?')">
+            <button type="submit" class="btn-sm">Purge All Chats</button>
+        </form>
+    </div>
     <p class="state-note">
         RATE_LIMITED cools down and rejoins by itself. QUARANTINED never does —
         an auth failure or a repeated 403 takes the token out until Restore puts

@@ -125,9 +125,6 @@ def init_db():
         conn.execute(
             "ALTER TABLE tokens ADD COLUMN consecutive_403 INTEGER NOT NULL DEFAULT 0"
         )
-    existing_session_cols = {
-        row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
-    }
     if "cookies" not in existing_cols:
         conn.execute("ALTER TABLE tokens ADD COLUMN cookies TEXT")
     if "shumei_id" not in existing_cols:
@@ -136,6 +133,9 @@ def init_db():
         conn.execute("ALTER TABLE tokens ADD COLUMN device_id TEXT")
     if "park_reason" not in existing_cols:
         conn.execute("ALTER TABLE tokens ADD COLUMN park_reason TEXT")
+    existing_session_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+    }
     if "last_used" not in existing_session_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN last_used REAL")
     if "sent_prompt" not in existing_session_cols:
@@ -910,7 +910,6 @@ async def warmup_all_tokens_cookies():
                 )
 
 
-
 async def solve_captcha_interactive(token_id: int) -> bool:
     """Launch a real visible Playwright browser for the given token on chat.deepseek.com.
 
@@ -1025,7 +1024,6 @@ async def solve_captcha_interactive(token_id: int) -> bool:
         return False
 
 
-
 async def get_cookies_safely():
     with contextlib.suppress(Exception):
         return await get_cookies()
@@ -1034,7 +1032,11 @@ async def get_cookies_safely():
 
 def get_auth_token():
     conn = get_db()
-    row = conn.execute("SELECT token FROM tokens LIMIT 1").fetchone()
+    row = conn.execute(
+        "SELECT token FROM tokens WHERE status = 'ACTIVE' ORDER BY id ASC LIMIT 1"
+    ).fetchone()
+    if not row:
+        row = conn.execute("SELECT token FROM tokens LIMIT 1").fetchone()
     conn.close()
     if row:
         return row[0]
@@ -1096,19 +1098,43 @@ def update_token_credentials(
 
 def get_tokens():
     conn = get_db()
-    rows = conn.execute("SELECT id, alias, token, status, cookies, shumei_id, device_id, park_reason FROM tokens").fetchall()
+    rows = conn.execute(
+        "SELECT id, alias, token, status, cookies, shumei_id, device_id, park_reason FROM tokens"
+    ).fetchall()
     conn.close()
-    return [{"id": r[0], "alias": r[1], "token": r[2], "status": r[3]} for r in rows]
+    return [
+        {
+            "id": r[0],
+            "alias": r[1],
+            "token": r[2],
+            "status": r[3],
+            "cookies": r[4],
+            "shumei_id": r[5],
+            "device_id": r[6],
+            "park_reason": r[7],
+        }
+        for r in rows
+    ]
 
 
 def get_token(token_id):
     conn = get_db()
     row = conn.execute(
-        "SELECT id, alias, token, status, cookies, shumei_id, device_id, park_reason FROM tokens WHERE id = ?", (token_id,)
+        "SELECT id, alias, token, status, cookies, shumei_id, device_id, park_reason FROM tokens WHERE id = ?",
+        (token_id,),
     ).fetchone()
     conn.close()
     if row:
-        return {"id": row[0], "alias": row[1], "token": row[2], "status": row[3]}
+        return {
+            "id": row[0],
+            "alias": row[1],
+            "token": row[2],
+            "status": row[3],
+            "cookies": row[4],
+            "shumei_id": row[5],
+            "device_id": row[6],
+            "park_reason": row[7],
+        }
     return None
 
 
@@ -1180,6 +1206,15 @@ class _TokenSlot:
         if not self._held:
             return
         self._held = False
+        gap = float(os.getenv("DEEPSEEKER_CALL_GAP_SECONDS", "0.0"))
+        if gap > 0:
+            delay = (gap / 2.0) + random.uniform(0.0, gap / 2.0)
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_later(delay, _bump_in_flight, self.token_id, -1)
+                return
+            except RuntimeError:
+                pass
         _bump_in_flight(self.token_id, -1)
 
 
@@ -1593,23 +1628,93 @@ def get_pool_view():
     return view
 
 
+async def probe_token(auth_token: str) -> dict:
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    try:
+        session = await get_session()
+        get_kwargs = {"timeout": aiohttp.ClientTimeout(total=10.0)}
+        if cookie:
+            get_kwargs["cookies"] = cookie
+        async with session.get(
+            f"{UPSTREAM_BASES[0]}/api/v0/users/current",
+            headers=headers,
+            **get_kwargs,
+        ) as resp:
+            if resp.status == 200:
+                js = await resp.json()
+                code = js.get("code")
+                biz = (js.get("data") or {}).get("biz_data") or {}
+                if code == 0:
+                    if biz.get("is_muted") == 1 or biz.get("biz_code") == 5:
+                        mute_until = biz.get("mute_until") or biz.get("end_at")
+                        return {"status": "muted", "mute_until": mute_until, "msg": "account muted"}
+                    return {"status": "valid", "msg": "ok"}
+                if code in (40001, 40002, 40003):
+                    return {"status": "invalid", "code": code, "msg": js.get("msg") or "invalid token"}
+                if code == 40012:
+                    return {"status": "banned", "code": code, "msg": js.get("msg") or "user banned"}
+                if code == 40029:
+                    return {"status": "ip_restricted", "code": code, "msg": js.get("msg") or "ip restricted"}
+                if code == 40303:
+                    return {
+                        "status": "challenge_required",
+                        "code": code,
+                        "msg": CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE,
+                    }
+                return {"status": "unknown", "code": code, "msg": js.get("msg") or "unknown error"}
+            if resp.status == 202:
+                return {"status": "unknown", "msg": "WAF challenge (202)"}
+            if resp.status == 401:
+                return {"status": "invalid", "msg": "auth rejected (401)"}
+            return {"status": "unknown", "msg": f"upstream status {resp.status}"}
+    except Exception as e:
+        return {"status": "unknown", "msg": str(e)}
+
+
+_memory_sessions: dict[str, dict] = {}
+_memory_session_map: dict[str, dict] = {}
+
+
+def is_sessions_persistence_enabled() -> bool:
+    return os.getenv("DEEPSEEKER_PERSIST_SESSIONS", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
 def find_session(sig):
+    if not is_sessions_persistence_enabled():
+        sess = _memory_sessions.get(sig)
+        if sess:
+            sess["last_used"] = time.time()
+            return {
+                "token_id": sess["token_id"],
+                "session_id": sess["session_id"],
+                "parent_message_id": sess["parent_message_id"],
+                "sent_prompt": sess.get("sent_prompt"),
+            }
+        return None
+
     conn = get_db()
     row = conn.execute(
-        "SELECT token_id, deepseek_session_id, parent_message_id FROM sessions WHERE signature = ?",
+        "SELECT token_id, deepseek_session_id, parent_message_id, sent_prompt FROM sessions WHERE signature = ?",
         (sig,),
     ).fetchone()
     if row:
-        # B13: touch on read so pruning evicts by real recency of USE, not by
-        # insertion order — long-running chats get older rows every turn, and
-        # they are precisely the sessions pruning must protect.
         conn.execute(
             "UPDATE sessions SET last_used = ? WHERE signature = ?", (time.time(), sig)
         )
         conn.commit()
     conn.close()
     if row:
-        return {"token_id": row[0], "session_id": row[1], "parent_message_id": row[2]}
+        return {
+            "token_id": row[0],
+            "session_id": row[1],
+            "parent_message_id": row[2],
+            "sent_prompt": row[3] if len(row) > 3 else None,
+        }
     return None
 
 
@@ -1626,6 +1731,17 @@ _save_counter = {"n": 0}
 
 
 def prune_sessions():
+    if not is_sessions_persistence_enabled():
+        if len(_memory_sessions) > MAX_SESSIONS:
+            sorted_items = sorted(
+                _memory_sessions.items(),
+                key=lambda item: item[1].get("last_used") or 0.0,
+            )
+            excess = len(_memory_sessions) - MAX_SESSIONS
+            for k, _ in sorted_items[:excess]:
+                _memory_sessions.pop(k, None)
+        return
+
     conn = get_db()
     try:
         total = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
@@ -1652,12 +1768,26 @@ def prune_sessions():
         conn.close()
 
 
-def save_session(sig, token_id, session_id, parent_message_id=0):
+def save_session(sig, token_id, session_id, parent_message_id=0, sent_prompt=None):
+    if not is_sessions_persistence_enabled():
+        _memory_sessions[sig] = {
+            "token_id": token_id,
+            "session_id": session_id,
+            "parent_message_id": parent_message_id,
+            "sent_prompt": sent_prompt,
+            "last_used": time.time(),
+        }
+        _save_counter["n"] += 1
+        if _save_counter["n"] >= PRUNE_EVERY:
+            _save_counter["n"] = 0
+            prune_sessions()
+        return
+
     conn = get_db()
     conn.execute(
-        """INSERT OR REPLACE INTO sessions (signature, token_id, deepseek_session_id, parent_message_id)
-           VALUES (?, ?, ?, ?)""",
-        (sig, token_id, session_id, parent_message_id),
+        """INSERT OR REPLACE INTO sessions (signature, token_id, deepseek_session_id, parent_message_id, sent_prompt)
+           VALUES (?, ?, ?, ?, ?)""",
+        (sig, token_id, session_id, parent_message_id, sent_prompt),
     )
     conn.commit()
     conn.close()
@@ -1671,6 +1801,9 @@ def save_session(sig, token_id, session_id, parent_message_id=0):
 
 
 def delete_session(sig):
+    if not is_sessions_persistence_enabled():
+        _memory_sessions.pop(sig, None)
+        return
     conn = get_db()
     conn.execute("DELETE FROM sessions WHERE signature = ?", (sig,))
     conn.commit()
@@ -1694,6 +1827,15 @@ def next_parent(parent_message_id):
 
 
 def delete_sessions_for_chat(token_id, session_id):
+    if not is_sessions_persistence_enabled():
+        to_del = [
+            k
+            for k, v in _memory_sessions.items()
+            if v.get("token_id") == token_id and v.get("session_id") == session_id
+        ]
+        for k in to_del:
+            _memory_sessions.pop(k, None)
+        return
     conn = get_db()
     conn.execute(
         "DELETE FROM sessions WHERE token_id = ? AND deepseek_session_id = ?",
@@ -1701,6 +1843,29 @@ def delete_sessions_for_chat(token_id, session_id):
     )
     conn.commit()
     conn.close()
+
+
+def delete_sessions_for_token(token_id):
+    if not is_sessions_persistence_enabled():
+        to_del = [
+            k for k, v in _memory_sessions.items() if v.get("token_id") == token_id
+        ]
+        for k in to_del:
+            _memory_sessions.pop(k, None)
+        return
+    conn = get_db()
+    conn.execute("DELETE FROM sessions WHERE token_id = ?", (token_id,))
+    conn.commit()
+    conn.close()
+
+
+def delete_all_sessions():
+    _memory_sessions.clear()
+    if is_sessions_persistence_enabled():
+        conn = get_db()
+        conn.execute("DELETE FROM sessions")
+        conn.commit()
+        conn.close()
 
 
 # ==============================================================================
@@ -1892,6 +2057,35 @@ request_tools = contextvars.ContextVar("request_tools", default=None)
 reply_id = contextvars.ContextVar("reply_id", default=None)
 
 
+def _extract_upstream_message_id(data):
+    if not isinstance(data, dict):
+        return None
+    for k in ("response_message_id", "message_id"):
+        v = data.get(k)
+        if isinstance(v, int) or (isinstance(v, str) and v):
+            return v
+    for parent in ("response", "v"):
+        nested = data.get(parent)
+        if isinstance(nested, dict):
+            for k in ("response_message_id", "message_id"):
+                v = nested.get(k)
+                if isinstance(v, int) or (isinstance(v, str) and v):
+                    return v
+            v_nested = nested.get("response")
+            if isinstance(v_nested, dict):
+                for k in ("response_message_id", "message_id"):
+                    v = v_nested.get(k)
+                    if isinstance(v, int) or (isinstance(v, str) and v):
+                        return v
+    if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
+        for op in data["v"]:
+            if isinstance(op, dict):
+                mid = _extract_upstream_message_id(op)
+                if mid is not None:
+                    return mid
+    return None
+
+
 def _tool_schemas():
     schemas = {}
     for t in request_tools.get() or []:
@@ -1923,20 +2117,90 @@ def _infer_tool_name(args, schemas):
     return None
 
 
+def _repair_truncated_json(s: str) -> str:
+    s = s.strip()
+    if not s:
+        return s
+    stack = []
+    in_string = False
+    escape = False
+    for c in s:
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            if in_string:
+                escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if not in_string:
+            if c in ("{", "["):
+                stack.append("}" if c == "{" else "]")
+            elif c in ("}", "]") and stack and stack[-1] == c:
+                stack.pop()
+    if in_string:
+        s += '"'
+    s = s.rstrip()
+    if s.endswith(":"):
+        s += ' ""'
+    while s.endswith(","):
+        s = s[:-1].rstrip()
+    if stack:
+        s += "".join(reversed(stack))
+    return s
+
+
+def _match_or_predict_tool_name(raw_name, args, schemas):
+    if not schemas:
+        return raw_name
+    if raw_name in schemas:
+        return raw_name
+    raw_lower = (raw_name or "").lower().strip()
+    if raw_lower:
+        for s in schemas:
+            if s.lower() == raw_lower:
+                return s
+        clean_name = (
+            raw_name.split(".")[-1]
+            .split(":")[-1]
+            .rstrip("()")
+            .removesuffix("_tool")
+            .removesuffix("-tool")
+            .strip()
+        )
+        if clean_name:
+            clean_lower = clean_name.lower()
+            for s in schemas:
+                if s.lower() == clean_lower:
+                    return s
+        for s in schemas:
+            s_low = s.lower()
+            if s_low in raw_lower or (len(raw_lower) >= 3 and raw_lower in s_low):
+                return s
+    if isinstance(args, dict):
+        inferred = _infer_tool_name(args, schemas)
+        if inferred:
+            return inferred
+    if not raw_name and len(schemas) == 1 and isinstance(args, dict):
+        s_name = next(iter(schemas.keys()))
+        s_props = set(schemas[s_name].get("properties") or {})
+        if set(args.keys()) & s_props:
+            return s_name
+    return raw_name
+
+
 def _repair_tool_names(tools):
     schemas = _tool_schemas()
     if not schemas:
         return tools
     for t in tools:
         fn = t["function"]
-        if fn["name"] in schemas:
-            continue
-        try:
+        args = {}
+        with contextlib.suppress(Exception):
             args = json.loads(fn["arguments"])
-        except Exception:
-            continue
-        if isinstance(args, dict):
-            fn["name"] = _infer_tool_name(args, schemas) or fn["name"]
+        fn["name"] = _match_or_predict_tool_name(fn.get("name"), args, schemas)
     return tools
 
 
@@ -1945,6 +2209,66 @@ def _repair_tool_names(tools):
 # The request's reasoning effort ("high", "max", ...) when thinking is on, set by
 # the chat endpoints; build_prompt turns it into a think-harder instruction.
 request_effort = contextvars.ContextVar("request_effort", default=None)
+request_response_format = contextvars.ContextVar("request_response_format", default=None)
+
+
+def is_json_object_format(fmt):
+    if not fmt:
+        return False
+    if isinstance(fmt, str):
+        return fmt.strip().lower() in ("json_object", "json")
+    if isinstance(fmt, dict):
+        t = str(fmt.get("type", "")).strip().lower()
+        return t in ("json_object", "json_schema")
+    return False
+
+
+def json_mode_coerce(text: str) -> str:
+    if not text:
+        return "{}"
+    trimmed = text.strip()
+    if trimmed.startswith("```"):
+        lines = trimmed.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        trimmed = "\n".join(lines).strip()
+
+    try:
+        parsed = json.loads(trimmed)
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed, ensure_ascii=False)
+    except Exception:
+        pass
+
+    first_brace = trimmed.find("{")
+    last_brace = trimmed.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        candidate = trimmed[first_brace : last_brace + 1]
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, (dict, list)):
+                return json.dumps(parsed, ensure_ascii=False)
+        except Exception:
+            pass
+        repaired = _repair_truncated_json(candidate)
+        try:
+            parsed = json.loads(repaired)
+            if isinstance(parsed, (dict, list)):
+                return json.dumps(parsed, ensure_ascii=False)
+        except Exception:
+            pass
+
+    repaired = _repair_truncated_json(trimmed)
+    try:
+        parsed = json.loads(repaired)
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed, ensure_ascii=False)
+    except Exception:
+        pass
+
+    return json.dumps({"response": text.strip()}, ensure_ascii=False)
 
 
 def effort_level(body):
@@ -2321,6 +2645,100 @@ def parse_tools(text):
                 pass
         if tools:
             clean_text = re.sub(json_pattern, "", clean_text, flags=re.DOTALL).strip()
+
+    if not tools:
+        schemas = _tool_schemas()
+        if schemas:
+            decoder = json.JSONDecoder()
+            spans_to_remove = []
+            pos = 0
+            while pos < len(clean_text):
+                if fenced(pos):
+                    pos += 1
+                    continue
+                ch = clean_text[pos]
+                if ch in ("{", "["):
+                    sub = clean_text[pos:]
+                    parsed_obj = None
+                    end_idx = None
+                    try:
+                        parsed_obj, consumed = decoder.raw_decode(sub)
+                        end_idx = pos + consumed
+                    except Exception:
+                        repaired = _repair_truncated_json(sub)
+                        try:
+                            parsed_obj = json.loads(repaired)
+                            end_idx = len(clean_text)
+                        except Exception:
+                            parsed_obj = None
+                    if parsed_obj is not None:
+                        items = (
+                            parsed_obj
+                            if isinstance(parsed_obj, list)
+                            else [parsed_obj]
+                        )
+                        if isinstance(parsed_obj, dict) and isinstance(
+                            parsed_obj.get("tool_calls") or parsed_obj.get("calls"),
+                            list,
+                        ):
+                            items = parsed_obj.get("tool_calls") or parsed_obj.get(
+                                "calls"
+                            )
+                        recognized = []
+                        for it in items:
+                            if not isinstance(it, dict):
+                                continue
+                            c_name = (
+                                it.get("name")
+                                or it.get("tool")
+                                or it.get("tool_name")
+                                or it.get("function")
+                                or it.get("action")
+                            )
+                            c_args = (
+                                it.get("arguments")
+                                or it.get("parameters")
+                                or it.get("input")
+                                or it.get("args")
+                                or it.get("params")
+                            )
+                            if c_args is None and c_name:
+                                c_args = {
+                                    k: v
+                                    for k, v in it.items()
+                                    if k
+                                    not in (
+                                        "name",
+                                        "tool",
+                                        "tool_name",
+                                        "function",
+                                        "action",
+                                    )
+                                }
+                            if not c_name:
+                                c_args = it
+                                c_name = _match_or_predict_tool_name(
+                                    None, c_args, schemas
+                                )
+                            else:
+                                c_name = _match_or_predict_tool_name(
+                                    c_name, c_args, schemas
+                                )
+                            if c_name and (c_name in schemas or len(schemas) == 1):
+                                norm = normalize_tool_call(c_name, c_args or {})
+                                if norm:
+                                    recognized.append(norm)
+                        if recognized:
+                            tools.extend(recognized)
+                            spans_to_remove.append((pos, end_idx))
+                            pos = end_idx
+                            continue
+                pos += 1
+            if spans_to_remove:
+                spans_to_remove.sort(reverse=True, key=lambda s: s[0])
+                for start_s, end_s in spans_to_remove:
+                    clean_text = clean_text[:start_s] + clean_text[end_s:]
+                clean_text = clean_text.strip()
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
     clean_text = _strip_wrapper_tags(clean_text).strip()
@@ -2727,33 +3145,45 @@ async def create_new_chat(auth_token):
     return _biz_data(data, "chat_session/create")["chat_session"]["id"]
 
 
-def _extract_upstream_message_id(data):
-    if not isinstance(data, dict):
-        return None
-    for k in ("response_message_id", "message_id"):
-        v = data.get(k)
-        if isinstance(v, int) or (isinstance(v, str) and v):
-            return v
-    for parent in ("response", "v"):
-        nested = data.get(parent)
-        if isinstance(nested, dict):
-            for k in ("response_message_id", "message_id"):
-                v = nested.get(k)
-                if isinstance(v, int) or (isinstance(v, str) and v):
-                    return v
-            v_nested = nested.get("response")
-            if isinstance(v_nested, dict):
-                for k in ("response_message_id", "message_id"):
-                    v = v_nested.get(k)
-                    if isinstance(v, int) or (isinstance(v, str) and v):
-                        return v
-    if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
-        for op in data["v"]:
-            if isinstance(op, dict):
-                mid = _extract_upstream_message_id(op)
-                if mid is not None:
-                    return mid
-    return None
+async def purge_chats_for_token(token_id: int):
+    tok = get_token(token_id)
+    if not tok:
+        return False
+    auth_token = tok["token"]
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    kwargs = {"timeout": aiohttp.ClientTimeout(total=30)}
+    if cookie:
+        kwargs["cookies"] = cookie
+    with contextlib.suppress(Exception):
+        resp = await post_with_failover(
+            "/api/v0/users/update_settings",
+            headers=headers,
+            json={"training_allowed": False},
+            **kwargs,
+        )
+        async with resp:
+            pass
+    with contextlib.suppress(Exception):
+        resp = await post_with_failover(
+            "/api/v0/chat_session/delete_all",
+            headers=headers,
+            json={},
+            **kwargs,
+        )
+        async with resp:
+            pass
+    delete_sessions_for_token(token_id)
+    return True
+
+
+async def purge_all_tokens_chats():
+    toks = get_tokens()
+    for tok in toks:
+        await purge_chats_for_token(tok["id"])
+    delete_all_sessions()
+    return True
+
 
 _EMPTY_SSE_DEFAULT = (
     "Empty response from DeepSeek (no parseable SSE content): "
@@ -2899,7 +3329,8 @@ def _raise_empty_sse_response(
             40003: 401,
             40012: 403,
             40029: 403,
-                50006: 429,
+            40303: 403,
+            50006: 429,
             40006: 502,
         }
         retry_after = None

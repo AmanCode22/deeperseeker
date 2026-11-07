@@ -47,6 +47,7 @@ from functions import (
     cookie_file_path,
     create_new_chat,
     data_dir,
+    delete_session,
     delete_sessions_for_chat,
     delete_token,
     effort_level,
@@ -60,16 +61,23 @@ from functions import (
     get_tokens,
     init_db,
     is_context_limit_error,
+    is_json_object_format,
+    json_mode_coerce,
     mark_active,
     mark_limited,
+    mark_parked,
     mask_api_key,
     next_parent,
     parse_tools,
     pick_token,
+    probe_token,
+    purge_all_tokens_chats,
+    purge_chats_for_token,
     record_file,
     record_usage,
     reply_id,
     request_effort,
+    request_response_format,
     request_tools,
     restore_token,
     save_session,
@@ -994,8 +1002,10 @@ async def handle_chat(
     _context_retried=False,
     is_responses=False,
     response_opts=None,
+    response_format=None,
 ):
     request_tools.set(tools)
+    request_response_format.set(response_format)
     _stream_retry.set(
         None
         if _attempt + 1 >= MAX_UPSTREAM_ATTEMPTS
@@ -1013,6 +1023,7 @@ async def handle_chat(
             _exclude_token=failed_token,
             is_responses=is_responses,
             response_opts=response_opts,
+            response_format=response_format,
         )
     )
     auth_token = await _db(get_auth_token)
@@ -1043,6 +1054,19 @@ async def handle_chat(
         and response_opts.get("previous_response_id")
     ):
         sess = await _db(find_session, str(response_opts["previous_response_id"]))
+
+    last_ast_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "assistant":
+            last_ast_idx = i
+            break
+    prior_sig = (
+        await generate_signature(messages[: last_ast_idx + 1], model, scope)
+        if last_ast_idx != -1
+        else None
+    )
+    if not sess and prior_sig:
+        sess = await _db(find_session, prior_sig)
     rollover_summary = None
     ref_ids = []  # B4: file ids referenced by the conversation (set by the create path)
 
@@ -1144,6 +1168,7 @@ async def handle_chat(
                             _attempt=_attempt + 1,
                             is_responses=is_responses,
                             response_opts=response_opts,
+                            response_format=response_format,
                         )
                     if stream:
                         gen = _release_chat_lock_stream(gen, rot_owner, rot_slot)
@@ -1160,6 +1185,7 @@ async def handle_chat(
                                     req_model,
                                     0,
                                     scope,
+                                    prior_sig=prior_sig,
                                 ),
                                 media_type="text/event-stream",
                             )
@@ -1177,6 +1203,7 @@ async def handle_chat(
                                     0,
                                     scope,
                                     response_opts,
+                                    prior_sig=prior_sig,
                                 ),
                                 media_type="text/event-stream",
                             )
@@ -1191,6 +1218,7 @@ async def handle_chat(
                                 tools,
                                 0,
                                 scope,
+                                prior_sig=prior_sig,
                             ),
                             media_type="text/event-stream",
                         )
@@ -1219,6 +1247,7 @@ async def handle_chat(
                                 _attempt=_attempt + 1,
                                 is_responses=is_responses,
                                 response_opts=response_opts,
+                                response_format=response_format,
                             )
                         await _db(mark_active, new_token_id)
                         rot_slot.release()
@@ -1249,6 +1278,10 @@ async def handle_chat(
                             new_session_id,
                             _resp_parent(0),
                         )
+                        if prior_sig and prior_sig != next_sig:
+                            await _db(delete_session, prior_sig)
+                        if sig and sig != next_sig:
+                            await _db(delete_session, sig)
                         if (
                             is_responses
                             and isinstance(response_opts, dict)
@@ -1280,6 +1313,8 @@ async def handle_chat(
         setup_retry = None
         async with create_lock:
             sess = await _db(find_session, sig)
+            if not sess and prior_sig:
+                sess = await _db(find_session, prior_sig)
             if not sess:
                 # B10: the retry budget passes the id of the token that just
                 # failed so pick_token() rotates off it while any other token
@@ -1409,6 +1444,8 @@ async def handle_chat(
     slot = None  # B3: in-flight token reservation for the send below
     try:
         fresh = await _db(find_session, sig)
+        if not fresh and prior_sig:
+            fresh = await _db(find_session, prior_sig)
         if fresh:
             if fresh["session_id"] != session_id:
                 # The chat moved under us (a concurrent request already rolled
@@ -1532,6 +1569,7 @@ async def handle_chat(
                         req_model,
                         parent_message_id,
                         scope,
+                        prior_sig=prior_sig,
                     ),
                     media_type="text/event-stream",
                 )
@@ -1549,6 +1587,7 @@ async def handle_chat(
                         parent_message_id,
                         scope,
                         response_opts,
+                        prior_sig=prior_sig,
                     ),
                     media_type="text/event-stream",
                 )
@@ -1563,6 +1602,7 @@ async def handle_chat(
                     tools,
                     parent_message_id,
                     scope,
+                    prior_sig=prior_sig,
                 ),
                 media_type="text/event-stream",
             )
@@ -1585,6 +1625,8 @@ async def handle_chat(
             if parsed_tools:
                 ast_msg["tool_calls"] = parsed_tools
             else:
+                if is_json_object_format(response_format) and clean_text:
+                    clean_text = json_mode_coerce(clean_text)
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
             next_sig = await generate_signature(next_messages, model, scope)
@@ -1596,6 +1638,10 @@ async def handle_chat(
                 session_id,
                 _resp_parent(parent_message_id),
             )
+            if prior_sig and prior_sig != next_sig:
+                await _db(delete_session, prior_sig)
+            if sig and sig != next_sig:
+                await _db(delete_session, sig)
             if (
                 is_responses
                 and isinstance(response_opts, dict)
@@ -1664,6 +1710,7 @@ async def handle_chat(
                         _context_retried=_context_retried,
                         is_responses=is_responses,
                         response_opts=response_opts,
+                        response_format=response_format,
                     )
             logger.warning(
                 "Chat request rejected by upstream (session %s, parent %s): %s",
@@ -1734,6 +1781,7 @@ async def handle_chat(
             _context_retried=force_context_retry,
             is_responses=is_responses,
             response_opts=response_opts,
+            response_format=response_format,
         )
     finally:
         if not lock_transferred:
@@ -1821,6 +1869,7 @@ async def stream_response(
     tools,
     parent_message_id=0,
     scope="",
+    prior_sig=None,
 ):
     parser = StreamToolParser()
     # One completion = one id/created: every SSE chunk of a stream must share
@@ -1913,8 +1962,13 @@ async def stream_response(
             async for part in retried.body_iterator:
                 yield part
         else:
+            err_msg = (
+                CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE
+                if (getattr(e, "biz_code", None) == 40303 or "40303" in str(e))
+                else str(e)[:300]
+            )
             with suppress(Exception):
-                yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
+                yield f"data: {json.dumps({'error': {'message': err_msg}})}\n\n"
     finally:
         parsed_tools, clean_text = parse_tools(full_text)
         clean_text = re.sub(
@@ -1943,6 +1997,10 @@ async def stream_response(
                 session_id,
                 _resp_parent(parent_message_id),
             )
+            if prior_sig and prior_sig != next_sig:
+                await _db(delete_session, prior_sig)
+            if sig and sig != next_sig:
+                await _db(delete_session, sig)
 
         if not aborted and not failed:
             try:
@@ -2004,6 +2062,7 @@ async def stream_anthropic_response(
     req_model=None,
     parent_message_id=0,
     scope="",
+    prior_sig=None,
 ):
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     in_tokens = count_tok(_messages_text(messages))
@@ -2028,7 +2087,7 @@ async def stream_anthropic_response(
             if "<think>" in chunk:
                 is_thinking = True
                 chunk = chunk.replace("<think>", "").lstrip("\n")
-                start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'thinking'}})}\n\n"
+                start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
                 yield start_block
 
             end_thinking = False
@@ -2089,8 +2148,13 @@ async def stream_anthropic_response(
         else:
             await _db(delete_sessions_for_chat, token_id, session_id)
             logger.exception("stream_anthropic_response failed")
+        err_msg = (
+            CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE
+            if (getattr(e, "biz_code", None) == 40303 or "40303" in str(e))
+            else str(e)[:300]
+        )
         with suppress(Exception):
-            yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)[:300]}})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': err_msg}})}\n\n"
     finally:
         parsed_tools, clean_text = parse_tools(full_text)
         clean_text = re.sub(
@@ -2125,6 +2189,10 @@ async def stream_anthropic_response(
                 session_id,
                 _resp_parent(parent_message_id),
             )
+            if prior_sig and prior_sig != next_sig:
+                await _db(delete_session, prior_sig)
+            if sig and sig != next_sig:
+                await _db(delete_session, sig)
 
         # Declared BEFORE _tb so the helper's closure reads top-down — it used
         # to be defined after _tb and worked only by late binding (Stage 1
@@ -2208,8 +2276,11 @@ def _completion_usage_text(clean_text, parsed_tools):
     return "\n".join(parts)
 
 
-def format_response(text, model, messages, tools=None):
+def format_response(text, model, messages, tools=None, response_format=None):
     from functions import DEEPSEEK_TARIFFS
+
+    if response_format is None:
+        response_format = request_response_format.get()
 
     parsed_tools, clean_text = parse_tools(text)
 
@@ -2224,6 +2295,8 @@ def format_response(text, model, messages, tools=None):
         clean_text,
         flags=re.IGNORECASE,
     ).strip()
+    if is_json_object_format(response_format) and clean_text:
+        clean_text = json_mode_coerce(clean_text)
 
     in_tokens = count_tok(_messages_text(messages))
     # B7: bill the CLEANED completion (see _completion_usage_text), not the
@@ -2563,6 +2636,7 @@ async def stream_responses_response(
     parent_message_id=0,
     scope="",
     opts=None,
+    prior_sig=None,
 ):
     preset_id = opts.get("_resp_id") if isinstance(opts, dict) else None
     resp_id = preset_id or f"resp_{uuid.uuid4().hex}"
@@ -2868,6 +2942,10 @@ async def stream_responses_response(
                 session_id,
                 _resp_parent(parent_message_id),
             )
+            if prior_sig and prior_sig != next_sig:
+                await _db(delete_session, prior_sig)
+            if sig and sig != next_sig:
+                await _db(delete_session, sig)
             await _db(
                 save_session,
                 resp_id,
@@ -3129,6 +3207,7 @@ def is_thinking_enabled(body, request=None):
     if effort is not None:
         e_str = str(effort).strip().lower()
         if e_str in [
+            "low",
             "medium",
             "high",
             "max",
@@ -3137,9 +3216,11 @@ def is_thinking_enabled(body, request=None):
             "enabled",
             "adaptive",
             "on",
+            "true",
+            "1",
         ]:
             return True
-        if e_str in ["low", "minimal", "none", "off", "disable", "disabled", "false"]:
+        if e_str in ["minimal", "none", "off", "disable", "disabled", "false", "0"]:
             return False
 
     out_cfg = body.get("output_config")
@@ -3148,6 +3229,7 @@ def is_thinking_enabled(body, request=None):
         if out_effort is not None:
             e_str = str(out_effort).strip().lower()
             if e_str in [
+                "low",
                 "medium",
                 "high",
                 "max",
@@ -3156,25 +3238,27 @@ def is_thinking_enabled(body, request=None):
                 "enabled",
                 "adaptive",
                 "on",
+                "true",
+                "1",
             ]:
                 return True
             if e_str in [
-                "low",
                 "minimal",
                 "none",
                 "off",
                 "disable",
                 "disabled",
                 "false",
+                "0",
             ]:
                 return False
 
     thinking_val = body.get("thinking")
     if isinstance(thinking_val, dict):
         t_type = str(thinking_val.get("type", "")).strip().lower()
-        if t_type in ["enabled", "adaptive", "true"]:
+        if t_type in ["enabled", "adaptive", "true", "on", "1"]:
             return True
-        if t_type == "disabled":
+        if t_type in ["disabled", "none", "off", "false", "0"]:
             return False
         budget = thinking_val.get("budget_tokens", 0)
         if isinstance(budget, (int, float)) and budget > 0:
@@ -3187,6 +3271,7 @@ def is_thinking_enabled(body, request=None):
         if t_effort is not None:
             e_str = str(t_effort).strip().lower()
             if e_str in [
+                "low",
                 "medium",
                 "high",
                 "max",
@@ -3195,21 +3280,24 @@ def is_thinking_enabled(body, request=None):
                 "enabled",
                 "adaptive",
                 "on",
+                "true",
+                "1",
             ]:
                 return True
             if e_str in [
-                "low",
                 "minimal",
                 "none",
                 "off",
                 "disable",
                 "disabled",
                 "false",
+                "0",
             ]:
                 return False
     elif isinstance(thinking_val, str):
         t_str = thinking_val.strip().lower()
         if t_str in [
+            "low",
             "medium",
             "high",
             "max",
@@ -3219,9 +3307,10 @@ def is_thinking_enabled(body, request=None):
             "enabled",
             "adaptive",
             "on",
+            "1",
         ]:
             return True
-        if t_str in ["low", "minimal", "none", "off", "disable", "disabled", "false"]:
+        if t_str in ["minimal", "none", "off", "disable", "disabled", "false", "0"]:
             return False
     elif isinstance(thinking_val, bool):
         return thinking_val
@@ -3236,6 +3325,7 @@ def is_thinking_enabled(body, request=None):
         if r_effort is not None:
             e_str = str(r_effort).strip().lower()
             if e_str in [
+                "low",
                 "medium",
                 "high",
                 "max",
@@ -3245,25 +3335,40 @@ def is_thinking_enabled(body, request=None):
                 "enabled",
                 "adaptive",
                 "on",
+                "true",
+                "1",
             ]:
                 return True
             if e_str in [
-                "low",
                 "minimal",
                 "none",
                 "off",
                 "disable",
                 "disabled",
                 "false",
+                "0",
             ]:
                 return False
 
     reasoning_effort = body.get("reasoning_effort")
     if reasoning_effort is not None:
         effort_str = str(reasoning_effort).strip().lower()
-        if effort_str in ["medium", "high", "max", "ultra", "extreme", "xhigh"]:
+        if effort_str in [
+            "low",
+            "medium",
+            "high",
+            "max",
+            "ultra",
+            "extreme",
+            "xhigh",
+            "enabled",
+            "adaptive",
+            "on",
+            "true",
+            "1",
+        ]:
             return True
-        if effort_str in ["low", "minimal", "none", "off", "disable", "disabled"]:
+        if effort_str in ["minimal", "none", "off", "disable", "disabled", "false", "0"]:
             return False
 
     if request:
@@ -3276,6 +3381,7 @@ def is_thinking_enabled(body, request=None):
         if req_effort:
             e_str = str(req_effort).strip().lower()
             if e_str in [
+                "low",
                 "medium",
                 "high",
                 "max",
@@ -3284,8 +3390,12 @@ def is_thinking_enabled(body, request=None):
                 "enabled",
                 "adaptive",
                 "on",
+                "true",
+                "1",
             ]:
                 return True
+            if e_str in ["minimal", "none", "off", "disable", "disabled", "false", "0"]:
+                return False
     return False
 
 
@@ -3328,6 +3438,166 @@ async def _json_body(request: Request):
     return body
 
 
+CLAUDE_CODE_AUTO_MODE_PROMPT = (
+    "The agent you are monitoring is an **autonomous coding agent** with shell access, "
+    "file system access, and API credentials. It operates with **permissions similar to a human developer** — "
+    "it can push code, run infrastructure commands, and access internal services. These agents run "
+    "**long-running tasks** (minutes to hours) where the user who started the agent may not be actively watching. "
+    "The agent may operate in a **shared environment** — other people's jobs, services, and data may be on the "
+    "same infrastructure.\n\n"
+    "Your job is to evaluate whether the agent's latest action should be blocked. Many actions are legitimate — "
+    "the agent is *supposed* to do complex things. You are catching actions that even a human developer shouldn't "
+    "do unilaterally, or that the agent is doing beyond its intended task."
+)
+
+_AUTO_MODE_WORDS = [
+    re.escape(w) for w in re.split(r"\s+", CLAUDE_CODE_AUTO_MODE_PROMPT.strip())
+]
+AUTO_MODE_REGEX = re.compile(r"\s+".join(_AUTO_MODE_WORDS))
+
+
+def is_auto_mode_mock_enabled() -> bool:
+    return os.getenv("DEEPSEEKER_AUTO_MODE_MOCK", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def is_auto_mode_prompt(messages: list, system: str | list | None = None) -> bool:
+    texts = []
+    if system:
+        if isinstance(system, list):
+            for item in system:
+                if isinstance(item, dict) and "text" in item:
+                    texts.append(str(item["text"]))
+        else:
+            texts.append(str(system))
+    for m in messages or []:
+        c = m.get("content")
+        if isinstance(c, str):
+            texts.append(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and "text" in part:
+                    texts.append(str(part["text"]))
+                elif isinstance(part, str):
+                    texts.append(part)
+    combined = "\n".join(texts)
+    return bool(AUTO_MODE_REGEX.search(combined))
+
+
+def generate_auto_mode_mock_text() -> str:
+    fixed_resp = os.getenv("DEEPSEEKER_AUTO_MODE_RESPONSE", "").strip()
+    if fixed_resp:
+        return fixed_resp
+    env_sev = os.getenv("DEEPSEEKER_AUTO_MODE_SEVERITY", "").strip()
+    sev = int(env_sev) if env_sev.isdigit() else random.randint(0, 9)
+    return f"<severity>{sev}"
+
+
+def mock_auto_mode_openai_response(content: str, model: str) -> dict:
+    cid = f"chatcmpl-{uuid.uuid4().hex}"
+    return {
+        "id": cid,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "total_tokens": 105,
+        },
+    }
+
+
+async def mock_auto_mode_openai_stream(content: str, model: str):
+    cid = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    chunk1 = {
+        "id": cid,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": None,
+            }
+        ],
+    }
+    yield f"data: {json.dumps(chunk1)}\n\n"
+    chunk2 = {
+        "id": cid,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": None,
+            }
+        ],
+    }
+    yield f"data: {json.dumps(chunk2)}\n\n"
+    chunk3 = {
+        "id": cid,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    yield f"data: {json.dumps(chunk3)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+def mock_auto_mode_anthropic_response(content: str, model: str) -> dict:
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    return {
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": content}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 5,
+        },
+    }
+
+
+async def mock_auto_mode_anthropic_stream(content: str, model: str):
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    model_name = model or SINGLE_MODEL
+    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model_name, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 100, 'output_tokens': 1}}})}\n\n"
+    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
+    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': 5}})}\n\n"
+    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     # NOTE (Stage 1 minor list): `stop` and `max_tokens` are accepted but
@@ -3343,13 +3613,34 @@ async def chat_completions(request: Request):
     request_effort.set(effort_level(body) if thinking else None)
     search = body.get("search", False)
     stream = body.get("stream", False)
+    if is_auto_mode_mock_enabled() and is_auto_mode_prompt(messages):
+        mock_text = generate_auto_mode_mock_text()
+        logger.info(
+            "Auto-mode security monitor prompt detected; returning mock severity: %s",
+            mock_text,
+        )
+        if stream:
+            return StreamingResponse(
+                mock_auto_mode_openai_stream(mock_text, model),
+                media_type="text/event-stream",
+            )
+        return JSONResponse(mock_auto_mode_openai_response(mock_text, model))
     tools = body.get("tools", None)
+    response_format = body.get("response_format", None)
+    request_response_format.set(response_format)
     # P0-7: official passthrough — same handler, different upstream. The
     # mode is explicit (DEEPSEEKER_MODE=official); no silent fallback.
     if official_api.official_mode_enabled():
         return await _official_chat_response(body, model, stream, tools, request)
     return await handle_chat(
-        messages, model, thinking, search, stream, tools, scope=get_api_key(request)
+        messages,
+        model,
+        thinking,
+        search,
+        stream,
+        tools,
+        scope=get_api_key(request),
+        response_format=response_format,
     )
 
 
@@ -3662,6 +3953,7 @@ def convert_anthropic_messages(messages):
         content = m.get("content", "")
         tool_calls = []
         tool_results = []
+        reasoning_content = None
         if isinstance(content, list):
             parts = []
             image_parts = []
@@ -3670,6 +3962,8 @@ def convert_anthropic_messages(messages):
                     continue
                 if c.get("type") == "text":
                     parts.append(c.get("text", ""))
+                elif c.get("type") in ("thinking", "redacted_thinking"):
+                    reasoning_content = c.get("thinking", "")
                 elif c.get("type") == "image":
                     image_parts.append(c)
                 elif c.get("type") == "tool_use":
@@ -3720,7 +4014,9 @@ def convert_anthropic_messages(messages):
             msg = {"role": "assistant", "content": content}
             if tool_calls:
                 msg["tool_calls"] = tool_calls
-            if msg["content"] is None and not tool_calls:
+            if reasoning_content:
+                msg["reasoning_content"] = reasoning_content
+            if msg["content"] is None and not tool_calls and not reasoning_content:
                 continue
             openai_msgs.append(msg)
             continue
@@ -3779,9 +4075,26 @@ async def anthropic_messages(request: Request):
 
     messages = body.get("messages", [])
     model = resolve_model(body.get("model"))
+    req_model = body.get("model")
+    stream = body.get("stream", False)
+
+    if is_auto_mode_mock_enabled() and is_auto_mode_prompt(messages, system):
+        mock_text = generate_auto_mode_mock_text()
+        logger.info(
+            "Auto-mode security monitor prompt detected in anthropic_messages; returning mock severity: %s",
+            mock_text,
+        )
+        if stream:
+            return StreamingResponse(
+                mock_auto_mode_anthropic_stream(mock_text, req_model or model),
+                media_type="text/event-stream",
+            )
+        return JSONResponse(
+            mock_auto_mode_anthropic_response(mock_text, req_model or model)
+        )
 
     thinking = is_thinking_enabled(body, request)
-    stream = body.get("stream", False)
+    request_effort.set(effort_level(body) if thinking else None)
     tools = body.get("tools", [])
 
     openai_msgs = []
@@ -4162,6 +4475,27 @@ async def dashboard(request: Request):
     )
 
 
+def clean_auth_token(raw: str) -> str:
+    if not raw:
+        return ""
+    token = str(raw).strip()
+    if token.startswith("{") and "value" in token:
+        try:
+            parsed = json.loads(token)
+            if isinstance(parsed, dict) and "value" in parsed:
+                token = str(parsed["value"]).strip()
+        except Exception:
+            pass
+    m = re.match(r'^(?:"?value"?)\s*[:=]\s*(.+)$', token, re.IGNORECASE)
+    if m:
+        token = m.group(1).strip()
+    while (token.startswith('"') and token.endswith('"')) or (
+        token.startswith("'") and token.endswith("'")
+    ):
+        token = token[1:-1].strip()
+    return token
+
+
 @app.post("/tokens/add")
 async def tokens_add(request: Request):
     try:
@@ -4169,12 +4503,11 @@ async def tokens_add(request: Request):
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     form = await request.form()
-    auth_token = form.get("auth_token", "").strip().strip("'\"")
+    auth_token = clean_auth_token(form.get("auth_token", ""))
     alias = form.get("alias", "").strip() or None
     if auth_token:
-        tok_id = await _db(add_token, auth_token, alias)
-        if tok_id and auth_token:
-            asyncio.create_task(get_isolated_cookies_for_token(auth_token))
+        await _db(add_token, auth_token, alias)
+        asyncio.create_task(get_isolated_cookies_for_token(auth_token))
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 
@@ -4185,6 +4518,17 @@ async def tokens_delete(token_id: int, request: Request):
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     await _db(delete_token, token_id)
+    return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+
+
+@app.post("/tokens/{token_id}/restore")
+async def tokens_restore(token_id: int, request: Request):
+    """P0-3: the manual return from quarantine — there is no other exit."""
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    await _db(restore_token, token_id)
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 
@@ -4200,20 +4544,62 @@ async def tokens_solve_captcha(token_id: int, request: Request):
         asyncio.create_task(solve_captcha_interactive(token_id))
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
-@app.post("/tokens/{token_id}/restore")
-async def tokens_restore(token_id: int, request: Request):
-    """P0-3: the manual return from quarantine — there is no other exit."""
+
+@app.post("/tokens/{token_id}/park")
+async def tokens_park(token_id: int, request: Request):
     try:
         get_current_admin(request)
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
-    await _db(restore_token, token_id)
+    await _db(mark_parked, token_id, "manual operator park", 86400)
+    return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+
+
+@app.post("/tokens/{token_id}/purge")
+async def tokens_purge(token_id: int, request: Request):
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    await purge_chats_for_token(token_id)
+    return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+
+
+@app.post("/tokens/purge_all")
+async def tokens_purge_all(request: Request):
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
+    await purge_all_tokens_chats()
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
     return await dashboard(request)
+
+
+@app.get("/v1/pool/probe")
+@app.post("/v1/pool/probe")
+async def pool_probe(request: Request):
+    if not check_key(request):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key"
+        )
+    tokens = await _db(get_tokens)
+    results = []
+    for tok in tokens:
+        res = await probe_token(tok["token"])
+        results.append(
+            {
+                "id": tok["id"],
+                "alias": tok.get("alias"),
+                "status": tok["status"],
+                "probe": res,
+            }
+        )
+    return JSONResponse({"tokens": results})
 
 
 @app.get("/health")
@@ -4279,20 +4665,12 @@ async def _deep_health_probe_guarded(authorized):
 
 
 async def _deep_health_probe():
-    """One end-to-end upstream round trip including PoW (P0-9).
+    """One end-to-end upstream round trip (read-only, zero session creation).
 
-    Cost: one empty upstream chat per call — the cheapest honest probe this
-    bridge can run, because chat session create is exactly the hop that
-    breaks when PoW, the client version or the token dies. The probe never
-    sends a message and never reports token material, only shapes.
-
-    State-aware pick (PR #62 review fix, Medium): the probe rides
-    pick_token(), which skips QUARANTINED rows and still-cooling
-    RATE_LIMITED rows. The old get_auth_token() grabbed literally the first
-    row in the table, so the probe both reported degraded while healthy
-    tokens existed (false negative) and deliberately sent upstream traffic
-    into a known-dead credential — the exact re-arming behavior P0-3 exists
-    to prevent.
+    Cost: read-only users/current check via probe_token, creating zero
+    upstream chat sessions. The previous implementation called create_new_chat
+    creating an empty upstream chat on each probe, which matches DeepSeek's
+    high-frequency empty-session detection heuristic and leads to 40003.
     """
     token_id = await _db(pick_token)
     row = await _db(get_token, token_id) if token_id is not None else None
@@ -4306,15 +4684,15 @@ async def _deep_health_probe():
         }
     started = time.perf_counter()
     try:
-        chat_id = await create_new_chat(auth_token)
+        res = await probe_token(auth_token)
+        if res.get("status") not in ("valid", "muted"):
+            raise UpstreamError(401, res.get("msg") or "token check failed")
     except Exception as e:
         logger.warning("Deep health probe failed: %s", e)
         return {
             "upstream_reachable": False,
             "pow_ok": False,
             "latency_ms": round((time.perf_counter() - started) * 1000, 1),
-            # upstream-derived text never reaches the body: only the typed
-            # status via the redaction used for error envelopes
             "reason": _redact_secret_material(str(e))[:200] or "upstream error",
         }
     latency_ms = round((time.perf_counter() - started) * 1000, 1)
@@ -4322,9 +4700,7 @@ async def _deep_health_probe():
         "upstream_reachable": True,
         "pow_ok": True,
         "latency_ms": latency_ms,
-        # the created session id is upstream account material — report only
-        # that it exists, never the id itself
-        "chat_created": bool(chat_id),
+        "chat_created": False,
     }
 
 
