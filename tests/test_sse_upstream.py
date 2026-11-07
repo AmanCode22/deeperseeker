@@ -438,6 +438,27 @@ def test_handle_chat_rotates_on_40029_fetch_files():
     assert calls["limited"][0][1][0] == 40029
 
 
+def test_fragment_cut_snapshot_does_not_duplicate_thinking():
+    import json
+
+    events = [
+        {"p": "response/fragments", "o": "APPEND", "v": [{"type": "THINK", "content": "Thinking part"}]},
+        {"v": " continues"},
+        {
+            "p": "response/fragments",
+            "v": [
+                {"type": "THINK", "content": "Thinking part continues"},
+                {"type": "RESPONSE", "content": "Answer part"},
+            ],
+        },
+        {"v": " done"},
+        {"p": "response/status", "v": "FINISHED"},
+    ]
+    body = "".join("data: " + json.dumps(e, separators=(",", ":")) + "\n" for e in events).encode()
+    out = asyncio.run(_collect_send_message(body))
+    assert out == "<think>\nThinking part continues\n</think>\n\nAnswer part done"
+
+
 TESTS = [
     test_sse_line_split_across_tcp_chunks,
     test_batch_append_after_quasi_finished,
@@ -446,6 +467,7 @@ TESTS = [
     test_handle_chat_retries_empty_sse_on_parent_zero,
     test_handle_chat_rotates_to_another_token_on_429,
     test_handle_chat_rotates_on_40029_fetch_files,
+    test_fragment_cut_snapshot_does_not_duplicate_thinking,
 ]
 
 

@@ -3513,8 +3513,7 @@ async def _send_message_unlocked(
         json_data["parent_message_id"] = parent_message_id
 
     resolved_shumei = shumei_id or extract_shumei_device_id(cookie)
-    if resolved_shumei:
-        json_data["shumei_device_id"] = resolved_shumei
+    json_data["shumei_device_id"] = resolved_shumei
 
     think_open = False
     got_output = False
@@ -3628,7 +3627,8 @@ async def _send_message_unlocked(
                             yield fragment.get("content", "")
                 return
 
-            if data.get("p") == "response/fragments" and data.get("o") in ("APPEND", None):
+            _frag_op = data.get("o")
+            if data.get("p") == "response/fragments" and _frag_op in ("APPEND", None):
                 fragments = data.get("v")
                 if isinstance(fragments, list):
                     for fragment in fragments:
@@ -3638,16 +3638,18 @@ async def _send_message_unlocked(
                                 think_open = False
                             got_output = True
                             got_response = got_response or bool(fragment.get("content"))
-                            yield fragment.get("content", "")
+                            yield fragment.get("content") or ""
                         elif fragment.get("type") == "THINK":
+                            if _frag_op is None and think_open:
+                                continue
                             if not think_open:
                                 yield "<think>\n"
                                 think_open = True
                             got_output = True
-                            yield fragment.get("content", "")
+                            yield fragment.get("content") or ""
                         else:
                             got_output = True
-                            yield fragment.get("content", "")
+                            yield fragment.get("content") or ""
                 return
 
             v = data.get("v")
