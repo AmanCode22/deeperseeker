@@ -161,7 +161,7 @@ cp .env.example .env
 python3 app.py
 ```
 
-> **Note:** thanks to PR <https://github.com/AmanCode22/deeperseeker/pull/16> by [@alan7383](https://github.com/alan7383), Playwright and Chromium are deprecated and kept as backup (DeepSeek does not enforce AWS WAF on requests using Android client headers). You no longer need to run `playwright install chromium` or `xvfb-run` unless reverting to the backup cookie mechanism — and it saves RAM and is much more stable than cookie harvesting.
+> **Note:** DeeperSeeker replicates the desktop PC Chrome client 1-to-1, including Sec-CH-UA hints, WebAssembly PoW challenge solving, Shumei device token forwarding, and HIF attestation tokens. Unfortunately, we cannot bypass DeepSeek's new protection system without Playwright, so it must be installed on the system.
 
 ## Auth token setup
 

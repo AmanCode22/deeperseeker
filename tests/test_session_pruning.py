@@ -21,6 +21,8 @@ import functions  # noqa: E402
 
 
 def _fresh_db():
+    os.environ["DEEPSEEKER_PERSIST_SESSIONS"] = "true"
+    functions._memory_sessions.clear()
     tmpdir = tempfile.mkdtemp()
     functions._db = os.path.join(tmpdir, "sessions.db")
     if os.path.exists(functions._db):
