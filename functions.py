@@ -895,24 +895,34 @@ async def _generate_isolated_cookies_payload():
                 timeout=30000,
             )
             cookies = []
-            for _ in range(30):
+            ls_shumei = None
+            for tick in range(40):
                 cookies = await context.cookies()
                 has_waf = any(c.get("name") == "aws-waf-token" for c in cookies)
-                has_shumei = any(c.get("name", "").startswith(".thumbcache_") for c in cookies)
-                if has_waf and (has_shumei or _ > 15):
+                has_shumei = any(
+                    c.get("name", "").startswith(".thumbcache_") and c.get("value")
+                    for c in cookies
+                )
+                if not has_shumei and tick >= 6:
+                    with contextlib.suppress(Exception):
+                        val = await page.evaluate("""() => {
+                            for (let i = 0; i < localStorage.length; i++) {
+                                const k = localStorage.key(i);
+                                if (k && (k.startsWith('.thumbcache') || k === '_sm_di')) {
+                                    const v = localStorage.getItem(k);
+                                    if (v && v.length > 5) return v;
+                                }
+                            }
+                            return null;
+                        }""")
+                        if val:
+                            ls_shumei = val
+                            has_shumei = True
+                if has_waf and has_shumei:
+                    break
+                if has_waf and tick >= 32:
                     break
                 await asyncio.sleep(0.3)
-            ls_shumei = None
-            with contextlib.suppress(Exception):
-                ls_shumei = await page.evaluate("""() => {
-                    for (let i = 0; i < localStorage.length; i++) {
-                        const k = localStorage.key(i);
-                        if (k && (k.startsWith('.thumbcache') || k === '_sm_di')) {
-                            return localStorage.getItem(k);
-                        }
-                    }
-                    return null;
-                }""")
         finally:
             await browser.close()
     final_cookies = {}
@@ -958,6 +968,24 @@ def _read_global_shumei_id() -> str | None:
         return c.get("shumei_id") or extract_shumei_device_id(c.get("cookie"))
     except Exception:
         return None
+
+
+def _save_global_shumei_id(shumei_id: str):
+    if not shumei_id:
+        return
+    try:
+        target = cookie_file_path()
+        if os.path.exists(target):
+            with open(target, "r") as f:
+                data = json.load(f)
+            data["shumei_id"] = shumei_id
+            target_dir = os.path.dirname(os.path.abspath(target))
+            tmp_path = os.path.join(target_dir, os.path.basename(target) + ".tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, target)
+    except Exception:
+        pass
 
 
 def is_cookie_headless() -> bool:
@@ -1142,34 +1170,32 @@ async def _generate_shumei_ids_for_tokens(tokens: list[tuple[int, str]]):
                                 timeout=30000,
                             )
                             cookies = []
-                            for _ in range(30):
+                            sh_id = None
+                            for tick in range(40):
                                 cookies = await context.cookies()
-                                has_shumei = any(
-                                    c.get("name", "").startswith(".thumbcache_")
-                                    for c in cookies
-                                )
-                                if has_shumei or _ > 15:
+                                for c in cookies:
+                                    if c.get("name", "").startswith(".thumbcache_") and c.get("value"):
+                                        sh_id = urllib.parse.unquote(str(c["value"]))
+                                        break
+                                if not sh_id and tick >= 6:
+                                    with contextlib.suppress(Exception):
+                                        ls_val = await page.evaluate("""() => {
+                                            for (let i = 0; i < localStorage.length; i++) {
+                                                const k = localStorage.key(i);
+                                                if (k && (k.startsWith('.thumbcache') || k === '_sm_di')) {
+                                                    const v = localStorage.getItem(k);
+                                                    if (v && v.length > 5) return v;
+                                                }
+                                            }
+                                            return null;
+                                        }""")
+                                        if ls_val:
+                                            sh_id = urllib.parse.unquote(str(ls_val))
+                                if sh_id:
+                                    break
+                                if tick >= 32:
                                     break
                                 await asyncio.sleep(0.3)
-
-                            sh_id = None
-                            for c in cookies:
-                                if c.get("name", "").startswith(".thumbcache_") and c.get("value"):
-                                    sh_id = urllib.parse.unquote(str(c["value"]))
-                                    break
-                            if not sh_id:
-                                with contextlib.suppress(Exception):
-                                    ls_shumei = await page.evaluate("""() => {
-                                        for (let i = 0; i < localStorage.length; i++) {
-                                            const k = localStorage.key(i);
-                                            if (k && (k.startsWith('.thumbcache') || k === '_sm_di')) {
-                                                return localStorage.getItem(k);
-                                            }
-                                        }
-                                        return null;
-                                    }""")
-                                    if ls_shumei:
-                                        sh_id = urllib.parse.unquote(str(ls_shumei))
 
                             if sh_id:
                                 update_token_credentials(tid, shumei_id=sh_id)
@@ -1256,6 +1282,7 @@ async def warmup_all_tokens_cookies():
             with contextlib.suppress(Exception):
                 _, _, shared_shumei = await _generate_isolated_cookies_payload()
         if shared_shumei:
+            _save_global_shumei_id(shared_shumei)
             for tid, _ in tokens_needing_shumei:
                 update_token_credentials(tid, shumei_id=shared_shumei)
             logger.info(
