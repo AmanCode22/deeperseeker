@@ -1035,7 +1035,7 @@ def test_send_message_includes_shumei_device_id_when_cookie_present(monkeypatch)
         mock.AsyncMock(
             return_value={
                 "aws-waf-token": "cookie-val",
-                ".thumbcache_abc": "test%2Bthumb%3D%3D",
+                ".thumbcache_abc": "Btest%2Bthumb%3D%3D",
             }
         ),
     )
@@ -1077,6 +1077,20 @@ def test_send_message_includes_shumei_device_id_when_cookie_present(monkeypatch)
     asyncio.run(run())
     assert captured_json.get("shumei_device_id") == "Btest+thumb=="
     assert "parent_message_id" not in captured_json
+
+    # Upstream DeepSeek web frontend rule: if token does not start with 'B', omit shumei_device_id
+    monkeypatch.setattr(
+        functions,
+        "get_cookies_safely",
+        mock.AsyncMock(
+            return_value={
+                "aws-waf-token": "cookie-val",
+                ".thumbcache_abc": "non_b_token%3D%3D",
+            }
+        ),
+    )
+    asyncio.run(run())
+    assert "shumei_device_id" not in captured_json
 
 
 def test_account_isolation_distinct_credentials(monkeypatch, tmp_path):
@@ -1221,16 +1235,16 @@ def test_40303_challenge_required_parks_token_and_returns_chairman_xi(monkeypatc
     assert row["status"] == "PARKED"
     assert row["rate_limited_until"] > time.time() + 1700
 
-    # Test client error formatting delivers Chairman Xi message
+    # Test client error formatting delivers 500 internal server error without leaking captcha info
     resp_openai = app._api_error_response(err, is_anthropic=False)
-    assert resp_openai.status_code == 403
+    assert resp_openai.status_code == 500
     data_openai = json.loads(resp_openai.body.decode())
-    assert data_openai["error"]["message"] == functions.CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE
+    assert data_openai["error"]["message"] == "Internal server error"
 
     resp_anthropic = app._api_error_response(err, is_anthropic=True)
-    assert resp_anthropic.status_code == 403
+    assert resp_anthropic.status_code == 500
     data_anthropic = json.loads(resp_anthropic.body.decode())
-    assert data_anthropic["error"]["message"] == functions.CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE
+    assert data_anthropic["error"]["message"] == "Internal server error"
 
 
 def test_solve_captcha_interactive(monkeypatch, tmp_path):

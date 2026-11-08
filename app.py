@@ -687,8 +687,8 @@ def _api_error_response(e, is_anthropic=False):
     # client-visible error body passes the secret scrub, one discipline.
     message = _redact_secret_material(str(e)[:500])
     if getattr(e, "biz_code", None) == 40303 or "40303" in str(e):
-        chairman_xi_decree = CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE
-        message = chairman_xi_decree
+        code = 500
+        message = "Internal server error"
     if is_anthropic:
         payload = {
             "type": "error",
@@ -3466,7 +3466,7 @@ AUTO_MODE_REGEX = re.compile(r"\s+".join(_AUTO_MODE_WORDS))
 
 
 def is_auto_mode_mock_enabled() -> bool:
-    return os.getenv("DEEPSEEKER_AUTO_MODE_MOCK", "").strip().lower() in (
+    return os.getenv("DEEPSEEKER_AUTO_MODE_MOCK", "false").strip().lower() in (
         "1",
         "true",
         "yes",

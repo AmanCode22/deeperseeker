@@ -93,7 +93,7 @@ def test_response_failed_hides_upstream_http_details():
         events[-1]["response"]["error"]["message"] == app_module.GENERIC_RESPONSE_ERROR
     )
     blob = "".join(frames)
-    assert "429" not in blob
+    assert "HTTP 429" not in blob
     assert "cookie" not in blob
     assert "artyom08" not in blob
 

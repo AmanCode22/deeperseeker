@@ -118,6 +118,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 
 ```bash
 uv sync
+uv run patchright install chromium          # 安装浏览器内核（Linux 上如缺少系统依赖可加 --with-deps）
 source .venv/bin/activate   # 或 activate.fish / activate.zsh
 cp .env.example .env
 uv run deeperseeker
@@ -128,11 +129,12 @@ uv run deeperseeker
 ```bash
 python3 -m venv .venv
 pip install -r requirements.txt
+patchright install chromium                 # 安装浏览器内核（Linux 上如缺少系统依赖可加 --with-deps）
 cp .env.example .env
 python3 app.py
 ```
 
-> **说明：** 感谢 [@alan7383](https://github.com/alan7383) 的 PR <https://github.com/AmanCode22/deeperseeker/pull/16>，Playwright 与 Chromium 已弃用并仅作后备保留（DeepSeek 不会对使用 Android 客户端头信息的请求执行 AWS WAF）。除非回退到后备的 cookie 采集机制，否则不再需要运行 `playwright install chromium` 或 `xvfb-run`——而且这样更省内存，也比 cookie 采集稳定得多。
+> **说明：** DeeperSeeker 1:1 模拟桌面端 Chrome 客户端，包括 Sec-CH-UA hints、WebAssembly PoW 挑战求解、数美（Shumei）设备令牌转发与 HIF 认证令牌。绕过 DeepSeek 最新的 Cloudflare / AWS WAF 护盾以及获取数美设备标识需要系统安装 Patchright（防检测加固版 Playwright）及 Chromium 内核（执行上述安装命令即可）。
 
 ## 认证令牌配置
 
@@ -166,6 +168,8 @@ python3 app.py
 | `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` | 一轮对话在池内的重试次数，用尽后才把上游错误返回给客户端 | `3` |
 | `DEEPSEEKER_MAX_USER_MESSAGE_TOKENS` | 提示内最新一条用户消息的硬上限；超过后按尾部截断并加标记，而不是让上游失败 | `900000` |
 | `DEEPSEEKER_PROMPT_OVERHEAD_TOKENS` | 滚动估算时加上的固定开销，覆盖工具模式、系统扩写与原始历史中看不到的摘要 | `4096` |
+| `DEEPSEEKER_FAST_START` | 启动时跨账号共享数美设备 ID（快速启动） | `false` |
+| `DEEPSEEKER_WARMUP_NON_HEADLESS` | 启动预热/采集时以有头（可见）模式运行浏览器，获得最强抗检测能力 | `false` |
 | `DEEPSEEKER_MODE` | `bridge`（逆向网页会话）或 `official`（官方 API 直通）。必须显式设置——没有任何自动回退 | `bridge` |
 | `DEEPSEEKER_OFFICIAL_API_KEY` | `official` 模式使用的官方 API 密钥（来自 platform.deepseek.com）。官方模式下必填 | 未设置 |
 | `DEEPSEEKER_OFFICIAL_BASE` | 官方模式下官方 API 基址覆盖 | `https://api.deepseek.com` |
