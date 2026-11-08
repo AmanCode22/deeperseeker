@@ -976,7 +976,7 @@ def _save_global_shumei_id(shumei_id: str):
     try:
         target = cookie_file_path()
         if os.path.exists(target):
-            with open(target, "r") as f:
+            with open(target) as f:
                 data = json.load(f)
             data["shumei_id"] = shumei_id
             target_dir = os.path.dirname(os.path.abspath(target))
