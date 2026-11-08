@@ -362,7 +362,7 @@ async def _warmup_cookies_startup():
 async def lifespan(app: FastAPI):
     await _db(init_db)
     _install_key_access_formatter()
-    asyncio.create_task(_warmup_cookies_startup())
+    await _warmup_cookies_startup()
     yield
     # Stage 1 minor list: release the shared aiohttp ClientSession so shutdown
     # does not leak its connector sockets.

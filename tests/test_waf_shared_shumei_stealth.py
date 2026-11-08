@@ -182,3 +182,27 @@ def test_warmup_headless_toggle(monkeypatch):
 
     monkeypatch.setenv("DEEPSEEKER_COOKIE_HEADLESS", "true")
     assert functions.is_cookie_headless() is True
+
+
+def test_get_isolated_cookies_non_blocking_on_missing_shumei(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "test_non_blocking.db")
+    monkeypatch.setattr(functions, "_db", db_path)
+    functions.init_db()
+
+    token_str = "tok-instant-test"
+    functions.add_token(token_str, alias="instant")
+
+    monkeypatch.setattr(
+        functions, "get_cookies_safely", mock.AsyncMock(return_value={"aws-waf-token": "w"})
+    )
+    monkeypatch.setattr(functions, "_read_global_shumei_id", lambda: "Bfallback_shumei")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    bg_mock = mock.AsyncMock()
+    monkeypatch.setattr(functions, "_generate_shumei_background", bg_mock)
+
+    c, sh, dev = asyncio.run(functions.get_isolated_cookies_for_token(token_str))
+
+    assert c["aws-waf-token"] == "w"
+    assert sh == "Bfallback_shumei"
+    assert dev is not None

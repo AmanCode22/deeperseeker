@@ -892,15 +892,14 @@ async def _generate_isolated_cookies_payload():
             await page.goto(
                 "https://chat.deepseek.com/",
                 wait_until="domcontentloaded",
-                timeout=45000,
+                timeout=30000,
             )
-            await page.wait_for_selector("body", timeout=30000)
             cookies = []
-            for _ in range(35):
+            for _ in range(30):
                 cookies = await context.cookies()
                 has_waf = any(c.get("name") == "aws-waf-token" for c in cookies)
                 has_shumei = any(c.get("name", "").startswith(".thumbcache_") for c in cookies)
-                if has_waf and (has_shumei or _ > 20):
+                if has_waf and (has_shumei or _ > 15):
                     break
                 await asyncio.sleep(0.3)
             ls_shumei = None
@@ -1004,6 +1003,8 @@ def invalidate_global_cookies():
 
 _token_cookie_locks = {}
 _token_locks_guard = asyncio.Lock()
+_pending_shumei_generation = set()
+_pending_shumei_lock = asyncio.Lock()
 
 
 async def _get_token_lock(auth_token: str) -> asyncio.Lock:
@@ -1078,42 +1079,28 @@ async def get_isolated_cookies_for_token(
     if resolved_shumei:
         return effective_cookies, resolved_shumei, dev_id
 
-    if is_fast_start_enabled():
-        shared_shumei = (
-            _read_global_shumei_id()
-            or extract_shumei_device_id(effective_cookies)
-            or os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID")
-        )
-        if shared_shumei:
-            update_token_credentials(tid, shumei_id=shared_shumei, device_id=dev_id)
-            return effective_cookies, shared_shumei, dev_id
+    fallback_shumei = (
+        _read_global_shumei_id()
+        or extract_shumei_device_id(effective_cookies)
+        or os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID")
+    )
+    if is_fast_start_enabled() and fallback_shumei:
+        update_token_credentials(tid, shumei_id=fallback_shumei, device_id=dev_id)
+        return effective_cookies, fallback_shumei, dev_id
 
     if os.getenv("PYTEST_CURRENT_TEST"):
-        return effective_cookies, extract_shumei_device_id(effective_cookies), dev_id
+        return (
+            effective_cookies,
+            fallback_shumei or extract_shumei_device_id(effective_cookies),
+            dev_id,
+        )
 
-    lock = await _get_token_lock(auth_token)
-    async with lock:
-        conn = get_db()
-        row2 = conn.execute(
-            "SELECT id, cookies, shumei_id, device_id FROM tokens WHERE token = ?",
-            (auth_token,),
-        ).fetchone()
-        conn.close()
-        if row2 and row2["shumei_id"]:
-            return effective_cookies, row2["shumei_id"], row2["device_id"] or dev_id
+    async with _pending_shumei_lock:
+        if tid not in _pending_shumei_generation:
+            _pending_shumei_generation.add(tid)
+            asyncio.create_task(_generate_shumei_background(tid, auth_token))
 
-        try:
-            _, _, generated_shumei = await _generate_isolated_cookies_payload()
-            resolved_shumei = generated_shumei or shumei_id
-            update_token_credentials(
-                tid,
-                shumei_id=resolved_shumei,
-                device_id=dev_id,
-            )
-            return effective_cookies, resolved_shumei, dev_id
-        except Exception as e:
-            logger.warning("Generating Shumei ID failed for token #%s: %s", tid, e)
-            return effective_cookies, shumei_id, dev_id
+    return effective_cookies, fallback_shumei, dev_id
 
 
 async def _generate_shumei_ids_for_tokens(tokens: list[tuple[int, str]]):
@@ -1204,6 +1191,14 @@ async def _generate_shumei_ids_for_tokens(tokens: list[tuple[int, str]]):
         logger.warning("Startup: error in Shumei generation browser: %s", e)
 
 
+async def _generate_shumei_background(tid: int, auth_token: str):
+    try:
+        await _generate_shumei_ids_for_tokens([(tid, auth_token)])
+    finally:
+        async with _pending_shumei_lock:
+            _pending_shumei_generation.discard(tid)
+
+
 async def warmup_all_tokens_cookies():
     """Background startup warmup: ensure global WAF cookie and per-token Shumei/device IDs are ready.
 
@@ -1269,11 +1264,23 @@ async def warmup_all_tokens_cookies():
             )
             return
 
-    logger.info(
-        "Startup: %d tokens need initial Shumei device ID registration...",
-        len(tokens_needing_shumei),
-    )
-    await _generate_shumei_ids_for_tokens(tokens_needing_shumei)
+    unclaimed = []
+    async with _pending_shumei_lock:
+        for item in tokens_needing_shumei:
+            if item[0] not in _pending_shumei_generation:
+                _pending_shumei_generation.add(item[0])
+                unclaimed.append(item)
+    if unclaimed:
+        logger.info(
+            "Startup: %d tokens need initial Shumei device ID registration...",
+            len(unclaimed),
+        )
+        try:
+            await _generate_shumei_ids_for_tokens(unclaimed)
+        finally:
+            async with _pending_shumei_lock:
+                for item in unclaimed:
+                    _pending_shumei_generation.discard(item[0])
 
 
 async def solve_captcha_interactive(token_id: int) -> bool:
