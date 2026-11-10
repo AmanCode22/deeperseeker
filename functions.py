@@ -865,7 +865,7 @@ async def _apply_stealth(context_or_page):
 
 async def _generate_isolated_cookies_payload():
     if async_playwright is None:
-        raise CookieGenerationError("playwright is not installed")
+        raise CookieGenerationError("patchright is not installed")
     headless = is_cookie_headless()
     launch_kwargs = {
         "headless": headless,
@@ -1319,7 +1319,7 @@ async def solve_captcha_interactive(token_id: int) -> bool:
     solved, saves the updated cookies and restores the token to ACTIVE.
     """
     if async_playwright is None:
-        logger.error("Solve Captcha failed: playwright is not installed")
+        logger.error("Solve Captcha failed: patchright is not installed")
         return False
 
     tok = get_token(token_id)
@@ -3859,6 +3859,17 @@ def token_busy(auth_token):
     return bool(lock and lock.locked())
 
 
+def are_all_tokens_busy() -> bool:
+    tokens = get_tokens()
+    active_tokens = [t for t in tokens if t.get("status") == "ACTIVE"]
+    if not active_tokens:
+        return False
+    return all(
+        token_busy(t.get("token")) or token_in_flight(t.get("id")) > 0
+        for t in active_tokens
+    )
+
+
 async def send_message(chat_id, auth_token, *args, **kwargs):
     # The upstream stream is drained by its own task, so the lock is released when
     # DeepSeek finishes even if the consumer abandons this generator mid-stream
@@ -3870,7 +3881,12 @@ async def send_message(chat_id, auth_token, *args, **kwargs):
 
     async def pump():
         try:
+            was_locked = lock.locked()
+            if was_locked:
+                logger.info("Token pool: account busy, request waiting for slot")
             async with lock:
+                if was_locked:
+                    logger.info("Token pool: slot acquired, proceeding with send")
                 gen = _send_message_unlocked(chat_id, auth_token, *args, **kwargs)
                 try:
                     async for chunk in gen:

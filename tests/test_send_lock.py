@@ -44,3 +44,37 @@ def test_upstream_error_reaches_consumer(monkeypatch):
 
     got, err = asyncio.run(run())
     assert got == ["x"] and "boom" in err
+
+
+def test_token_busy_logs_waiting_message(caplog, monkeypatch):
+    import logging
+
+    started_first = asyncio.Event()
+    finish_first = asyncio.Event()
+
+    async def fake_unlocked(chat_id, auth_token, *args, **kwargs):
+        if chat_id == "first":
+            started_first.set()
+            await finish_first.wait()
+            yield "first-done"
+        else:
+            yield "second-done"
+
+    monkeypatch.setattr(functions, "_send_message_unlocked", fake_unlocked)
+    monkeypatch.setattr(functions, "_send_locks", {})
+
+    async def run():
+        with caplog.at_level(logging.INFO):
+            first_gen = functions.send_message("first", "tok_busy")
+            t1 = asyncio.create_task(first_gen.__anext__())
+            await started_first.wait()
+            second_gen = functions.send_message("second", "tok_busy")
+            t2 = asyncio.create_task(second_gen.__anext__())
+            await asyncio.sleep(0.05)
+            assert "Token pool: account busy, request waiting for slot" in caplog.text
+            finish_first.set()
+            await t1
+            await t2
+            assert "Token pool: slot acquired, proceeding with send" in caplog.text
+
+    asyncio.run(asyncio.wait_for(run(), 5))
