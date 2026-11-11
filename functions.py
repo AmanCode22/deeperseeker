@@ -362,7 +362,7 @@ def get_browser_timezone_id() -> str:
         return tz_env
     try:
         offset = int(_TZ_OFFSET)
-        if offset == 10800:
+        if offset == 10800: # noqa: SIM116
             return "Europe/Moscow"
         elif offset == 7200:
             return "Europe/Warsaw"
