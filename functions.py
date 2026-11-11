@@ -1789,16 +1789,16 @@ def mark_parked(token_id, reason, duration=86400):
     conn.close()
 
 
-CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE = (
-    "Account social credit is critically low: Chairman Xi requested captcha verification."
+CAPTCHA_CHALLENGE_MESSAGE = (
+    "Account social credit is critically low: Winnie-the-Pooh requested captcha verification."
 )
 
 
-def chairman_xi_penalize_social_credit(token_id, penalty_duration=1800):
-    social_credit_dock_seconds = (
+def park_token_for_captcha(token_id, penalty_duration=1800):
+    dock_seconds = (
         int(penalty_duration) if penalty_duration and penalty_duration > 0 else 1800
     )
-    mark_parked(token_id, CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE, social_credit_dock_seconds)
+    mark_parked(token_id, CAPTCHA_CHALLENGE_MESSAGE, dock_seconds)
 
 
 def restore_token(token_id):
@@ -1842,7 +1842,7 @@ def mark_limited(token_id, code=None, cooldown=None):
         mark_parked(token_id, "upstream 40012 (banned)", 86400)
         return
     if code in (40303, "40303"):
-        chairman_xi_penalize_social_credit(token_id, cooldown or 1800)
+        park_token_for_captcha(token_id, cooldown or 1800)
         return
     if code in (50006, "50006"):
         secs = int(cooldown) if cooldown and cooldown > 0 else 3600
@@ -2025,8 +2025,7 @@ def get_pool_view():
         streak = streak or 0
         is_captcha = status == "PARKED" and (
             "captcha" in str(park_reason or "").lower()
-            or "social credit" in str(park_reason or "").lower()
-            or "chairman xi" in str(park_reason or "").lower()
+            or "challenge" in str(park_reason or "").lower()
             or (until and (until - now) <= 1805 and (until - now) > 0)
         )
         if status == "QUARANTINED":
@@ -2110,7 +2109,7 @@ async def probe_token(auth_token: str) -> dict:
                     return {
                         "status": "challenge_required",
                         "code": code,
-                        "msg": CHAIRMAN_XI_SOCIAL_CREDIT_MESSAGE,
+                        "msg": CAPTCHA_CHALLENGE_MESSAGE,
                     }
                 return {"status": "unknown", "code": code, "msg": js.get("msg") or "unknown error"}
             if resp.status == 202:

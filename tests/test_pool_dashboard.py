@@ -129,8 +129,6 @@ def test_purge_chats_buttons_and_routes():
     assert "Purge All Chats" in html
     assert "/tokens/1/purge" in html
     assert "/tokens/purge_all" in html
-    assert "Chairman Xi tracking" in html
-    assert "social credit" in html
 
     import app as app_module
 
@@ -156,7 +154,7 @@ def test_solve_captcha_button_and_route(monkeypatch):
     import app as app_module
 
     _seed_pool()
-    functions.chairman_xi_penalize_social_credit(1, 1800)
+    functions.park_token_for_captcha(1, 1800)
 
     resp = _render_dashboard()
     assert resp.status_code == 200

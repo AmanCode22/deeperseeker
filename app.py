@@ -42,7 +42,6 @@ from functions import (
     acquire_token_slot,
     add_token,
     are_all_tokens_busy,
-    chairman_xi_penalize_social_credit,
     close_session,
     cookie_file_path,
     create_new_chat,
@@ -69,6 +68,7 @@ from functions import (
     mark_parked,
     mask_api_key,
     next_parent,
+    park_token_for_captcha,
     parse_tools,
     pick_token,
     probe_token,
@@ -669,11 +669,11 @@ async def _record_upstream_limit(token_id, exc, code):
     if "WAF" in str(exc) or "202" in str(exc):
         await _db(invalidate_token_cookies, token_id)
     if biz == 40303 or code == 40303 or "40303" in str(exc):
-        chairman_xi_social_credit_dock_duration = retry_after or 1800
+        captcha_dock_duration = retry_after or 1800
         await _db(
-            chairman_xi_penalize_social_credit,
+            park_token_for_captcha,
             token_id,
-            chairman_xi_social_credit_dock_duration,
+            captcha_dock_duration,
         )
         return
     eff_code = biz if biz in (40012, 40029, 50006) else code

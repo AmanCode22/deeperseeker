@@ -1196,7 +1196,7 @@ def test_account_isolation_distinct_credentials(monkeypatch, tmp_path):
     assert req_a["json"]["shumei_device_id"] != req_b["json"]["shumei_device_id"]
 
 
-def test_40303_challenge_required_parks_token_and_returns_chairman_xi(monkeypatch, tmp_path):
+def test_40303_challenge_required_parks_token(monkeypatch, tmp_path):
     import app
     import functions
 
@@ -1224,7 +1224,6 @@ def test_40303_challenge_required_parks_token_and_returns_chairman_xi(monkeypatc
     code = app._upstream_http_code(err)
     assert code == 403
 
-    # Test _record_upstream_limit parks the token for 1800s with Chairman Xi message
     asyncio.run(app._record_upstream_limit(token_id, err, code))
     updated_tok = functions.get_token(token_id)
     assert updated_tok["status"] == "PARKED"
@@ -1257,7 +1256,7 @@ def test_solve_captcha_interactive(monkeypatch, tmp_path):
     functions.add_token("tok-captcha-solve", alias="solve_me")
     tok = functions.get_tokens()[0]
     tid = tok["id"]
-    functions.chairman_xi_penalize_social_credit(tid, 1800)
+    functions.park_token_for_captcha(tid, 1800)
     assert functions.get_token(tid)["status"] == "PARKED"
 
     class FakePage:
