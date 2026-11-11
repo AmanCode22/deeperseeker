@@ -1078,7 +1078,8 @@ def test_send_message_includes_shumei_device_id_when_cookie_present(monkeypatch)
     assert captured_json.get("shumei_device_id") == "Btest+thumb=="
     assert "parent_message_id" not in captured_json
 
-    # Upstream DeepSeek web frontend rule: if token does not start with 'B', omit shumei_device_id
+    # Shumei web cookie (.thumbcache_) omits leading 'B', while SMSdk.getDeviceId()
+    # and completion payload always normalize with leading 'B':
     monkeypatch.setattr(
         functions,
         "get_cookies_safely",
@@ -1090,7 +1091,8 @@ def test_send_message_includes_shumei_device_id_when_cookie_present(monkeypatch)
         ),
     )
     asyncio.run(run())
-    assert "shumei_device_id" not in captured_json
+    assert captured_json.get("shumei_device_id") == "Bnon_b_token=="
+    assert captured_json.get("shumei_device_id").startswith("B")
 
 
 def test_account_isolation_distinct_credentials(monkeypatch, tmp_path):

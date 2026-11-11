@@ -160,6 +160,15 @@ def init_db():
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_usage_day_key ON usage(day, key_alias)"
     )
+    with contextlib.suppress(Exception):
+        rows = conn.execute("SELECT id, token, device_id FROM tokens WHERE device_id IS NOT NULL").fetchall()
+        for row in rows:
+            tid, tok, d_id = row[0], row[1], row[2]
+            if d_id and len(d_id) == 36 and d_id[14] == "5":
+                conn.execute(
+                    "UPDATE tokens SET device_id = ? WHERE id = ?",
+                    (generate_device_id(f"deeperseeker:{tok}" if tok else None), tid),
+                )
     conn.commit()
     conn.close()
     try:
@@ -319,13 +328,58 @@ def get_browser_user_agent(platform_name: str | None = None) -> str:
     )
 
 
+def normalize_shumei_device_id(val: str | None) -> str | None:
+    if not val:
+        return None
+    s = urllib.parse.unquote(str(val).strip())
+    if not s:
+        return None
+    return s if s.startswith("B") else f"B{s}"
+
+
+_DEVICE_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.I,
+)
+
+
+def is_valid_deepseek_device_id(val: str | None) -> bool:
+    return bool(val and _DEVICE_ID_RE.match(str(val).strip()))
+
+
+def generate_device_id(seed: str | None = None) -> str:
+    if seed:
+        import hashlib
+
+        h = hashlib.sha256(str(seed).encode("utf-8")).hexdigest()
+        return f"{h[:8]}-{h[8:12]}-4{h[13:16]}-a{h[17:20]}-{h[20:32]}"
+    return str(uuid.uuid4())
+
+
+def get_browser_timezone_id() -> str:
+    tz_env = os.getenv("DEEPSEEKER_BROWSER_TIMEZONE")
+    if tz_env:
+        return tz_env
+    try:
+        offset = int(_TZ_OFFSET)
+        if offset == 10800:
+            return "Europe/Moscow"
+        elif offset == 7200:
+            return "Europe/Warsaw"
+        elif offset == 0:
+            return "UTC"
+    except Exception:
+        pass
+    return "Europe/Moscow"
+
+
 def extract_shumei_device_id(cookies: dict | None) -> str | None:
     if not cookies or not isinstance(cookies, dict):
-        return os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID")
+        return normalize_shumei_device_id(os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID"))
     for k, v in cookies.items():
         if k.startswith(".thumbcache_") and v:
-            return urllib.parse.unquote(str(v))
-    return os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID")
+            return normalize_shumei_device_id(v)
+    return normalize_shumei_device_id(os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID"))
 
 
 def is_browser_profile(*args, **kwargs) -> bool:
@@ -365,8 +419,8 @@ def get_headers(auth_token, pow=None, *args, **kwargs):
     device_id = kwargs.get("device_id")
     if auth_token:
         headers["authorization"] = f"Bearer {auth_token}"
-        headers["x-device-id"] = device_id or str(
-            uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{auth_token}")
+        headers["x-device-id"] = device_id or generate_device_id(
+            f"deeperseeker:{auth_token}"
         )
         headers["x-device-model"] = ""
     if pow:
@@ -407,6 +461,9 @@ def _get_hif_attest_headers() -> dict[str, str]:
         "origin": "https://chat.deepseek.com",
         "referer": "https://chat.deepseek.com/",
         "user-agent": browser_ua,
+        "sec-ch-ua": '"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": f'"{browser_platform}"',
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-site",
@@ -706,33 +763,34 @@ _STEALTH_JS = """
         return _oldToString.apply(this, arguments);
     }, 'toString');
 
-    Object.defineProperty(navigator, 'webdriver', {
-        get: makeNative(() => undefined, 'get webdriver'),
-        enumerable: false,
-        configurable: true
-    });
     try {
-        delete Object.getPrototypeOf(navigator).webdriver;
-    } catch (e) {}
-    try {
-        if (Navigator.prototype && Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver')) {
+        if (typeof Navigator !== 'undefined' && Navigator.prototype) {
             Object.defineProperty(Navigator.prototype, 'webdriver', {
-                get: makeNative(() => undefined, 'get webdriver'),
-                enumerable: false,
+                get: makeNative(() => false, 'get webdriver'),
+                enumerable: true,
                 configurable: true
             });
         }
+        Object.defineProperty(navigator, 'webdriver', {
+            get: makeNative(() => false, 'get webdriver'),
+            enumerable: true,
+            configurable: true
+        });
     } catch (e) {}
 
     try {
-        Object.defineProperty(navigator, 'hardwareConcurrency', {
-            get: makeNative(() => 8, 'get hardwareConcurrency'),
-            configurable: true
-        });
-        Object.defineProperty(navigator, 'deviceMemory', {
-            get: makeNative(() => 8, 'get deviceMemory'),
-            configurable: true
-        });
+        if (typeof Navigator !== 'undefined' && Navigator.prototype) {
+            Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', {
+                get: makeNative(() => 12, 'get hardwareConcurrency'),
+                configurable: true,
+                enumerable: true
+            });
+            Object.defineProperty(Navigator.prototype, 'deviceMemory', {
+                get: makeNative(() => 8, 'get deviceMemory'),
+                configurable: true,
+                enumerable: true
+            });
+        }
     } catch (e) {}
 
     try {
@@ -826,15 +884,18 @@ _STEALTH_JS = """
         }, 'query');
     }
 
+    const isLinux = typeof navigator !== 'undefined' && /linux/i.test(navigator.platform || navigator.userAgent);
     const spoofWebGL = (proto) => {
         if (!proto || !proto.getParameter) return;
         const oldGetParameter = proto.getParameter;
         proto.getParameter = makeNative(function getParameter(parameter) {
             if (parameter === 37445) {
-                return 'Google Inc. (NVIDIA)';
+                return isLinux ? 'Google Inc. (Intel)' : 'Google Inc. (NVIDIA)';
             }
             if (parameter === 37446) {
-                return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                return isLinux
+                    ? 'ANGLE (Intel, Mesa Intel(R) Graphics (ADL GT2), OpenGL ES 3.2)'
+                    : 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
             }
             return oldGetParameter.apply(this, arguments);
         }, 'getParameter');
@@ -847,12 +908,30 @@ _STEALTH_JS = """
     }
 
     try {
+        if (typeof Navigator !== 'undefined' && Navigator.prototype) {
+            Object.defineProperty(Navigator.prototype, 'languages', {
+                get: makeNative(() => ['ru-RU', 'ru', 'en-US', 'en'], 'get languages'),
+                configurable: true,
+                enumerable: true
+            });
+        }
         Object.defineProperty(navigator, 'languages', {
-            get: makeNative(() => ['en-US', 'en'], 'get languages'),
-            configurable: true
+            get: makeNative(() => ['ru-RU', 'ru', 'en-US', 'en'], 'get languages'),
+            configurable: true,
+            enumerable: true
         });
-        if (window.outerWidth === 0) window.outerWidth = window.innerWidth;
-        if (window.outerHeight === 0) window.outerHeight = window.innerHeight;
+        if (!window.outerHeight || window.outerHeight === 0 || window.outerHeight === window.innerHeight) {
+            Object.defineProperty(window, 'outerHeight', {
+                get: makeNative(() => (window.innerHeight ? window.innerHeight + 143 : 1036), 'get outerHeight'),
+                configurable: true
+            });
+        }
+        if (!window.outerWidth || window.outerWidth === 0) {
+            Object.defineProperty(window, 'outerWidth', {
+                get: makeNative(() => (window.innerWidth || 1904), 'get outerWidth'),
+                configurable: true
+            });
+        }
     } catch (e) {}
 })();
 """
@@ -876,12 +955,14 @@ async def _generate_isolated_cookies_payload():
         browser = await p.chromium.launch(**launch_kwargs)
         try:
             ua = get_browser_user_agent()
+            tz_id = get_browser_timezone_id()
+            locale_id = os.getenv("DEEPSEEKER_CLIENT_LOCALE", "ru-RU")
             context = await browser.new_context(
                 user_agent=ua,
-                viewport={"width": 1920, "height": 1080},
+                viewport={"width": 1904, "height": 893},
                 screen={"width": 1920, "height": 1080},
-                locale="en-US",
-                timezone_id="America/New_York",
+                locale=locale_id,
+                timezone_id=tz_id,
                 device_scale_factor=1,
                 has_touch=False,
                 is_mobile=False,
@@ -896,31 +977,43 @@ async def _generate_isolated_cookies_payload():
             )
             cookies = []
             ls_shumei = None
-            for tick in range(40):
+            ls_key = None
+            for tick in range(50):
                 cookies = await context.cookies()
                 has_waf = any(c.get("name") == "aws-waf-token" for c in cookies)
-                has_shumei = any(
+                has_smid = any(c.get("name") == "smidV2" for c in cookies)
+                has_thumb = any(
                     c.get("name", "").startswith(".thumbcache_") and c.get("value")
                     for c in cookies
                 )
-                if not has_shumei and tick >= 6:
+                if not has_thumb and tick >= 4:
                     with contextlib.suppress(Exception):
-                        val = await page.evaluate("""() => {
+                        data = await page.evaluate("""() => {
+                            try {
+                                if (window.SMSdk && typeof window.SMSdk.getDeviceId === 'function') {
+                                    const did = window.SMSdk.getDeviceId();
+                                    if (did && did.length > 5) return {key: '.thumbcache_smsdk', val: did};
+                                }
+                            } catch (e) {}
                             for (let i = 0; i < localStorage.length; i++) {
                                 const k = localStorage.key(i);
                                 if (k && (k.startsWith('.thumbcache') || k === '_sm_di')) {
                                     const v = localStorage.getItem(k);
-                                    if (v && v.length > 5) return v;
+                                    if (v && v.length > 5) return {key: k, val: v};
                                 }
                             }
                             return null;
                         }""")
-                        if val:
-                            ls_shumei = val
-                            has_shumei = True
-                if has_waf and has_shumei:
+                        if data and isinstance(data, dict):
+                            ls_shumei = data.get("val")
+                            ls_key = data.get("key")
+                            if ls_shumei:
+                                has_thumb = True
+                if has_waf and has_smid and has_thumb:
                     break
-                if has_waf and tick >= 32:
+                if has_waf and has_smid and tick >= 38:
+                    break
+                if has_waf and tick >= 45:
                     break
                 await asyncio.sleep(0.3)
         finally:
@@ -931,6 +1024,12 @@ async def _generate_isolated_cookies_payload():
         if i.get("name") == "aws-waf-token":
             expiry = i.get("expires")
         final_cookies[i["name"]] = i["value"]
+    thumb_key = next((k for k in final_cookies if k.startswith(".thumbcache_")), None)
+    if ls_shumei:
+        if not thumb_key:
+            final_cookies[ls_key or ".thumbcache_default"] = urllib.parse.quote(ls_shumei.lstrip("B"))
+        elif not final_cookies.get(thumb_key):
+            final_cookies[thumb_key] = urllib.parse.quote(ls_shumei.lstrip("B"))
     final_cookies["ds_cookie_preference"] = (
         "%257B%2522level%2522%253A%2522all%2522%257D"
     )
@@ -938,7 +1037,7 @@ async def _generate_isolated_cookies_payload():
         expiry = time.time() + 1800
     shumei_id = extract_shumei_device_id(final_cookies)
     if not shumei_id and ls_shumei:
-        shumei_id = urllib.parse.unquote(str(ls_shumei))
+        shumei_id = normalize_shumei_device_id(ls_shumei)
     return final_cookies, expiry, shumei_id
 
 
@@ -948,24 +1047,20 @@ async def _generate_cookies():
     target_dir = os.path.dirname(os.path.abspath(target))
     os.makedirs(target_dir, exist_ok=True)
     tmp_path = os.path.join(target_dir, os.path.basename(target) + ".tmp")
-    data = {"cookie": final_cookies, "expiry": expiry}
+    data = {"cookie": final_cookies, "expiry": int(expiry) if expiry else int(time.time() + 1800)}
     if shumei_id:
         data["shumei_id"] = shumei_id
     with open(tmp_path, "w") as f:
         f.write(json.dumps(data))
     os.replace(tmp_path, target)
-    logger.info(
-        "DeepSeek cookies saved to %s (expires %s)",
-        target,
-        datetime.fromtimestamp(expiry) if expiry else "n/a",
-    )
+    return final_cookies, expiry, shumei_id
 
 
 def _read_global_shumei_id() -> str | None:
     try:
         with open(cookie_file_path()) as f:
             c = json.load(f)
-        return c.get("shumei_id") or extract_shumei_device_id(c.get("cookie"))
+        return normalize_shumei_device_id(c.get("shumei_id")) or extract_shumei_device_id(c.get("cookie"))
     except Exception:
         return None
 
@@ -973,12 +1068,13 @@ def _read_global_shumei_id() -> str | None:
 def _save_global_shumei_id(shumei_id: str):
     if not shumei_id:
         return
+    norm = normalize_shumei_device_id(shumei_id)
     try:
         target = cookie_file_path()
         if os.path.exists(target):
             with open(target) as f:
                 data = json.load(f)
-            data["shumei_id"] = shumei_id
+            data["shumei_id"] = norm
             target_dir = os.path.dirname(os.path.abspath(target))
             tmp_path = os.path.join(target_dir, os.path.basename(target) + ".tmp")
             with open(tmp_path, "w") as f:
@@ -1064,15 +1160,16 @@ async def get_isolated_cookies_for_token(
 
     if not row:
         c = await get_cookies_safely()
-        dev_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{auth_token}"))
+        dev_id = generate_device_id(f"deeperseeker:{auth_token}")
         return c, extract_shumei_device_id(c), dev_id
 
     tid = row["id"]
     cached_cookies = row["cookies"]
     shumei_id = row["shumei_id"]
-    dev_id = row["device_id"] or str(
-        uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{auth_token}")
-    )
+    dev_id = row["device_id"]
+    if not dev_id:
+        dev_id = generate_device_id(f"deeperseeker:{auth_token}")
+        update_token_credentials(tid, device_id=dev_id)
 
     token_explicit_waf = False
     effective_cookies = {}
@@ -1103,14 +1200,14 @@ async def get_isolated_cookies_for_token(
             except Exception:
                 pass
 
-    resolved_shumei = shumei_id or extract_shumei_device_id(effective_cookies)
+    resolved_shumei = normalize_shumei_device_id(shumei_id) or extract_shumei_device_id(effective_cookies)
     if resolved_shumei:
         return effective_cookies, resolved_shumei, dev_id
 
     fallback_shumei = (
         _read_global_shumei_id()
         or extract_shumei_device_id(effective_cookies)
-        or os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID")
+        or normalize_shumei_device_id(os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID"))
     )
     if is_fast_start_enabled() and fallback_shumei:
         update_token_credentials(tid, shumei_id=fallback_shumei, device_id=dev_id)
@@ -1150,12 +1247,14 @@ async def _generate_shumei_ids_for_tokens(tokens: list[tuple[int, str]]):
                 for tid, _ in tokens:
                     try:
                         ua = get_browser_user_agent()
+                        tz_id = get_browser_timezone_id()
+                        locale_id = os.getenv("DEEPSEEKER_CLIENT_LOCALE", "ru-RU")
                         context = await browser.new_context(
                             user_agent=ua,
-                            viewport={"width": 1920, "height": 1080},
+                            viewport={"width": 1904, "height": 893},
                             screen={"width": 1920, "height": 1080},
-                            locale="en-US",
-                            timezone_id="America/New_York",
+                            locale=locale_id,
+                            timezone_id=tz_id,
                             device_scale_factor=1,
                             has_touch=False,
                             is_mobile=False,
@@ -1171,11 +1270,11 @@ async def _generate_shumei_ids_for_tokens(tokens: list[tuple[int, str]]):
                             )
                             cookies = []
                             sh_id = None
-                            for tick in range(40):
+                            for tick in range(50):
                                 cookies = await context.cookies()
                                 for c in cookies:
                                     if c.get("name", "").startswith(".thumbcache_") and c.get("value"):
-                                        sh_id = urllib.parse.unquote(str(c["value"]))
+                                        sh_id = normalize_shumei_device_id(c["value"])
                                         break
                                 if not sh_id and tick >= 6:
                                     with contextlib.suppress(Exception):
@@ -1190,15 +1289,34 @@ async def _generate_shumei_ids_for_tokens(tokens: list[tuple[int, str]]):
                                             return null;
                                         }""")
                                         if ls_val:
-                                            sh_id = urllib.parse.unquote(str(ls_val))
-                                if sh_id:
+                                            sh_id = normalize_shumei_device_id(ls_val)
+                                has_smid = any(c.get("name") == "smidV2" for c in cookies)
+                                if sh_id and has_smid:
                                     break
-                                if tick >= 32:
+                                if sh_id and tick >= 28:
+                                    break
+                                if tick >= 38:
                                     break
                                 await asyncio.sleep(0.3)
 
                             if sh_id:
-                                update_token_credentials(tid, shumei_id=sh_id)
+                                tok_cookies = {}
+                                tok_expiry = None
+                                for i in cookies:
+                                    if i.get("name") == "aws-waf-token":
+                                        tok_expiry = i.get("expires")
+                                    tok_cookies[i["name"]] = i["value"]
+                                thumb_k = next((k for k in tok_cookies if k.startswith(".thumbcache_")), None)
+                                if not thumb_k:
+                                    tok_cookies[".thumbcache_default"] = urllib.parse.quote(sh_id.lstrip("B"))
+                                elif not tok_cookies.get(thumb_k):
+                                    tok_cookies[thumb_k] = urllib.parse.quote(sh_id.lstrip("B"))
+                                tok_cookies["ds_cookie_preference"] = "%257B%2522level%2522%253A%2522all%2522%257D"
+                                update_token_credentials(
+                                    tid,
+                                    cookies={"cookie": tok_cookies, "expiry": tok_expiry or (time.time() + 1800)},
+                                    shumei_id=sh_id,
+                                )
                                 logger.info(
                                     "Startup: saved isolated Shumei ID for token id=%s",
                                     tid,
@@ -1226,22 +1344,10 @@ async def _generate_shumei_background(tid: int, auth_token: str):
 
 
 async def warmup_all_tokens_cookies():
-    """Background startup warmup: ensure global WAF cookie and per-token Shumei/device IDs are ready.
-
-    AWS WAF token is shared globally so warmup only generates WAF once across all tokens.
-    Tokens that already possess a Shumei ID incur zero browser launches.
-    Only tokens missing a Shumei device ID are batched through a single browser session.
-    """
     if os.getenv("PYTEST_CURRENT_TEST") or os.getenv(
         "DEEPSEEKER_DISABLE_WARMUP", ""
     ).lower() in ("1", "true", "yes"):
         return
-
-    if not _read_cookie_file():
-        logger.info("Startup: generating shared DeepSeek WAF cookies in background...")
-        with contextlib.suppress(Exception):
-            await get_cookies_safely()
-        logger.info("Startup: shared DeepSeek WAF cookies ready.")
 
     conn = get_db()
     rows = conn.execute(
@@ -1252,54 +1358,66 @@ async def warmup_all_tokens_cookies():
     if not rows:
         return
 
-    tokens_needing_shumei = []
+    all_tokens = []
     for row in rows:
         tid = row["id"]
         token_str = row["token"]
-        shumei_id = row["shumei_id"]
+        if not token_str:
+            continue
         dev_id = row["device_id"]
-        if not dev_id and token_str:
-            dev_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{token_str}"))
+        if not dev_id:
+            dev_id = generate_device_id(f"deeperseeker:{token_str}")
             update_token_credentials(tid, device_id=dev_id)
-        if not shumei_id and token_str:
-            tokens_needing_shumei.append((tid, token_str))
+        all_tokens.append((tid, token_str))
 
-    if not tokens_needing_shumei:
-        logger.info(
-            "Startup: all %d tokens already have isolated Shumei device IDs. No browser launches needed.",
-            len(rows),
-        )
+    if not all_tokens:
         return
 
     if is_fast_start_enabled():
-        global_c = await get_cookies_safely()
-        shared_shumei = (
-            _read_global_shumei_id()
-            or extract_shumei_device_id(global_c)
-            or os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID")
-        )
-        if not shared_shumei and not os.getenv("PYTEST_CURRENT_TEST"):
-            with contextlib.suppress(Exception):
-                _, _, shared_shumei = await _generate_isolated_cookies_payload()
+        logger.info("Fast start: warming up cookies...")
+        final_cookies = None
+        shared_shumei = None
+        expiry = None
+        try:
+            final_cookies, expiry, shared_shumei = await _generate_cookies()
+        except Exception as e:
+            logger.warning("Fast start: cookie generation failed: %s", e)
+
+        if not shared_shumei:
+            shared_shumei = (
+                _read_global_shumei_id()
+                or extract_shumei_device_id(await get_cookies_safely())
+                or normalize_shumei_device_id(os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID"))
+            )
+
         if shared_shumei:
             _save_global_shumei_id(shared_shumei)
-            for tid, _ in tokens_needing_shumei:
-                update_token_credentials(tid, shumei_id=shared_shumei)
-            logger.info(
-                "Startup (fast start): applied shared Shumei ID to %d tokens without launching separate browsers.",
-                len(tokens_needing_shumei),
+            cookie_payload = (
+                {"cookie": final_cookies, "expiry": expiry}
+                if final_cookies
+                else None
             )
-            return
+            for tid, _ in all_tokens:
+                update_kwargs = {"shumei_id": shared_shumei}
+                if cookie_payload:
+                    update_kwargs["cookies"] = cookie_payload
+                update_token_credentials(tid, **update_kwargs)
+            logger.info("Fast start: cookies ready.")
+        return
+
+    if not _read_cookie_file():
+        with contextlib.suppress(Exception):
+            await get_cookies_safely()
 
     unclaimed = []
     async with _pending_shumei_lock:
-        for item in tokens_needing_shumei:
+        for item in all_tokens:
             if item[0] not in _pending_shumei_generation:
                 _pending_shumei_generation.add(item[0])
                 unclaimed.append(item)
     if unclaimed:
         logger.info(
-            "Startup: %d tokens need initial Shumei device ID registration...",
+            "Warming up Shumei IDs for %d tokens...",
             len(unclaimed),
         )
         try:
@@ -1341,10 +1459,10 @@ async def solve_captcha_interactive(token_id: int) -> bool:
                 ua = get_browser_user_agent()
                 context = await browser.new_context(
                     user_agent=ua,
-                    viewport={"width": 1280, "height": 840},
+                    viewport={"width": 1904, "height": 893},
                     screen={"width": 1920, "height": 1080},
-                    locale="en-US",
-                    timezone_id="America/New_York",
+                    locale=os.getenv("DEEPSEEKER_CLIENT_LOCALE", "ru-RU"),
+                    timezone_id=get_browser_timezone_id(),
                     device_scale_factor=1,
                 )
                 await _apply_stealth(context)
@@ -1418,9 +1536,9 @@ async def solve_captcha_interactive(token_id: int) -> bool:
                     expiry = time.time() + 1800
                 shumei_id = extract_shumei_device_id(final_cookies)
                 if not shumei_id and last_ls_shumei:
-                    shumei_id = urllib.parse.unquote(str(last_ls_shumei))
-                dev_id = tok.get("device_id") or str(
-                    uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{auth_token}")
+                    shumei_id = normalize_shumei_device_id(last_ls_shumei)
+                dev_id = tok.get("device_id") or generate_device_id(
+                    f"deeperseeker:{auth_token}"
                 )
                 update_token_credentials(
                     token_id,
@@ -1486,7 +1604,9 @@ def add_token(token, alias=None, cookies=None, shumei_id=None, device_id=None):
         """).fetchone()
         next_id = row[0] if row and row[0] else 1
     if not device_id and token:
-        device_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"deeperseeker:{token}"))
+        device_id = generate_device_id(f"deeperseeker:{token}")
+    if shumei_id:
+        shumei_id = normalize_shumei_device_id(shumei_id)
     cookies_str = (
         json.dumps(cookies)
         if isinstance(cookies, dict)
@@ -1515,7 +1635,7 @@ def update_token_credentials(
         )
     if shumei_id is not None:
         updates.append("shumei_id = ?")
-        params.append(str(shumei_id))
+        params.append(str(normalize_shumei_device_id(shumei_id)))
     if device_id is not None:
         updates.append("device_id = ?")
         params.append(str(device_id))
@@ -3957,8 +4077,8 @@ async def _send_message_unlocked(
     if parent_message_id:
         json_data["parent_message_id"] = parent_message_id
 
-    resolved_shumei = shumei_id or extract_shumei_device_id(cookie)
-    if resolved_shumei and str(resolved_shumei).startswith("B"):
+    resolved_shumei = normalize_shumei_device_id(shumei_id) or extract_shumei_device_id(cookie)
+    if resolved_shumei:
         json_data["shumei_device_id"] = resolved_shumei
 
     think_open = False

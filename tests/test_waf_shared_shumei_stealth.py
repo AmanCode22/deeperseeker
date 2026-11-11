@@ -50,7 +50,7 @@ def test_waf_shared_across_tokens_while_shumei_isolated(monkeypatch, tmp_path):
     assert da != db
 
 
-def test_warmup_zero_browser_launches_when_shumei_present(monkeypatch, tmp_path):
+def test_warmup_always_refreshes_tokens_when_fast_start_disabled(monkeypatch, tmp_path):
     db_path = str(tmp_path / "test_warmup_fast.db")
     monkeypatch.setattr(functions, "_db", db_path)
     functions.init_db()
@@ -66,16 +66,19 @@ def test_warmup_zero_browser_launches_when_shumei_present(monkeypatch, tmp_path)
     monkeypatch.setattr(functions, "_read_cookie_file", lambda: {"aws-waf-token": "waf"})
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv("DEEPSEEKER_DISABLE_WARMUP", raising=False)
+    monkeypatch.delenv("DEEPSEEKER_FAST_START", raising=False)
 
     batch_mock = mock.AsyncMock()
     monkeypatch.setattr(functions, "_generate_shumei_ids_for_tokens", batch_mock)
 
     asyncio.run(functions.warmup_all_tokens_cookies())
 
-    batch_mock.assert_not_called()
+    batch_mock.assert_called_once()
+    called_tokens = batch_mock.call_args[0][0]
+    assert len(called_tokens) == 5
 
 
-def test_warmup_batches_tokens_lacking_shumei(monkeypatch, tmp_path):
+def test_warmup_batches_all_tokens_even_if_some_have_shumei(monkeypatch, tmp_path):
     db_path = str(tmp_path / "test_warmup_batch.db")
     monkeypatch.setattr(functions, "_db", db_path)
     functions.init_db()
@@ -87,6 +90,7 @@ def test_warmup_batches_tokens_lacking_shumei(monkeypatch, tmp_path):
     monkeypatch.setattr(functions, "_read_cookie_file", lambda: {"aws-waf-token": "waf"})
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv("DEEPSEEKER_DISABLE_WARMUP", raising=False)
+    monkeypatch.delenv("DEEPSEEKER_FAST_START", raising=False)
 
     batch_mock = mock.AsyncMock()
     monkeypatch.setattr(functions, "_generate_shumei_ids_for_tokens", batch_mock)
@@ -95,11 +99,11 @@ def test_warmup_batches_tokens_lacking_shumei(monkeypatch, tmp_path):
 
     batch_mock.assert_called_once()
     called_tokens = batch_mock.call_args[0][0]
-    assert len(called_tokens) == 2
+    assert len(called_tokens) == 3
     token_strs = [t[1] for t in called_tokens]
     assert "tok-needs-1" in token_strs
     assert "tok-needs-2" in token_strs
-    assert "tok-ready" not in token_strs
+    assert "tok-ready" in token_strs
 
 
 def test_stealth_evasion_configuration():
@@ -144,12 +148,15 @@ def test_fast_start_applies_shared_shumei_id(monkeypatch, tmp_path):
     monkeypatch.setattr(functions, "_db", db_path)
     functions.init_db()
 
-    functions.add_token("tok-1", alias="one")
-    functions.add_token("tok-2", alias="two")
+    functions.add_token("tok-1", alias="one", shumei_id="Bold_1")
+    functions.add_token("tok-2", alias="two", shumei_id="Bold_2")
 
     monkeypatch.setenv("DEEPSEEKER_FAST_START", "true")
-    monkeypatch.setattr(functions, "_read_cookie_file", lambda: {"aws-waf-token": "waf"})
-    monkeypatch.setattr(functions, "_read_global_shumei_id", lambda: "Bshared_shumei_fast")
+    monkeypatch.setattr(
+        functions,
+        "_generate_cookies",
+        mock.AsyncMock(return_value=({"aws-waf-token": "waf-fresh"}, 1799999999, "Bshared_shumei_fast")),
+    )
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv("DEEPSEEKER_DISABLE_WARMUP", raising=False)
 
@@ -164,6 +171,9 @@ def test_fast_start_applies_shared_shumei_id(monkeypatch, tmp_path):
     t2 = functions.get_token(2)
     assert t1["shumei_id"] == "Bshared_shumei_fast"
     assert t2["shumei_id"] == "Bshared_shumei_fast"
+    import json
+    c1 = json.loads(t1["cookies"])
+    assert c1["cookie"]["aws-waf-token"] == "waf-fresh"
 
 
 def test_warmup_headless_toggle(monkeypatch):
@@ -206,3 +216,95 @@ def test_get_isolated_cookies_non_blocking_on_missing_shumei(monkeypatch, tmp_pa
     assert c["aws-waf-token"] == "w"
     assert sh == "Bfallback_shumei"
     assert dev is not None
+
+
+def test_normalize_shumei_device_id_prefix_and_unquoting():
+    assert functions.normalize_shumei_device_id(None) is None
+    assert functions.normalize_shumei_device_id("") is None
+    assert functions.normalize_shumei_device_id("BalreadyHasB==") == "BalreadyHasB=="
+    assert functions.normalize_shumei_device_id("needsB==") == "BneedsB=="
+    assert functions.normalize_shumei_device_id("needsB%3D%3D") == "BneedsB=="
+    assert functions.normalize_shumei_device_id("Balready%3D%3D") == "Balready=="
+
+
+def test_extract_shumei_device_id_ensures_prefix_b(monkeypatch):
+    cookies = {
+        "aws-waf-token": "waf",
+        "smidV2": "20261111...",
+        ".thumbcache_6b2e5483f9d858d7c661c5e276b6a6ae": "rawThumbcacheValue%3D%3D",
+    }
+    extracted = functions.extract_shumei_device_id(cookies)
+    assert extracted == "BrawThumbcacheValue=="
+    assert extracted.startswith("B")
+
+    monkeypatch.setenv("DEEPSEEKER_SHUMEI_DEVICE_ID", "envValWithoutB==")
+    assert functions.extract_shumei_device_id({}) == "BenvValWithoutB=="
+
+    monkeypatch.setenv("DEEPSEEKER_SHUMEI_DEVICE_ID", "BenvValWithB==")
+    assert functions.extract_shumei_device_id({}) == "BenvValWithB=="
+
+
+def test_send_message_includes_normalized_shumei_id(monkeypatch):
+    sh_id = "testShumeiWithoutB=="
+    monkeypatch.setattr(
+        functions,
+        "get_isolated_cookies_for_token",
+        mock.AsyncMock(
+            return_value=(
+                {
+                    "aws-waf-token": "w",
+                    "smidV2": "s",
+                    ".thumbcache_abc": "testShumeiWithoutB%3D%3D",
+                },
+                sh_id,
+                "dev-123",
+            )
+        ),
+    )
+    monkeypatch.setattr(functions, "solve_create_pow", mock.AsyncMock(return_value="pow-123"))
+
+    captured_req = {}
+
+    class FakeResp:
+        status = 200
+        headers = {"content-type": "text/event-stream"}
+
+        def __init__(self):
+            self.content = self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def iter_any(self):
+            yield b'data: {"p": "response", "o": "BATCH", "v": [{"p": "fragments", "v": [{"type": "RESPONSE", "content": "hi"}]}]}\n\ndata: {"p": "response/status", "v": "FINISHED"}\n\n'
+
+    async def fake_post(path, headers=None, json=None, cookies=None, **kwargs):
+        captured_req["path"] = path
+        captured_req["json"] = json
+        captured_req["cookies"] = cookies
+        return FakeResp()
+
+    monkeypatch.setattr(functions, "post_with_failover", fake_post)
+
+    async def run_gen():
+        chunks = []
+        async for c in functions.send_message(
+            chat_id="chat-1",
+            auth_token="tok-1",
+            message="hello",
+            parent_message_id=None,
+        ):
+            chunks.append(c)
+        return chunks
+
+    res = asyncio.run(run_gen())
+    assert len(res) > 0
+    assert "shumei_device_id" in captured_req["json"]
+    assert captured_req["json"]["shumei_device_id"] == "BtestShumeiWithoutB=="
+    assert captured_req["json"]["shumei_device_id"].startswith("B")
+    assert captured_req["cookies"]["smidV2"] == "s"
+    assert captured_req["cookies"][".thumbcache_abc"] == "testShumeiWithoutB%3D%3D"
+

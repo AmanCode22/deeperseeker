@@ -95,7 +95,7 @@ def test_extract_shumei_device_id():
         ".thumbcache_6b2e5483f9d858d7c661c5e276b6a6ae": "b9dIQDDbDoaexszgYZBwqZ7EF9Be2TZZzX76fivt3NkVgk4C8op36qcGi2+slbEFK3oeb6UsG9APdR+ChcrNIA%3D%3D",
     }
     shumei_id = functions.extract_shumei_device_id(cookies)
-    assert shumei_id == "b9dIQDDbDoaexszgYZBwqZ7EF9Be2TZZzX76fivt3NkVgk4C8op36qcGi2+slbEFK3oeb6UsG9APdR+ChcrNIA=="
+    assert shumei_id == "Bb9dIQDDbDoaexszgYZBwqZ7EF9Be2TZZzX76fivt3NkVgk4C8op36qcGi2+slbEFK3oeb6UsG9APdR+ChcrNIA=="
 
     assert functions.extract_shumei_device_id({".thumbcache_test": "B12345"}) == "B12345"
 
