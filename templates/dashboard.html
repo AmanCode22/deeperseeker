@@ -1,7 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Dashboard - DeeperSeeker{% endblock %}
 {% block content %}
-<h1>Dashboard</h1>
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+    <h1 style="margin-bottom: 0;">Dashboard</h1>
+    <div id="live-indicator" style="font-size: 0.85em; color: #3fb950; display: inline-flex; align-items: center; gap: 6px; user-select: none;">
+        <span id="live-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#3fb950; box-shadow:0 0 6px #3fb950;"></span>
+        <span id="live-text">Live (0.5s)</span>
+    </div>
+</div>
 
 <section>
     <h2>Add Auth Token</h2>
@@ -58,7 +64,7 @@
     </script>
 </section>
 
-<section>
+<section id="token-pool-section">
     <h2>Token pool ({{ tokens|length }})</h2>
     {% if tokens %}
     <table>
@@ -126,7 +132,7 @@
     {% endif %}
 </section>
 
-<section>
+<section id="usage-section">
     <h2>Usage — last 30 days (per day × per key)</h2>
     {% if usage_rows %}
     <table>
@@ -173,4 +179,78 @@
     <p>Anthropic: <code>http://localhost:4000</code></p>
     <p>Model: <code>v4.1flash</code> (single default DeepSeek model)</p>
 </section>
+
+<script>
+(function() {
+    let isMouseDown = false;
+    let isSubmitting = false;
+
+    document.addEventListener('mousedown', function() { isMouseDown = true; });
+    document.addEventListener('mouseup', function() { isMouseDown = false; });
+    document.addEventListener('submit', function() { isSubmitting = true; });
+
+    const dot = document.getElementById('live-dot');
+    const text = document.getElementById('live-text');
+
+    async function updateDashboard() {
+        if (document.hidden || isMouseDown || isSubmitting) return;
+
+        const curPool = document.getElementById('token-pool-section');
+        const curUsage = document.getElementById('usage-section');
+        const active = document.activeElement;
+        if (active && ((curPool && curPool.contains(active)) || (curUsage && curUsage.contains(active)))) {
+            return;
+        }
+
+        try {
+            const res = await fetch(window.location.href, {
+                headers: { 'Cache-Control': 'no-cache' },
+                credentials: 'same-origin'
+            });
+
+            if (res.redirected && res.url.includes('/login')) {
+                window.location.href = '/login';
+                return;
+            }
+
+            if (!res.ok) {
+                if (dot) {
+                    dot.style.background = '#da3633';
+                    dot.style.boxShadow = 'none';
+                }
+                if (text) text.textContent = 'Offline';
+                return;
+            }
+
+            const html = await res.text();
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+
+            const newPool = doc.getElementById('token-pool-section');
+            if (newPool && curPool && curPool.innerHTML !== newPool.innerHTML) {
+                curPool.innerHTML = newPool.innerHTML;
+            }
+
+            const newUsage = doc.getElementById('usage-section');
+            if (newUsage && curUsage && curUsage.innerHTML !== newUsage.innerHTML) {
+                curUsage.innerHTML = newUsage.innerHTML;
+            }
+
+            if (dot) {
+                dot.style.background = '#3fb950';
+                dot.style.boxShadow = '0 0 6px #3fb950';
+            }
+            if (text) text.textContent = 'Live (0.5s)';
+        } catch (e) {
+            if (dot) {
+                dot.style.background = '#da3633';
+                dot.style.boxShadow = 'none';
+            }
+            if (text) text.textContent = 'Reconnecting...';
+        }
+    }
+
+    setInterval(updateDashboard, 500);
+})();
+</script>
 {% endblock %}
