@@ -26,6 +26,28 @@ th { color: #8b949e; font-weight: 600; }
 .status.ok { background: #238636; color: #fff; }
 .status.warn { background: #9e6a03; color: #fff; }
 .status.err { background: #da3633; color: #fff; }
+@property --warm-a { syntax: "<color>"; inherits: false; initial-value: #c2410c; }
+@property --warm-b { syntax: "<color>"; inherits: false; initial-value: #9a3412; }
+.status.warming { background: linear-gradient(90deg, var(--warm-a), var(--warm-b)); color: #fff; position: relative; animation: warm-tint 3s ease-in-out infinite; }
+.steam { position: absolute; left: 0; right: 0; top: 50%; height: 0; pointer-events: none; }
+.steam i, .steam::before, .steam::after { position: absolute; bottom: 0; width: var(--s); height: var(--s); margin-left: calc(var(--s) / -2); border-radius: 50%; background: rgba(156, 163, 175, 0.55); opacity: 0; animation: steam-rise var(--t) linear var(--d) infinite; }
+.steam i:nth-child(1) { left: 10%; --s: 7px; --t: 0.8s; --d: 0s; }
+.steam i:nth-child(2) { left: 50%; --s: 10px; --t: 1.3s; --d: 0.21s; }
+.steam i:nth-child(3) { left: 90%; --s: 8px; --t: 0.95s; --d: 0.47s; }
+.steam::before { content: ""; left: 30%; --s: 9px; --t: 1.1s; --d: 0.12s; }
+.steam::after { content: ""; left: 70%; --s: 6px; --t: 1.45s; --d: 0.6s; }
+@keyframes warm-tint {
+  0%, 100% { --warm-a: #c2410c; --warm-b: #9a3412; }
+  50% { --warm-a: #fb923c; --warm-b: #f97316; }
+}
+@keyframes steam-rise {
+  0% { transform: translateY(0) scale(0.6); opacity: 0; }
+  25% { transform: translateY(-12px) scale(0.9); opacity: 0.8; }
+  50% { transform: translateY(-22px) scale(1.1); }
+  75% { transform: translateY(-32px); opacity: 0.5; }
+  100% { transform: translateY(-44px) scale(1.3); opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) { .status.warming { animation: none; } .steam { display: none; } }
 .state-note { font-size: 0.8em; color: #8b949e; margin-top: 4px; }
 .warning { background: #9e6a0322; border: 1px solid #9e6a03; color: #e3b341; padding: 10px; border-radius: 4px; margin-bottom: 12px; font-size: 0.9em; }
 code { background: #0d1117; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }

@@ -86,94 +86,90 @@ def test_extract_upstream_message_id_shapes():
     assert _extract_upstream_message_id({"unrelated": True}) is None
 
 
-def test_bare_json_tool_call_object():
+def test_bare_json_in_prose_is_not_a_tool_call():
     token = request_tools.set(TOOLS)
     try:
         text = 'Please run: {"name": "bash", "arguments": {"command": "ls -la"}}'
         tools, clean = parse_tools(text)
-        assert len(tools) == 1
-        assert tools[0]["function"]["name"] == "bash"
-        assert json.loads(tools[0]["function"]["arguments"]) == {"command": "ls -la"}
-        assert clean == "Please run:"
+        assert tools == []
+        assert clean == text
     finally:
         request_tools.reset(token)
 
 
-def test_bare_json_tool_call_array():
+def test_bare_json_array_in_prose_is_not_a_tool_call():
     token = request_tools.set(TOOLS)
     try:
         text = (
-            '[\n'
-            '  {"name": "bash", "arguments": {"command": "pwd"}},\n'
-            '  {"name": "read", "arguments": {"path": "main.py"}}\n'
-            ']'
+            "Example output:\n"
+            '[\n  {"name": "bash", "arguments": {"command": "pwd"}},\n'
+            '  {"name": "read", "arguments": {"path": "main.py"}}\n]'
         )
         tools, clean = parse_tools(text)
-        assert len(tools) == 2
-        assert tools[0]["function"]["name"] == "bash"
-        assert tools[1]["function"]["name"] == "read"
-        assert clean == ""
+        assert tools == []
+        assert clean == text
     finally:
         request_tools.reset(token)
 
 
-def test_bare_json_truncated_repair():
+def test_bare_truncated_json_is_not_a_tool_call():
     token = request_tools.set(TOOLS)
     try:
         text = '{"name": "bash", "arguments": {"command": "git status"'
         tools, clean = parse_tools(text)
-        assert len(tools) == 1
-        assert tools[0]["function"]["name"] == "bash"
-        assert json.loads(tools[0]["function"]["arguments"]) == {"command": "git status"}
-        assert clean == ""
+        assert tools == []
+        assert clean == text
     finally:
         request_tools.reset(token)
 
 
-def test_bare_args_inferred():
+def test_bare_args_object_is_not_inferred_as_tool_call():
     token = request_tools.set(TOOLS)
     try:
         text = '{"command": "echo 123"}'
         tools, clean = parse_tools(text)
-        assert len(tools) == 1
-        assert tools[0]["function"]["name"] == "bash"
-        assert json.loads(tools[0]["function"]["arguments"]) == {"command": "echo 123"}
-        assert clean == ""
+        assert tools == []
+        assert clean == text
     finally:
         request_tools.reset(token)
 
 
-def test_tool_name_prediction():
+def test_tool_name_prediction_with_explicit_tag():
     token = request_tools.set(TOOLS)
     try:
-        text = '{"name": "functions.bash", "arguments": {"command": "uptime"}}'
-        tools, _ = parse_tools(text)
-        assert len(tools) == 1
-        assert tools[0]["function"]["name"] == "bash"
-
-        text2 = '{"name": "BASH", "arguments": {"command": "uptime"}}'
-        tools2, _ = parse_tools(text2)
-        assert len(tools2) == 1
-        assert tools2[0]["function"]["name"] == "bash"
-
-        text3 = '{"name": "bash_tool", "arguments": {"command": "uptime"}}'
-        tools3, _ = parse_tools(text3)
-        assert len(tools3) == 1
-        assert tools3[0]["function"]["name"] == "bash"
+        cases = [
+            ('{"name": "functions.bash", "arguments": {"command": "uptime"}}', "bash"),
+            ('{"name": "BASH", "arguments": {"command": "uptime"}}', "bash"),
+            ('{"name": "bash_tool", "arguments": {"command": "uptime"}}', "bash"),
+        ]
+        for payload, expected in cases:
+            tools, _ = parse_tools(f"<tool_call>{payload}</tool_call>")
+            assert len(tools) == 1, payload
+            assert tools[0]["function"]["name"] == expected, payload
     finally:
         request_tools.reset(token)
 
 
-def test_single_tool_prediction():
+def test_single_tool_prediction_with_explicit_tag():
     token = request_tools.set([_tool("only_tool", ["arg1"], ["arg1"])])
     try:
-        text = '{"name": "broken_or_unknown", "arguments": {"arg1": "val"}}'
+        text = '<tool_call>{"name": "broken_or_unknown", "arguments": {"arg1": "val"}}</tool_call>'
         tools, _ = parse_tools(text)
         assert len(tools) == 1
         assert tools[0]["function"]["name"] == "only_tool"
     finally:
         request_tools.reset(token)
 
+
+def test_fenced_json_example_is_not_a_tool_call():
+    token = request_tools.set(TOOLS)
+    try:
+        text = '```json\n{"name": "bash", "arguments": {"command": "ls"}}\n```'
+        tools, clean = parse_tools(text)
+        assert tools == []
+        assert clean == text
+    finally:
+        request_tools.reset(token)
 
 def test_bare_json_ignored_when_no_tools_in_request():
     token = request_tools.set([])

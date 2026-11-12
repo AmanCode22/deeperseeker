@@ -1128,6 +1128,7 @@ def invalidate_global_cookies():
 _token_cookie_locks = {}
 _token_locks_guard = asyncio.Lock()
 _pending_shumei_generation = set()
+_warming_token_ids: set[int] = set()
 _pending_shumei_lock = asyncio.Lock()
 
 
@@ -1229,6 +1230,17 @@ async def get_isolated_cookies_for_token(
 
 
 async def _generate_shumei_ids_for_tokens(tokens: list[tuple[int, str]]):
+    if not tokens:
+        return
+    _warming_token_ids.update(tid for tid, _ in tokens)
+    try:
+        await _generate_shumei_ids_batch(tokens)
+    finally:
+        for tid, _ in tokens:
+            _warming_token_ids.discard(tid)
+
+
+async def _generate_shumei_ids_batch(tokens: list[tuple[int, str]]):
     """Generate isolated Shumei device IDs for multiple tokens using a single shared browser instance."""
     if async_playwright is None or not tokens:
         return
@@ -1329,6 +1341,8 @@ async def _generate_shumei_ids_for_tokens(tokens: list[tuple[int, str]]):
                             tid,
                             e,
                         )
+                    finally:
+                        _warming_token_ids.discard(tid)
             finally:
                 await browser.close()
     except Exception as e:
@@ -1432,7 +1446,7 @@ async def solve_captcha_interactive(token_id: int) -> bool:
     """Launch a real visible Playwright browser for the given token on chat.deepseek.com.
 
     Injects the user's auth_token into localStorage and any existing cookies,
-    allowing the operator to solve any Cloudflare/Shumei/Chairman Xi captcha
+    allowing the operator to solve any Cloudflare/Shumei/DeepSeek captcha
     interactively with their mouse. Once the window is closed or captcha is
     solved, saves the updated cookies and restores the token to ACTIVE.
     """
@@ -1910,7 +1924,7 @@ def mark_parked(token_id, reason, duration=86400):
 
 
 CAPTCHA_CHALLENGE_MESSAGE = (
-    "Account social credit is critically low: Winnie-the-Pooh requested captcha verification."
+    "Account social credit is critically low: some comrade requested captcha verification."
 )
 
 
@@ -2148,7 +2162,11 @@ def get_pool_view():
             or "challenge" in str(park_reason or "").lower()
             or (until and (until - now) <= 1805 and (until - now) > 0)
         )
-        if status == "QUARANTINED":
+        warming = status == "ACTIVE" and tid in _warming_token_ids
+        if warming:
+            state_class, cooldown = "warming", "—"
+            note = "warming up — building cookies and Shumei ID"
+        elif status == "QUARANTINED":
             state_class, cooldown = "err", "—"
             note = "quarantined — manual return required"
         elif status == "PARKED" and until and until > now:
@@ -2184,6 +2202,8 @@ def get_pool_view():
                 "id": tid,
                 "label": alias if alias else f"untagged #{tid}",
                 "status": status,
+                "status_label": "WARMING" if warming else status,
+                "warming": warming,
                 "state_class": state_class,
                 "state_note": note,
                 "in_flight": _in_flight.get(tid, 0),
@@ -3184,130 +3204,6 @@ def parse_tools(text):
                 codeblock_pattern, "", clean_text, flags=re.DOTALL
             ).strip()
 
-    if not tools:
-        json_pattern = r"```json\s*(\{.*?\})\s*```"
-        json_matches = list(re.finditer(json_pattern, clean_text, flags=re.DOTALL))
-        for m in json_matches:
-            cleaned = clean_json_str(m.group(1))
-            try:
-                data = json.loads(cleaned)
-                if isinstance(data, dict) and (
-                    "name" in data or "tool" in data or "function" in data
-                ):
-                    name = (
-                        data.get("name")
-                        or data.get("tool")
-                        or data.get("function")
-                        or data.get("action")
-                    )
-                    args = (
-                        data.get("arguments")
-                        or data.get("parameters")
-                        or data.get("input")
-                        or data.get("args")
-                        or {}
-                    )
-                    norm = normalize_tool_call(name, args)
-                    if norm:
-                        tools.append(norm)
-            except Exception:
-                pass
-        if tools:
-            clean_text = re.sub(json_pattern, "", clean_text, flags=re.DOTALL).strip()
-
-    if not tools:
-        schemas = _tool_schemas()
-        if schemas:
-            decoder = json.JSONDecoder()
-            spans_to_remove = []
-            pos = 0
-            while pos < len(clean_text):
-                if fenced(pos):
-                    pos += 1
-                    continue
-                ch = clean_text[pos]
-                if ch in ("{", "["):
-                    sub = clean_text[pos:]
-                    parsed_obj = None
-                    end_idx = None
-                    try:
-                        parsed_obj, consumed = decoder.raw_decode(sub)
-                        end_idx = pos + consumed
-                    except Exception:
-                        repaired = _repair_truncated_json(sub)
-                        try:
-                            parsed_obj = json.loads(repaired)
-                            end_idx = len(clean_text)
-                        except Exception:
-                            parsed_obj = None
-                    if parsed_obj is not None:
-                        items = (
-                            parsed_obj
-                            if isinstance(parsed_obj, list)
-                            else [parsed_obj]
-                        )
-                        if isinstance(parsed_obj, dict) and isinstance(
-                            parsed_obj.get("tool_calls") or parsed_obj.get("calls"),
-                            list,
-                        ):
-                            items = parsed_obj.get("tool_calls") or parsed_obj.get(
-                                "calls"
-                            )
-                        recognized = []
-                        for it in items:
-                            if not isinstance(it, dict):
-                                continue
-                            c_name = (
-                                it.get("name")
-                                or it.get("tool")
-                                or it.get("tool_name")
-                                or it.get("function")
-                                or it.get("action")
-                            )
-                            c_args = (
-                                it.get("arguments")
-                                or it.get("parameters")
-                                or it.get("input")
-                                or it.get("args")
-                                or it.get("params")
-                            )
-                            if c_args is None and c_name:
-                                c_args = {
-                                    k: v
-                                    for k, v in it.items()
-                                    if k
-                                    not in (
-                                        "name",
-                                        "tool",
-                                        "tool_name",
-                                        "function",
-                                        "action",
-                                    )
-                                }
-                            if not c_name:
-                                c_args = it
-                                c_name = _match_or_predict_tool_name(
-                                    None, c_args, schemas
-                                )
-                            else:
-                                c_name = _match_or_predict_tool_name(
-                                    c_name, c_args, schemas
-                                )
-                            if c_name and (c_name in schemas or len(schemas) == 1):
-                                norm = normalize_tool_call(c_name, c_args or {})
-                                if norm:
-                                    recognized.append(norm)
-                        if recognized:
-                            tools.extend(recognized)
-                            spans_to_remove.append((pos, end_idx))
-                            pos = end_idx
-                            continue
-                pos += 1
-            if spans_to_remove:
-                spans_to_remove.sort(reverse=True, key=lambda s: s[0])
-                for start_s, end_s in spans_to_remove:
-                    clean_text = clean_text[:start_s] + clean_text[end_s:]
-                clean_text = clean_text.strip()
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
     clean_text = _strip_wrapper_tags(clean_text).strip()

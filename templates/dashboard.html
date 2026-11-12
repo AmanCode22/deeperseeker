@@ -79,7 +79,7 @@
                 <td>{{ tok['id'] }}</td>
                 <td>{{ tok['label'] }}</td>
                 <td>
-                    <span class="status {{ tok['state_class'] }}">{{ tok['status'] }}</span>
+                    <span class="status {{ tok['state_class'] }}">{{ tok['status_label'] }}{% if tok['warming'] %}<span class="steam" aria-hidden="true"><i></i><i></i><i></i></span>{% endif %}</span>
                     <div class="state-note">{{ tok['state_note'] }}</div>
                 </td>
                 <td>{{ tok['in_flight'] }}</td>
@@ -88,7 +88,7 @@
                 <td>
                     {% if tok['can_solve_captcha'] %}
                     <form method="post" action="/tokens/{{ tok['id'] }}/solve_captcha" style="display:inline"
-                          onsubmit="return confirm('A browser window will now open to solve Winnie-the-Pooh captcha. Send any prompt in a new chat, solve the captcha, then close the browser. DO NOT FORGET TO CLICK THE Restore BUTTON IN THE PANEL AFTERWARDS.')">
+                          onsubmit="return confirm('A browser window will now open to solve some comrade captcha. Send any prompt in a new chat, solve the captcha, then close the browser. DO NOT FORGET TO CLICK THE Restore BUTTON IN THE PANEL AFTERWARDS.')">
                         <button type="submit" class="btn-sm" style="background:#d97706;color:#fff;" title="Open real browser with this account on chat.deepseek.com to solve captcha">Solve Captcha</button>
                     </form>
                     {% endif %}
@@ -98,7 +98,7 @@
                     </form>
                     {% endif %}
                     <form method="post" action="/tokens/{{ tok['id'] }}/purge" style="display:inline"
-                          onsubmit="return confirm('This button will delete all your chats and disable Winnie-the-Pooh tracking, possibly lowering account social credit with frequent purging. Are you sure?')">
+                          onsubmit="return confirm('This button will delete all your chats and disable some comrade tracking, possibly lowering account social credit with frequent purging. Are you sure?')">
                         <button type="submit" class="btn-sm">Purge Chats</button>
                     </form>
                     <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
@@ -112,7 +112,7 @@
     </table>
     <div style="margin-top: 10px; margin-bottom: 10px;">
         <form method="post" action="/tokens/purge_all" style="display:inline"
-              onsubmit="return confirm('This button will delete all your chats and disable Winnie-the-Pooh tracking, possibly lowering account social credit with frequent purging. Are you sure?')">
+              onsubmit="return confirm('This button will delete all your chats and disable some comrade tracking, possibly lowering account social credit with frequent purging. Are you sure?')">
             <button type="submit" class="btn-sm">Purge All Chats</button>
         </form>
     </div>

@@ -362,8 +362,11 @@ async def _warmup_cookies_startup():
 async def lifespan(app: FastAPI):
     await _db(init_db)
     _install_key_access_formatter()
-    await _warmup_cookies_startup()
+    warmup_task = asyncio.create_task(_warmup_cookies_startup())
     yield
+    warmup_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await warmup_task
     # Stage 1 minor list: release the shared aiohttp ClientSession so shutdown
     # does not leak its connector sockets.
     await close_session()
@@ -652,11 +655,7 @@ def _upstream_http_code(exc):
     if biz in (40029, 50006, "40029", "50006"):
         return 429
     status = getattr(exc, "status", None)
-    if status == 202 or (
-        isinstance(exc, Exception)
-        and "202" in str(exc)
-        and ("mimetype" in str(exc) or "text/html" in str(exc) or "WAF" in str(exc))
-    ):
+    if status == 202:
         return 429
     if isinstance(status, int) and 400 <= status <= 599:
         return status
@@ -666,7 +665,7 @@ def _upstream_http_code(exc):
 async def _record_upstream_limit(token_id, exc, code):
     biz = getattr(exc, "biz_code", None)
     retry_after = getattr(exc, "retry_after", None)
-    if "WAF" in str(exc) or "202" in str(exc):
+    if getattr(exc, "status", None) == 202:
         await _db(invalidate_token_cookies, token_id)
     if biz == 40303 or code == 40303 or "40303" in str(exc):
         captcha_dock_duration = retry_after or 1800
