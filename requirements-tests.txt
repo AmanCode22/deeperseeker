@@ -83,7 +83,7 @@ pytest-asyncio==1.4.1
     # via -r requirements-tests.in
 python-dotenv==1.2.4
     # via -r requirements.in
-python-multipart==0.0.32
+python-multipart==0.0.33
     # via -r requirements.in
 starlette==1.7.0
     # via fastapi
