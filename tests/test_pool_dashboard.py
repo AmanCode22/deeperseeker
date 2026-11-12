@@ -120,9 +120,75 @@ def test_pool_view_carries_no_credential_fields():
     )
 
 
+def test_purge_chats_buttons_and_routes():
+    _seed_pool()
+    resp = _render_dashboard()
+    assert resp.status_code == 200
+    html = resp.text
+    assert "Purge Chats" in html
+    assert "Purge All Chats" in html
+    assert "/tokens/1/purge" in html
+    assert "/tokens/purge_all" in html
+
+    import app as app_module
+
+    client = TestClient(app_module.app)
+    unauth = client.post("/tokens/1/purge", follow_redirects=False)
+    assert "/login" in unauth.text
+
+    unauth_all = client.post("/tokens/purge_all", follow_redirects=False)
+    assert "/login" in unauth_all.text
+
+    app_module.SESSIONS["test-purge-admin"] = time.time()
+    client.cookies.set("session_id", "test-purge-admin")
+    try:
+        r1 = client.post("/tokens/1/purge", follow_redirects=False)
+        assert "/dashboard" in r1.text
+        r2 = client.post("/tokens/purge_all", follow_redirects=False)
+        assert "/dashboard" in r2.text
+    finally:
+        app_module.SESSIONS.pop("test-purge-admin", None)
+
+
+def test_solve_captcha_button_and_route(monkeypatch):
+    import app as app_module
+
+    _seed_pool()
+    functions.park_token_for_captcha(1, 1800)
+
+    resp = _render_dashboard()
+    assert resp.status_code == 200
+    html = resp.text
+    assert "Solve Captcha" in html
+    assert "/tokens/1/solve_captcha" in html
+
+    client = TestClient(app_module.app)
+    unauth = client.post("/tokens/1/solve_captcha", follow_redirects=False)
+    assert "/login" in unauth.text
+
+    called_solve = []
+
+    async def fake_solve(tid):
+        called_solve.append(tid)
+        return True
+
+    monkeypatch.setattr(app_module, "solve_captcha_interactive", fake_solve)
+
+    app_module.SESSIONS["test-solve-admin"] = time.time()
+    client.cookies.set("session_id", "test-solve-admin")
+    try:
+        r = client.post("/tokens/1/solve_captcha", follow_redirects=False)
+        assert "/dashboard" in r.text
+        assert called_solve == [1]
+    finally:
+        app_module.SESSIONS.pop("test-solve-admin", None)
+
+
 TESTS = [
     test_pool_table_shows_state_without_secrets,
     test_pool_view_carries_no_credential_fields,
+    test_purge_chats_buttons_and_routes,
+    test_solve_captcha_button_and_route,
 ]
 
 

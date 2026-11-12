@@ -11,6 +11,8 @@ import re
 import sqlite3
 import string
 import time
+import urllib.parse
+import uuid
 from datetime import UTC, datetime
 
 import aiohttp
@@ -18,7 +20,7 @@ import deepseek_tokenizer
 import wasmtime
 
 try:
-    from playwright.async_api import async_playwright
+    from patchright.async_api import async_playwright
 except ImportError:
     async_playwright = None
 
@@ -123,11 +125,21 @@ def init_db():
         conn.execute(
             "ALTER TABLE tokens ADD COLUMN consecutive_403 INTEGER NOT NULL DEFAULT 0"
         )
+    if "cookies" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN cookies TEXT")
+    if "shumei_id" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN shumei_id TEXT")
+    if "device_id" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN device_id TEXT")
+    if "park_reason" not in existing_cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN park_reason TEXT")
     existing_session_cols = {
         row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
     }
     if "last_used" not in existing_session_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN last_used REAL")
+    if "sent_prompt" not in existing_session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN sent_prompt TEXT")
     # P0-6 (Day 29): usage stats — one row per COMPLETED turn (client-visible
     # success), aggregated per day x per masked key at read time. Keeping raw
     # rows instead of pre-aggregated counters makes the numbers auditable and
@@ -148,6 +160,15 @@ def init_db():
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_usage_day_key ON usage(day, key_alias)"
     )
+    with contextlib.suppress(Exception):
+        rows = conn.execute("SELECT id, token, device_id FROM tokens WHERE device_id IS NOT NULL").fetchall()
+        for row in rows:
+            tid, tok, d_id = row[0], row[1], row[2]
+            if d_id and len(d_id) == 36 and d_id[14] == "5":
+                conn.execute(
+                    "UPDATE tokens SET device_id = ? WHERE id = ?",
+                    (generate_device_id(f"deeperseeker:{tok}" if tok else None), tid),
+                )
     conn.commit()
     conn.close()
     try:
@@ -268,42 +289,247 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
     )
 
 
-# B11 (Stage 1 audit): the Android client identity used to be hardcoded to one
-# version for ALL tokens — when DeepSeek's app moves, a single stale string
-# degrades every account simultaneously, and identical fingerprints correlate
-# bans. The version is env-configurable now; per-token identity profiles
-# (rotating UA/version/locale) remain a P1.
-DEEPSEEKER_CLIENT_VERSION = os.getenv("DEEPSEEKER_CLIENT_VERSION", "2.4.5")
+# Desktop Chrome client identity sent as x-client-version (B11); bump it when
+# DeepSeek's web frontend updates.
+DEEPSEEKER_CLIENT_VERSION = os.getenv("DEEPSEEKER_CLIENT_VERSION", "2.7.1")
+DEEPSEEKER_CLIENT_LOCALE = os.getenv("DEEPSEEKER_CLIENT_LOCALE", "ru")
+DEEPSEEKER_BROWSER_PLATFORM_DEFAULT = "Linux"
+DEEPSEEKER_BROWSER_UA_DEFAULT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/157.0.0.0 Safari/537.36"
+)
 
 
-def get_headers(auth_token, pow=None):
+def get_browser_user_agent(platform_name: str | None = None) -> str:
+    ua_env = os.getenv("DEEPSEEKER_BROWSER_USER_AGENT")
+    if ua_env:
+        return ua_env
+    plat = platform_name or os.getenv(
+        "DEEPSEEKER_BROWSER_PLATFORM", DEEPSEEKER_BROWSER_PLATFORM_DEFAULT
+    )
+    plat_lower = str(plat).strip().lower()
+    if plat_lower == "windows":
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/157.0.0.0 Safari/537.36"
+        )
+    if plat_lower in ("macos", "darwin", "macintosh"):
+        return (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/157.0.0.0 Safari/537.36"
+        )
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/157.0.0.0 Safari/537.36"
+    )
+
+
+def normalize_shumei_device_id(val: str | None) -> str | None:
+    if not val:
+        return None
+    s = urllib.parse.unquote(str(val).strip())
+    if not s:
+        return None
+    return s if s.startswith("B") else f"B{s}"
+
+
+_DEVICE_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.I,
+)
+
+
+def is_valid_deepseek_device_id(val: str | None) -> bool:
+    return bool(val and _DEVICE_ID_RE.match(str(val).strip()))
+
+
+def generate_device_id(seed: str | None = None) -> str:
+    if seed:
+        import hashlib
+
+        h = hashlib.sha256(str(seed).encode("utf-8")).hexdigest()
+        return f"{h[:8]}-{h[8:12]}-4{h[13:16]}-a{h[17:20]}-{h[20:32]}"
+    return str(uuid.uuid4())
+
+
+def get_browser_timezone_id() -> str:
+    tz_env = os.getenv("DEEPSEEKER_BROWSER_TIMEZONE")
+    if tz_env:
+        return tz_env
+    try:
+        offset = int(_TZ_OFFSET)
+        if offset == 10800: # noqa: SIM116
+            return "Europe/Moscow"
+        elif offset == 7200:
+            return "Europe/Warsaw"
+        elif offset == 0:
+            return "UTC"
+    except Exception:
+        pass
+    return "Europe/Moscow"
+
+
+def extract_shumei_device_id(cookies: dict | None) -> str | None:
+    if not cookies or not isinstance(cookies, dict):
+        return normalize_shumei_device_id(os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID"))
+    for k, v in cookies.items():
+        if k.startswith(".thumbcache_") and v:
+            return normalize_shumei_device_id(v)
+    return normalize_shumei_device_id(os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID"))
+
+
+def is_browser_profile(*args, **kwargs) -> bool:
+    return True
+
+
+def resolve_client_profile(*args, **kwargs) -> str:
+    return "browser"
+
+
+def get_headers(auth_token, pow=None, *args, **kwargs):
+    browser_platform = os.getenv(
+        "DEEPSEEKER_BROWSER_PLATFORM", DEEPSEEKER_BROWSER_PLATFORM_DEFAULT
+    )
+    browser_ua = get_browser_user_agent(browser_platform)
+    locale = os.getenv("DEEPSEEKER_CLIENT_LOCALE", DEEPSEEKER_CLIENT_LOCALE)
+    client_version = os.getenv("DEEPSEEKER_CLIENT_VERSION", DEEPSEEKER_CLIENT_VERSION)
     headers = {
         "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
+        "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         "content-type": "application/json",
         "origin": "https://chat.deepseek.com",
         "referer": "https://chat.deepseek.com/",
-        "user-agent": "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 7)",
-        "x-client-platform": "android",
-        "x-client-version": DEEPSEEKER_CLIENT_VERSION,
-        "x-client-locale": "en_US",
+        "user-agent": browser_ua,
+        "sec-ch-ua": '"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": f'"{browser_platform}"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
         "x-client-bundle-id": "com.deepseek.chat",
+        "x-client-locale": locale,
+        "x-client-platform": "web",
         "x-client-timezone-offset": _TZ_OFFSET,
+        "x-client-version": client_version,
     }
+    device_id = kwargs.get("device_id")
     if auth_token:
         headers["authorization"] = f"Bearer {auth_token}"
+        headers["x-device-id"] = device_id or generate_device_id(
+            f"deeperseeker:{auth_token}"
+        )
+        headers["x-device-model"] = ""
     if pow:
         headers["x-ds-pow-response"] = pow
     return headers
 
 
+_HIF_LEIM_URL = os.getenv(
+    "DEEPSEEKER_HIF_URL",
+    os.getenv("DEEPSEEKER_HIF_LEIM_URL", "https://hif-leim.deepseek.com/query"),
+)
+_HIF_DLIQ_URL = os.getenv(
+    "DEEPSEEKER_HIF_DLIQ_URL", "https://hif-dliq.deepseek.com/query"
+)
+_HIF_URL = _HIF_LEIM_URL
+
+_hif_caches = {
+    "leim": {"value": None, "expire_at": 0.0, "retry_at": 0.0},
+    "dliq": {"value": None, "expire_at": 0.0, "retry_at": 0.0},
+}
+_hif_cache = _hif_caches["leim"]
+_hif_locks = {
+    "leim": asyncio.Lock(),
+    "dliq": asyncio.Lock(),
+}
+_hif_lock = _hif_locks["leim"]
+
+
+def _get_hif_attest_headers() -> dict[str, str]:
+    browser_platform = os.getenv(
+        "DEEPSEEKER_BROWSER_PLATFORM", DEEPSEEKER_BROWSER_PLATFORM_DEFAULT
+    )
+    browser_ua = get_browser_user_agent(browser_platform)
+    client_version = os.getenv("DEEPSEEKER_CLIENT_VERSION", DEEPSEEKER_CLIENT_VERSION)
+    return {
+        "accept": "*/*",
+        "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "origin": "https://chat.deepseek.com",
+        "referer": "https://chat.deepseek.com/",
+        "user-agent": browser_ua,
+        "sec-ch-ua": '"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": f'"{browser_platform}"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        "x-client-platform": "web",
+        "x-client-version": client_version,
+        "x-client-bundle-id": "com.deepseek.chat",
+    }
+
+
+async def get_hif_token(kind: str = "leim") -> str | None:
+    norm_kind = "dliq" if str(kind).lower() == "dliq" else "leim"
+    url = _HIF_DLIQ_URL if norm_kind == "dliq" else _HIF_LEIM_URL
+    cache = _hif_caches[norm_kind]
+    lock = _hif_locks[norm_kind]
+    now = time.time()
+    if cache["value"] and now < cache["expire_at"]:
+        return cache["value"]
+    if now < cache["retry_at"] and not cache["value"]:
+        return None
+
+    async with lock:
+        now = time.time()
+        if cache["value"] and now < cache["expire_at"]:
+            return cache["value"]
+        if now < cache["retry_at"] and not cache["value"]:
+            return None
+        try:
+            session = await get_session()
+            headers = _get_hif_attest_headers()
+            async with session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=5.0)
+            ) as resp:
+                if resp.status == 200:
+                    ttl_header = resp.headers.get("x-hif-ttl")
+                    ttl = (
+                        float(ttl_header)
+                        if ttl_header and ttl_header.isdigit()
+                        else 600.0
+                    )
+                    js = await resp.json()
+                    val = (
+                        ((js.get("data") or {}).get("biz_data") or {}).get("value")
+                        or (js.get("data") if isinstance(js.get("data"), str) else None)
+                        or (js.get("data") or {}).get("token")
+                        or js.get("token")
+                    )
+                    if val:
+                        cache["value"] = str(val)
+                        cache["expire_at"] = now + max(60.0, ttl - 30.0)
+                        return cache["value"]
+        except Exception:
+            pass
+        cache["retry_at"] = now + 60.0
+        return cache["value"]
+
+
+async def get_hif_dliq_token() -> str | None:
+    return await get_hif_token(kind="dliq")
+
+
 # ==============================================================================
-# BACKUP WAF COOKIE GENERATION (DEPRECATED IN FAVOR OF ANDROID CLIENT HEADERS)
+# WAF & SESSION COOKIE GENERATION
 #
-# DeepSeek's backend does not enforce AWS WAF on requests using Android client
-# headers. The Playwright/Chromium cookie generation below is retained as a backup
-# so that if DeepSeek ever tightens WAF rules in the future, it can easily be
-# re-enabled simply by uncommenting cookies=cookie in API calls.
+# DeepSeek's web frontend enforces AWS WAF and Shumei device fingerprinting.
+# The Playwright/Chromium cookie generation below obtains valid WAF and session
+# cookies so requests replicate an authentic desktop browser.
 # ==============================================================================
 
 _cookie_lock = asyncio.Lock()
@@ -327,48 +553,94 @@ class UpstreamError(Exception):
     mapping whenever a wording changed. Callers read .status directly; str()
     keeps the familiar 'HTTP <status>: <body>' shape for logs."""
 
-    def __init__(self, status, body=""):
+    def __init__(self, status, body="", retry_after=None):
         self.status = int(status)
         self.body = str(body)
+        self.retry_after = retry_after
         super().__init__(f"HTTP {self.status}: {self.body}")
 
 
 class UpstreamBizError(UpstreamError):
-    """HTTP 200 whose envelope carries a business-level error.
-
-    DeepSeek answers several endpoints with 200 + `{"code": N, "data": null}`
-    (or `data.biz_data: null`) when the account is flagged, its web session
-    was killed, or the per-account "messages too frequent" wall is hit. The
-    old code indexed straight into biz_data and died with
-    `'NoneType' object is not subscriptable`, which is not an UpstreamError —
-    so the token never rotated and the dead account stayed pinned forever.
-
-    Subclassing UpstreamError means `_upstream_http_code()` already reads
-    `.status`, and handle_chat's rotation path (401/403/429) picks it up with
-    no changes there.
-    """
+    def __init__(self, status, body, biz_code=None, retry_after=None):
+        super().__init__(status, body, retry_after=retry_after)
+        self.biz_code = biz_code
 
 
 def _biz_data(payload, what="response"):
-    """Return `payload["data"]["biz_data"]` or raise UpstreamBizError.
-
-    Auth-shaped business messages map to 401 so the token is quarantined /
-    rotated; everything else maps to 429 so it cools down and rotates. Both
-    are statuses handle_chat already understands.
-    """
     data = payload.get("data") if isinstance(payload, dict) else None
     biz = data.get("biz_data") if isinstance(data, dict) else None
     if biz:
+        if isinstance(biz, dict) and (biz.get("is_muted") == 1 or biz.get("biz_code") == 5):
+            mute_until = biz.get("mute_until") or biz.get("end_at")
+            retry_after = None
+            if mute_until:
+                with contextlib.suppress(Exception):
+                    retry_after = max(1, int(float(mute_until) - time.time()))
+            raise UpstreamBizError(429, f"{what}: account muted until {mute_until}", biz_code=5, retry_after=retry_after)
         return biz
     payload = payload if isinstance(payload, dict) else {}
     code = payload.get("code")
     msg = payload.get("msg") or payload.get("message") or "empty biz_data"
-    status = 401 if re.search(r"login|auth|token|session|expire", str(msg), re.I) else 429
-    raise UpstreamBizError(status, f"{what}: code={code} msg={msg}")
+    code_map = {
+        40002: 401,
+        40003: 401,
+        40012: 403,
+        40029: 429,
+        40303: 403,
+        50006: 429,
+        40006: 502,
+    }
+    retry_after = None
+    if code == 40012:
+        retry_after = 86400
+    elif code == 40303:
+        retry_after = 1800
+    elif code == 50006:
+        retry_after = 3600
+    elif code == 40029:
+        retry_after = TOKEN_COOLDOWN_SECONDS
+
+    if code in code_map:
+        status = code_map[code]
+    elif re.search(r"login|auth|token|session|expire", str(msg), re.I):
+        status = 401
+    else:
+        status = 429
+    raise UpstreamBizError(status, f"{what}: code={code} msg={msg}", biz_code=code, retry_after=retry_after)
+
+
+def _parse_cookie_env(val: str) -> dict | None:
+    if not val or not val.strip():
+        return None
+    val = val.strip()
+    if val.startswith("{") and val.endswith("}"):
+        with contextlib.suppress(Exception):
+            parsed = json.loads(val)
+            if isinstance(parsed, dict):
+                return parsed
+    res = {}
+    if ";" in val or "=" in val:
+        for part in val.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if k:
+                    res[k] = v
+        if res:
+            return res
+    return {
+        "aws-waf-token": val,
+        "ds_cookie_preference": "%257B%2522level%2522%253A%2522all%2522%257D",
+    }
 
 
 def _read_cookie_file():
     """Return valid (unexpired) cookies, or None."""
+    env_c = _parse_cookie_env(
+        os.getenv("DEEPSEEKER_WAF_COOKIE") or os.getenv("DEEPSEEK_COOKIE") or ""
+    )
+    if env_c:
+        return env_c
     try:
         with open(cookie_file_path()) as f:
             c = json.load(f)
@@ -455,26 +727,295 @@ async def get_cookies():
         raise CookieGenerationError(_cookie_fail["error"])
 
 
-async def _generate_cookies():
+_CHROMIUM_STEALTH_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-infobars",
+    "--window-position=0,0",
+    "--window-size=1920,1080",
+    "--start-maximized",
+    "--lang=en-US,en",
+    "--no-first-run",
+    "--no-default-browser-check",
+]
+
+_STEALTH_JS = """
+(function() {
+    const _nativeFunctions = new WeakMap();
+    const _oldToString = Function.prototype.toString;
+
+    function makeNative(fn, name) {
+        _nativeFunctions.set(fn, name || fn.name || '');
+        return fn;
+    }
+
+    Function.prototype.toString = makeNative(function() {
+        if (_nativeFunctions.has(this)) {
+            const name = _nativeFunctions.get(this);
+            return 'function ' + name + '() { [native code] }';
+        }
+        return _oldToString.apply(this, arguments);
+    }, 'toString');
+
+    try {
+        if (typeof Navigator !== 'undefined' && Navigator.prototype) {
+            Object.defineProperty(Navigator.prototype, 'webdriver', {
+                get: makeNative(() => false, 'get webdriver'),
+                enumerable: true,
+                configurable: true
+            });
+        }
+        Object.defineProperty(navigator, 'webdriver', {
+            get: makeNative(() => false, 'get webdriver'),
+            enumerable: true,
+            configurable: true
+        });
+    } catch (e) {}
+
+    try {
+        if (typeof Navigator !== 'undefined' && Navigator.prototype) {
+            Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', {
+                get: makeNative(() => 12, 'get hardwareConcurrency'),
+                configurable: true,
+                enumerable: true
+            });
+            Object.defineProperty(Navigator.prototype, 'deviceMemory', {
+                get: makeNative(() => 8, 'get deviceMemory'),
+                configurable: true,
+                enumerable: true
+            });
+        }
+    } catch (e) {}
+
+    try {
+        if (!navigator.connection) {
+            Object.defineProperty(navigator, 'connection', {
+                get: makeNative(() => ({
+                    downlink: 10,
+                    effectiveType: '4g',
+                    rtt: 50,
+                    saveData: false
+                }), 'get connection'),
+                configurable: true
+            });
+        }
+    } catch (e) {}
+
+    if (!window.chrome) {
+        window.chrome = {
+            app: {
+                isInstalled: false,
+                InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+                RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' }
+            },
+            runtime: {
+                OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+                OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+                PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+                RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }
+            },
+            loadTimes: makeNative(function loadTimes() {
+                return {
+                    commitLoadTime: Date.now() / 1000 - 1,
+                    connectionInfo: 'h2',
+                    finishDocumentLoadTime: Date.now() / 1000 - 0.5,
+                    finishLoadTime: Date.now() / 1000,
+                    firstPaintAfterLoadTime: 0,
+                    firstPaintTime: Date.now() / 1000 - 0.8,
+                    navigationType: 'Other',
+                    npnNegotiatedProtocol: 'h2',
+                    requestTime: Date.now() / 1000 - 1.2,
+                    startLoadTime: Date.now() / 1000 - 1.1,
+                    wasAlternateProtocolAvailable: false,
+                    wasFetchedViaSpdy: true,
+                    wasNpnNegotiated: true
+                };
+            }, 'loadTimes'),
+            csi: makeNative(function csi() {
+                return {
+                    startE: Date.now() - 1200,
+                    onloadT: Date.now(),
+                    pageT: 1200.0,
+                    tran: 15
+                };
+            }, 'csi')
+        };
+    }
+
+    if (!navigator.plugins || navigator.plugins.length === 0) {
+        const pluginsData = [
+            { name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" },
+            { name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" },
+            { name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" },
+            { name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" },
+            { name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "Portable Document Format" }
+        ];
+        pluginsData.item = makeNative(function item(index) { return this[index] || null; }, 'item');
+        pluginsData.namedItem = makeNative(function namedItem(name) {
+            for (let i = 0; i < this.length; i++) {
+                if (this[i].name === name) return this[i];
+            }
+            return null;
+        }, 'namedItem');
+        pluginsData.refresh = makeNative(function refresh() {}, 'refresh');
+
+        Object.defineProperty(navigator, 'plugins', {
+            get: makeNative(() => pluginsData, 'get plugins'),
+            enumerable: true,
+            configurable: true
+        });
+    }
+
+    if (window.navigator && window.navigator.permissions) {
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = makeNative(function query(parameters) {
+            if (parameters && parameters.name === 'notifications') {
+                return Promise.resolve({ state: Notification.permission });
+            }
+            return originalQuery.apply(this, arguments);
+        }, 'query');
+    }
+
+    const isLinux = typeof navigator !== 'undefined' && /linux/i.test(navigator.platform || navigator.userAgent);
+    const spoofWebGL = (proto) => {
+        if (!proto || !proto.getParameter) return;
+        const oldGetParameter = proto.getParameter;
+        proto.getParameter = makeNative(function getParameter(parameter) {
+            if (parameter === 37445) {
+                return isLinux ? 'Google Inc. (Intel)' : 'Google Inc. (NVIDIA)';
+            }
+            if (parameter === 37446) {
+                return isLinux
+                    ? 'ANGLE (Intel, Mesa Intel(R) Graphics (ADL GT2), OpenGL ES 3.2)'
+                    : 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            }
+            return oldGetParameter.apply(this, arguments);
+        }, 'getParameter');
+    };
+    if (typeof WebGLRenderingContext !== 'undefined') {
+        spoofWebGL(WebGLRenderingContext.prototype);
+    }
+    if (typeof WebGL2RenderingContext !== 'undefined') {
+        spoofWebGL(WebGL2RenderingContext.prototype);
+    }
+
+    try {
+        if (typeof Navigator !== 'undefined' && Navigator.prototype) {
+            Object.defineProperty(Navigator.prototype, 'languages', {
+                get: makeNative(() => ['ru-RU', 'ru', 'en-US', 'en'], 'get languages'),
+                configurable: true,
+                enumerable: true
+            });
+        }
+        Object.defineProperty(navigator, 'languages', {
+            get: makeNative(() => ['ru-RU', 'ru', 'en-US', 'en'], 'get languages'),
+            configurable: true,
+            enumerable: true
+        });
+        if (!window.outerHeight || window.outerHeight === 0 || window.outerHeight === window.innerHeight) {
+            Object.defineProperty(window, 'outerHeight', {
+                get: makeNative(() => (window.innerHeight ? window.innerHeight + 143 : 1036), 'get outerHeight'),
+                configurable: true
+            });
+        }
+        if (!window.outerWidth || window.outerWidth === 0) {
+            Object.defineProperty(window, 'outerWidth', {
+                get: makeNative(() => (window.innerWidth || 1904), 'get outerWidth'),
+                configurable: true
+            });
+        }
+    } catch (e) {}
+})();
+"""
+
+
+async def _apply_stealth(context_or_page):
+    with contextlib.suppress(Exception):
+        await context_or_page.add_init_script(_STEALTH_JS)
+
+
+async def _generate_isolated_cookies_payload():
     if async_playwright is None:
-        raise CookieGenerationError("playwright is not installed")
-    launch_kwargs = {"headless": False}
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        launch_kwargs["args"] = ["--no-sandbox"]
+        raise CookieGenerationError("patchright is not installed")
+    headless = is_cookie_headless()
+    launch_kwargs = {
+        "headless": headless,
+        "args": _CHROMIUM_STEALTH_ARGS,
+        "ignore_default_args": ["--enable-automation"],
+    }
     async with async_playwright() as p:
         browser = await p.chromium.launch(**launch_kwargs)
         try:
-            context = await browser.new_context()
+            ua = get_browser_user_agent()
+            tz_id = get_browser_timezone_id()
+            locale_id = os.getenv("DEEPSEEKER_CLIENT_LOCALE", "ru-RU")
+            context = await browser.new_context(
+                user_agent=ua,
+                viewport={"width": 1904, "height": 893},
+                screen={"width": 1920, "height": 1080},
+                locale=locale_id,
+                timezone_id=tz_id,
+                device_scale_factor=1,
+                has_touch=False,
+                is_mobile=False,
+                color_scheme="light",
+            )
+            await _apply_stealth(context)
             page = await context.new_page()
             await page.goto(
                 "https://chat.deepseek.com/",
                 wait_until="domcontentloaded",
-                timeout=45000,
+                timeout=30000,
             )
-            await page.wait_for_selector("body", timeout=30000)
-            with contextlib.suppress(Exception):
-                await page.wait_for_url("**/sign_in*", timeout=30000)
-            cookies = await context.cookies()
+            cookies = []
+            ls_shumei = None
+            ls_key = None
+            for tick in range(50):
+                cookies = await context.cookies()
+                has_waf = any(c.get("name") == "aws-waf-token" for c in cookies)
+                has_smid = any(c.get("name") == "smidV2" for c in cookies)
+                has_thumb = any(
+                    c.get("name", "").startswith(".thumbcache_") and c.get("value")
+                    for c in cookies
+                )
+                if not has_thumb and tick >= 4:
+                    with contextlib.suppress(Exception):
+                        data = await page.evaluate("""() => {
+                            try {
+                                if (window.SMSdk && typeof window.SMSdk.getDeviceId === 'function') {
+                                    const did = window.SMSdk.getDeviceId();
+                                    if (did && did.length > 5) return {key: '.thumbcache_smsdk', val: did};
+                                }
+                            } catch (e) {}
+                            for (let i = 0; i < localStorage.length; i++) {
+                                const k = localStorage.key(i);
+                                if (k && (k.startsWith('.thumbcache') || k === '_sm_di')) {
+                                    const v = localStorage.getItem(k);
+                                    if (v && v.length > 5) return {key: k, val: v};
+                                }
+                            }
+                            return null;
+                        }""")
+                        if data and isinstance(data, dict):
+                            ls_shumei = data.get("val")
+                            ls_key = data.get("key")
+                            if ls_shumei:
+                                has_thumb = True
+                if has_waf and has_smid and has_thumb:
+                    break
+                if has_waf and has_smid and tick >= 38:
+                    break
+                if has_waf and tick >= 45:
+                    break
+                await asyncio.sleep(0.3)
         finally:
             await browser.close()
     final_cookies = {}
@@ -483,35 +1024,588 @@ async def _generate_cookies():
         if i.get("name") == "aws-waf-token":
             expiry = i.get("expires")
         final_cookies[i["name"]] = i["value"]
+    thumb_key = next((k for k in final_cookies if k.startswith(".thumbcache_")), None)
+    if ls_shumei:
+        if not thumb_key:
+            final_cookies[ls_key or ".thumbcache_default"] = urllib.parse.quote(ls_shumei.lstrip("B"))
+        elif not final_cookies.get(thumb_key):
+            final_cookies[thumb_key] = urllib.parse.quote(ls_shumei.lstrip("B"))
     final_cookies["ds_cookie_preference"] = (
         "%257B%2522level%2522%253A%2522all%2522%257D"
     )
     if not expiry or expiry < 0:
         expiry = time.time() + 1800
+    shumei_id = extract_shumei_device_id(final_cookies)
+    if not shumei_id and ls_shumei:
+        shumei_id = normalize_shumei_device_id(ls_shumei)
+    return final_cookies, expiry, shumei_id
+
+
+async def _generate_cookies():
+    final_cookies, expiry, shumei_id = await _generate_isolated_cookies_payload()
     target = cookie_file_path()
     target_dir = os.path.dirname(os.path.abspath(target))
     os.makedirs(target_dir, exist_ok=True)
     tmp_path = os.path.join(target_dir, os.path.basename(target) + ".tmp")
+    data = {"cookie": final_cookies, "expiry": int(expiry) if expiry else int(time.time() + 1800)}
+    if shumei_id:
+        data["shumei_id"] = shumei_id
     with open(tmp_path, "w") as f:
-        f.write(json.dumps({"cookie": final_cookies, "expiry": expiry}))
+        f.write(json.dumps(data))
     os.replace(tmp_path, target)
-    logger.info(
-        "DeepSeek cookies saved to %s (expires %s)",
-        target,
-        datetime.fromtimestamp(expiry) if expiry else "n/a",
+    return final_cookies, expiry, shumei_id
+
+
+def _read_global_shumei_id() -> str | None:
+    try:
+        with open(cookie_file_path()) as f:
+            c = json.load(f)
+        return normalize_shumei_device_id(c.get("shumei_id")) or extract_shumei_device_id(c.get("cookie"))
+    except Exception:
+        return None
+
+
+def _save_global_shumei_id(shumei_id: str):
+    if not shumei_id:
+        return
+    norm = normalize_shumei_device_id(shumei_id)
+    try:
+        target = cookie_file_path()
+        if os.path.exists(target):
+            with open(target) as f:
+                data = json.load(f)
+            data["shumei_id"] = norm
+            target_dir = os.path.dirname(os.path.abspath(target))
+            tmp_path = os.path.join(target_dir, os.path.basename(target) + ".tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, target)
+    except Exception:
+        pass
+
+
+def is_cookie_headless() -> bool:
+    if os.getenv("DEEPSEEKER_WARMUP_NON_HEADLESS", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return False
+    if os.getenv("DEEPSEEKER_NON_HEADLESS_WARMUP", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return False
+    val = (
+        os.getenv("DEEPSEEKER_COOKIE_HEADLESS")
+        or os.getenv("DEEPSEEKER_WARMUP_HEADLESS")
+        or "true"
     )
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def is_fast_start_enabled() -> bool:
+    val = (
+        os.getenv("DEEPSEEKER_FAST_START")
+        or os.getenv("DEEPSEEKER_FAST_STARTUP")
+        or "false"
+    )
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def invalidate_global_cookies():
+    try:
+        p = cookie_file_path()
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+
+_token_cookie_locks = {}
+_token_locks_guard = asyncio.Lock()
+_pending_shumei_generation = set()
+_warming_token_ids: set[int] = set()
+_pending_shumei_lock = asyncio.Lock()
+
+
+async def _get_token_lock(auth_token: str) -> asyncio.Lock:
+    async with _token_locks_guard:
+        if auth_token not in _token_cookie_locks:
+            _token_cookie_locks[auth_token] = asyncio.Lock()
+        return _token_cookie_locks[auth_token]
+
+
+async def get_isolated_cookies_for_token(
+    auth_token: str | None = None,
+) -> tuple[dict | None, str | None, str | None]:
+    """Return (cookies_dict, shumei_device_id, device_id) isolated per account.
+
+    AWS WAF token is shared globally to minimize resource consumption on small VPS,
+    while Shumei device ID and device_id UUID are strictly isolated per account.
+    """
+    if not auth_token:
+        c = await get_cookies_safely()
+        return c, extract_shumei_device_id(c), None
+
+    now = time.time()
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, cookies, shumei_id, device_id FROM tokens WHERE token = ?",
+        (auth_token,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        c = await get_cookies_safely()
+        dev_id = generate_device_id(f"deeperseeker:{auth_token}")
+        return c, extract_shumei_device_id(c), dev_id
+
+    tid = row["id"]
+    cached_cookies = row["cookies"]
+    shumei_id = row["shumei_id"]
+    dev_id = row["device_id"]
+    if not dev_id:
+        dev_id = generate_device_id(f"deeperseeker:{auth_token}")
+        update_token_credentials(tid, device_id=dev_id)
+
+    token_explicit_waf = False
+    effective_cookies = {}
+    if cached_cookies:
+        try:
+            data = json.loads(cached_cookies)
+            if isinstance(data, dict):
+                exp = data.get("expiry", 0)
+                cand = data.get("cookie")
+                if cand and isinstance(cand, dict) and exp - now > 120:
+                    effective_cookies = dict(cand)
+                    token_explicit_waf = True
+        except Exception:
+            pass
+
+    if not token_explicit_waf:
+        global_c = await get_cookies_safely()
+        effective_cookies = dict(global_c or {})
+        if cached_cookies:
+            try:
+                data = json.loads(cached_cookies)
+                if isinstance(data, dict):
+                    cand = data.get("cookie")
+                    if isinstance(cand, dict):
+                        for k, v in cand.items():
+                            if k != "aws-waf-token":
+                                effective_cookies[k] = v
+            except Exception:
+                pass
+
+    resolved_shumei = normalize_shumei_device_id(shumei_id) or extract_shumei_device_id(effective_cookies)
+    if resolved_shumei:
+        return effective_cookies, resolved_shumei, dev_id
+
+    fallback_shumei = (
+        _read_global_shumei_id()
+        or extract_shumei_device_id(effective_cookies)
+        or normalize_shumei_device_id(os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID"))
+    )
+    if is_fast_start_enabled() and fallback_shumei:
+        update_token_credentials(tid, shumei_id=fallback_shumei, device_id=dev_id)
+        return effective_cookies, fallback_shumei, dev_id
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return (
+            effective_cookies,
+            fallback_shumei or extract_shumei_device_id(effective_cookies),
+            dev_id,
+        )
+
+    async with _pending_shumei_lock:
+        if tid not in _pending_shumei_generation:
+            _pending_shumei_generation.add(tid)
+            asyncio.create_task(_generate_shumei_background(tid, auth_token))
+
+    return effective_cookies, fallback_shumei, dev_id
+
+
+async def _generate_shumei_ids_for_tokens(tokens: list[tuple[int, str]]):
+    if not tokens:
+        return
+    _warming_token_ids.update(tid for tid, _ in tokens)
+    try:
+        await _generate_shumei_ids_batch(tokens)
+    finally:
+        for tid, _ in tokens:
+            _warming_token_ids.discard(tid)
+
+
+async def _generate_shumei_ids_batch(tokens: list[tuple[int, str]]):
+    """Generate isolated Shumei device IDs for multiple tokens using a single shared browser instance."""
+    if async_playwright is None or not tokens:
+        return
+
+    headless = is_cookie_headless()
+    launch_kwargs = {
+        "headless": headless,
+        "args": _CHROMIUM_STEALTH_ARGS,
+        "ignore_default_args": ["--enable-automation"],
+    }
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(**launch_kwargs)
+            try:
+                for tid, _ in tokens:
+                    try:
+                        ua = get_browser_user_agent()
+                        tz_id = get_browser_timezone_id()
+                        locale_id = os.getenv("DEEPSEEKER_CLIENT_LOCALE", "ru-RU")
+                        context = await browser.new_context(
+                            user_agent=ua,
+                            viewport={"width": 1904, "height": 893},
+                            screen={"width": 1920, "height": 1080},
+                            locale=locale_id,
+                            timezone_id=tz_id,
+                            device_scale_factor=1,
+                            has_touch=False,
+                            is_mobile=False,
+                            color_scheme="light",
+                        )
+                        await _apply_stealth(context)
+                        page = await context.new_page()
+                        try:
+                            await page.goto(
+                                "https://chat.deepseek.com/",
+                                wait_until="domcontentloaded",
+                                timeout=30000,
+                            )
+                            cookies = []
+                            sh_id = None
+                            for tick in range(50):
+                                cookies = await context.cookies()
+                                for c in cookies:
+                                    if c.get("name", "").startswith(".thumbcache_") and c.get("value"):
+                                        sh_id = normalize_shumei_device_id(c["value"])
+                                        break
+                                if not sh_id and tick >= 6:
+                                    with contextlib.suppress(Exception):
+                                        ls_val = await page.evaluate("""() => {
+                                            for (let i = 0; i < localStorage.length; i++) {
+                                                const k = localStorage.key(i);
+                                                if (k && (k.startsWith('.thumbcache') || k === '_sm_di')) {
+                                                    const v = localStorage.getItem(k);
+                                                    if (v && v.length > 5) return v;
+                                                }
+                                            }
+                                            return null;
+                                        }""")
+                                        if ls_val:
+                                            sh_id = normalize_shumei_device_id(ls_val)
+                                has_smid = any(c.get("name") == "smidV2" for c in cookies)
+                                if sh_id and has_smid:
+                                    break
+                                if sh_id and tick >= 28:
+                                    break
+                                if tick >= 38:
+                                    break
+                                await asyncio.sleep(0.3)
+
+                            if sh_id:
+                                tok_cookies = {}
+                                tok_expiry = None
+                                for i in cookies:
+                                    if i.get("name") == "aws-waf-token":
+                                        tok_expiry = i.get("expires")
+                                    tok_cookies[i["name"]] = i["value"]
+                                thumb_k = next((k for k in tok_cookies if k.startswith(".thumbcache_")), None)
+                                if not thumb_k:
+                                    tok_cookies[".thumbcache_default"] = urllib.parse.quote(sh_id.lstrip("B"))
+                                elif not tok_cookies.get(thumb_k):
+                                    tok_cookies[thumb_k] = urllib.parse.quote(sh_id.lstrip("B"))
+                                tok_cookies["ds_cookie_preference"] = "%257B%2522level%2522%253A%2522all%2522%257D"
+                                update_token_credentials(
+                                    tid,
+                                    cookies={"cookie": tok_cookies, "expiry": tok_expiry or (time.time() + 1800)},
+                                    shumei_id=sh_id,
+                                )
+                                logger.info(
+                                    "Startup: saved isolated Shumei ID for token id=%s",
+                                    tid,
+                                )
+                        finally:
+                            await context.close()
+                    except Exception as e:
+                        logger.warning(
+                            "Startup: failed to get Shumei ID for token id=%s: %s",
+                            tid,
+                            e,
+                        )
+                    finally:
+                        _warming_token_ids.discard(tid)
+            finally:
+                await browser.close()
+    except Exception as e:
+        logger.warning("Startup: error in Shumei generation browser: %s", e)
+
+
+async def _generate_shumei_background(tid: int, auth_token: str):
+    try:
+        await _generate_shumei_ids_for_tokens([(tid, auth_token)])
+    finally:
+        async with _pending_shumei_lock:
+            _pending_shumei_generation.discard(tid)
+
+
+async def warmup_all_tokens_cookies():
+    if os.getenv("PYTEST_CURRENT_TEST") or os.getenv(
+        "DEEPSEEKER_DISABLE_WARMUP", ""
+    ).lower() in ("1", "true", "yes"):
+        return
+
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, token, cookies, shumei_id, device_id FROM tokens WHERE status != 'QUARANTINED'"
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return
+
+    all_tokens = []
+    for row in rows:
+        tid = row["id"]
+        token_str = row["token"]
+        if not token_str:
+            continue
+        dev_id = row["device_id"]
+        if not dev_id:
+            dev_id = generate_device_id(f"deeperseeker:{token_str}")
+            update_token_credentials(tid, device_id=dev_id)
+        all_tokens.append((tid, token_str))
+
+    if not all_tokens:
+        return
+
+    if is_fast_start_enabled():
+        logger.info("Fast start: warming up cookies...")
+        final_cookies = None
+        shared_shumei = None
+        expiry = None
+        try:
+            final_cookies, expiry, shared_shumei = await _generate_cookies()
+        except Exception as e:
+            logger.warning("Fast start: cookie generation failed: %s", e)
+
+        if not shared_shumei:
+            shared_shumei = (
+                _read_global_shumei_id()
+                or extract_shumei_device_id(await get_cookies_safely())
+                or normalize_shumei_device_id(os.getenv("DEEPSEEKER_SHUMEI_DEVICE_ID"))
+            )
+
+        if shared_shumei:
+            _save_global_shumei_id(shared_shumei)
+            cookie_payload = (
+                {"cookie": final_cookies, "expiry": expiry}
+                if final_cookies
+                else None
+            )
+            for tid, _ in all_tokens:
+                update_kwargs = {"shumei_id": shared_shumei}
+                if cookie_payload:
+                    update_kwargs["cookies"] = cookie_payload
+                update_token_credentials(tid, **update_kwargs)
+            logger.info("Fast start: cookies ready.")
+        return
+
+    if not _read_cookie_file():
+        with contextlib.suppress(Exception):
+            await get_cookies_safely()
+
+    unclaimed = []
+    async with _pending_shumei_lock:
+        for item in all_tokens:
+            if item[0] not in _pending_shumei_generation:
+                _pending_shumei_generation.add(item[0])
+                unclaimed.append(item)
+    if unclaimed:
+        logger.info(
+            "Warming up Shumei IDs for %d tokens...",
+            len(unclaimed),
+        )
+        try:
+            await _generate_shumei_ids_for_tokens(unclaimed)
+        finally:
+            async with _pending_shumei_lock:
+                for item in unclaimed:
+                    _pending_shumei_generation.discard(item[0])
+
+
+async def solve_captcha_interactive(token_id: int) -> bool:
+    """Launch a real visible Playwright browser for the given token on chat.deepseek.com.
+
+    Injects the user's auth_token into localStorage and any existing cookies,
+    allowing the operator to solve any Cloudflare/Shumei/DeepSeek captcha
+    interactively with their mouse. Once the window is closed or captcha is
+    solved, saves the updated cookies and restores the token to ACTIVE.
+    """
+    if async_playwright is None:
+        logger.error("Solve Captcha failed: patchright is not installed")
+        return False
+
+    tok = get_token(token_id)
+    if not tok:
+        logger.error("Solve Captcha failed: token id=%s not found", token_id)
+        return False
+
+    auth_token = tok["token"]
+    launch_kwargs = {
+        "headless": False,
+        "args": _CHROMIUM_STEALTH_ARGS,
+        "ignore_default_args": ["--enable-automation"],
+    }
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(**launch_kwargs)
+            try:
+                ua = get_browser_user_agent()
+                context = await browser.new_context(
+                    user_agent=ua,
+                    viewport={"width": 1904, "height": 893},
+                    screen={"width": 1920, "height": 1080},
+                    locale=os.getenv("DEEPSEEKER_CLIENT_LOCALE", "ru-RU"),
+                    timezone_id=get_browser_timezone_id(),
+                    device_scale_factor=1,
+                )
+                await _apply_stealth(context)
+
+                if tok.get("cookies"):
+                    with contextlib.suppress(Exception):
+                        data = json.loads(tok["cookies"])
+                        c_dict = data.get("cookie") if isinstance(data, dict) else None
+                        if c_dict and isinstance(c_dict, dict):
+                            playwright_cookies = [
+                                {
+                                    "name": k,
+                                    "value": str(v),
+                                    "domain": ".deepseek.com",
+                                    "path": "/",
+                                }
+                                for k, v in c_dict.items()
+                            ]
+                            await context.add_cookies(playwright_cookies)
+
+                await context.add_init_script(f"""
+                    try {{
+                        localStorage.setItem("userToken", JSON.stringify({{"value": {json.dumps(auth_token)}, "__version": "0"}}));
+                    }} catch(e) {{}}
+                """)
+
+                page = await context.new_page()
+                logger.info(
+                    "Solve Captcha: opened visible browser for token #%d on chat.deepseek.com",
+                    token_id,
+                )
+                await page.goto(
+                    "https://chat.deepseek.com/", wait_until="domcontentloaded"
+                )
+
+                deadline = time.time() + 600
+                last_cookies = []
+                last_ls_shumei = None
+                while time.time() < deadline:
+                    with contextlib.suppress(Exception):
+                        last_cookies = await context.cookies()
+                    if page.is_closed() or not context.pages:
+                        break
+                    with contextlib.suppress(Exception):
+                        last_ls_shumei = await page.evaluate("""() => {
+                            for (let i = 0; i < localStorage.length; i++) {
+                                const k = localStorage.key(i);
+                                if (k && (k.startsWith('.thumbcache') || k === '_sm_di')) {
+                                    return localStorage.getItem(k);
+                                }
+                            }
+                            return null;
+                        }""")
+                    await asyncio.sleep(1.0)
+
+            finally:
+                with contextlib.suppress(Exception):
+                    await browser.close()
+
+            if last_cookies:
+                final_cookies = {}
+                expiry = None
+                for i in last_cookies:
+                    if i.get("name") == "aws-waf-token":
+                        expiry = i.get("expires")
+                    final_cookies[i["name"]] = i["value"]
+                final_cookies["ds_cookie_preference"] = (
+                    "%257B%2522level%2522%253A%2522all%2522%257D"
+                )
+                if not expiry or expiry < 0:
+                    expiry = time.time() + 1800
+                shumei_id = extract_shumei_device_id(final_cookies)
+                if not shumei_id and last_ls_shumei:
+                    shumei_id = normalize_shumei_device_id(last_ls_shumei)
+                dev_id = tok.get("device_id") or generate_device_id(
+                    f"deeperseeker:{auth_token}"
+                )
+                update_token_credentials(
+                    token_id,
+                    cookies={"cookie": final_cookies, "expiry": expiry},
+                    shumei_id=shumei_id,
+                    device_id=dev_id,
+                )
+                if "aws-waf-token" in final_cookies:
+                    with contextlib.suppress(Exception):
+                        target = cookie_file_path()
+                        target_dir = os.path.dirname(os.path.abspath(target))
+                        os.makedirs(target_dir, exist_ok=True)
+                        tmp_path = os.path.join(
+                            target_dir, os.path.basename(target) + ".tmp"
+                        )
+                        with open(tmp_path, "w") as f:
+                            f.write(
+                                json.dumps(
+                                    {"cookie": final_cookies, "expiry": expiry}
+                                )
+                            )
+                        os.replace(tmp_path, target)
+                logger.info(
+                    "Solve Captcha: updated credentials for token #%d; awaiting operator Restore",
+                    token_id,
+                )
+
+            return True
+    except Exception as e:
+        logger.error("Solve Captcha error for token #%d: %s", token_id, e)
+        return False
+
+
+async def get_cookies_safely():
+    with contextlib.suppress(Exception):
+        return await get_cookies()
+    return None
 
 
 def get_auth_token():
     conn = get_db()
-    row = conn.execute("SELECT token FROM tokens LIMIT 1").fetchone()
+    row = conn.execute(
+        "SELECT token FROM tokens WHERE status = 'ACTIVE' ORDER BY id ASC LIMIT 1"
+    ).fetchone()
+    if not row:
+        row = conn.execute("SELECT token FROM tokens LIMIT 1").fetchone()
     conn.close()
     if row:
         return row[0]
     return None
 
 
-def add_token(token, alias=None):
+def add_token(token, alias=None, cookies=None, shumei_id=None, device_id=None):
     conn = get_db()
     if not conn.execute("SELECT 1 FROM tokens WHERE id = 1").fetchone():
         next_id = 1
@@ -523,29 +1617,102 @@ def add_token(token, alias=None):
             WHERE t2.id IS NULL
         """).fetchone()
         next_id = row[0] if row and row[0] else 1
+    if not device_id and token:
+        device_id = generate_device_id(f"deeperseeker:{token}")
+    if shumei_id:
+        shumei_id = normalize_shumei_device_id(shumei_id)
+    cookies_str = (
+        json.dumps(cookies)
+        if isinstance(cookies, dict)
+        else (cookies if isinstance(cookies, str) else None)
+    )
     conn.execute(
-        "INSERT INTO tokens (id, alias, token, status) VALUES (?, ?, ?, 'ACTIVE')",
-        (next_id, alias, token),
+        "INSERT INTO tokens (id, alias, token, status, cookies, shumei_id, device_id) "
+        "VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?)",
+        (next_id, alias, token, cookies_str, shumei_id, device_id),
     )
     conn.commit()
     conn.close()
 
 
+def update_token_credentials(
+    token_id_or_token, cookies=None, shumei_id=None, device_id=None
+):
+    conn = get_db()
+    clause = "id = ?" if isinstance(token_id_or_token, int) else "token = ?"
+    updates = []
+    params = []
+    if cookies is not None:
+        updates.append("cookies = ?")
+        params.append(
+            json.dumps(cookies) if isinstance(cookies, dict) else str(cookies)
+        )
+    if shumei_id is not None:
+        updates.append("shumei_id = ?")
+        params.append(str(normalize_shumei_device_id(shumei_id)))
+    if device_id is not None:
+        updates.append("device_id = ?")
+        params.append(str(device_id))
+    if updates:
+        params.append(token_id_or_token)
+        conn.execute(f"UPDATE tokens SET {', '.join(updates)} WHERE {clause}", params)
+        conn.commit()
+    conn.close()
+
+
+def invalidate_token_cookies(token_id_or_token):
+    if not token_id_or_token:
+        return
+    with contextlib.suppress(Exception):
+        conn = get_db()
+        clause = "id = ?" if isinstance(token_id_or_token, int) else "token = ?"
+        conn.execute(
+            f"UPDATE tokens SET cookies = NULL WHERE {clause}",
+            (token_id_or_token,),
+        )
+        conn.commit()
+        conn.close()
+
+
 def get_tokens():
     conn = get_db()
-    rows = conn.execute("SELECT id, alias, token, status FROM tokens").fetchall()
+    rows = conn.execute(
+        "SELECT id, alias, token, status, cookies, shumei_id, device_id, park_reason FROM tokens"
+    ).fetchall()
     conn.close()
-    return [{"id": r[0], "alias": r[1], "token": r[2], "status": r[3]} for r in rows]
+    return [
+        {
+            "id": r[0],
+            "alias": r[1],
+            "token": r[2],
+            "status": r[3],
+            "cookies": r[4],
+            "shumei_id": r[5],
+            "device_id": r[6],
+            "park_reason": r[7],
+        }
+        for r in rows
+    ]
 
 
 def get_token(token_id):
     conn = get_db()
     row = conn.execute(
-        "SELECT id, alias, token, status FROM tokens WHERE id = ?", (token_id,)
+        "SELECT id, alias, token, status, cookies, shumei_id, device_id, park_reason FROM tokens WHERE id = ?",
+        (token_id,),
     ).fetchone()
     conn.close()
     if row:
-        return {"id": row[0], "alias": row[1], "token": row[2], "status": row[3]}
+        return {
+            "id": row[0],
+            "alias": row[1],
+            "token": row[2],
+            "status": row[3],
+            "cookies": row[4],
+            "shumei_id": row[5],
+            "device_id": row[6],
+            "park_reason": row[7],
+        }
     return None
 
 
@@ -617,6 +1784,15 @@ class _TokenSlot:
         if not self._held:
             return
         self._held = False
+        gap = float(os.getenv("DEEPSEEKER_CALL_GAP_SECONDS", "0.0"))
+        if gap > 0:
+            delay = (gap / 2.0) + random.uniform(0.0, gap / 2.0)
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_later(delay, _bump_in_flight, self.token_id, -1)
+                return
+            except RuntimeError:
+                pass
         _bump_in_flight(self.token_id, -1)
 
 
@@ -656,10 +1832,10 @@ def pick_token(exclude=None):
     for tid, status, until, last_used in rows:
         if status == "QUARANTINED":
             continue  # terminal: only restore_token() puts it back (P0-3)
-        if status == "RATE_LIMITED" and until is not None and until > now:
-            continue  # still cooling down
-        if status == "RATE_LIMITED":
-            recovered.append(tid)  # cooldown expired -> auto-recover below
+        if status in ("RATE_LIMITED", "PARKED") and until is not None and until > now:
+            continue
+        if status in ("RATE_LIMITED", "PARKED"):
+            recovered.append(tid)
         available.append((tid, last_used or 0.0))
 
     pickable = [entry for entry in available if entry[0] not in excluded] or available
@@ -691,10 +1867,19 @@ def pick_token(exclude=None):
     # pool of nothing but dead credentials this returns None, and the callers
     # already treat "no token" as the not-configured case.
     conn = get_db()
-    row = conn.execute(
-        "SELECT id FROM tokens WHERE status != 'QUARANTINED' "
-        "ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
-    ).fetchone()
+    row = None
+    if excluded:
+        placeholders = ",".join("?" for _ in excluded)
+        row = conn.execute(
+            f"SELECT id FROM tokens WHERE status NOT IN ('QUARANTINED', 'PARKED') AND id NOT IN ({placeholders}) "
+            "ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1",
+            list(excluded),
+        ).fetchone()
+    if not row:
+        row = conn.execute(
+            "SELECT id FROM tokens WHERE status NOT IN ('QUARANTINED', 'PARKED') "
+            "ORDER BY COALESCE(rate_limited_until, 0) ASC, id ASC LIMIT 1"
+        ).fetchone()
     conn.close()
     return row[0] if row else None
 
@@ -719,6 +1904,37 @@ def mark_quarantined(token_id, reason):
     conn.close()
 
 
+def mark_parked(token_id, reason, duration=86400):
+    secs = int(duration) if duration and duration > 0 else 86400
+    secs = min(secs, 7 * 86400)
+    until = time.time() + secs
+    logger.warning(
+        "Token #%d PARKED for %ds (%s)",
+        token_id,
+        secs,
+        reason,
+    )
+    conn = get_db()
+    conn.execute(
+        "UPDATE tokens SET status = ?, rate_limited_until = ?, park_reason = ? WHERE id = ?",
+        ("PARKED", until, str(reason or ""), token_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+CAPTCHA_CHALLENGE_MESSAGE = (
+    "Account social credit is critically low: some comrade requested captcha verification."
+)
+
+
+def park_token_for_captcha(token_id, penalty_duration=1800):
+    dock_seconds = (
+        int(penalty_duration) if penalty_duration and penalty_duration > 0 else 1800
+    )
+    mark_parked(token_id, CAPTCHA_CHALLENGE_MESSAGE, dock_seconds)
+
+
 def restore_token(token_id):
     """The only exit from quarantine (P0-3): an explicit operator action.
 
@@ -729,7 +1945,7 @@ def restore_token(token_id):
     conn = get_db()
     conn.execute(
         "UPDATE tokens SET status = ?, rate_limited_until = NULL, "
-        "consecutive_403 = 0 WHERE id = ?",
+        "consecutive_403 = 0, park_reason = NULL WHERE id = ?",
         ("ACTIVE", token_id),
     )
     conn.commit()
@@ -752,20 +1968,19 @@ def _bump_403_streak(token_id):
     return row[0] if row else 0
 
 
-def mark_limited(token_id, code=None):
-    """Record an upstream failure against a token — the pool's one door.
-
-    Without `code` this is exactly the landed B3 behavior: a RATE_LIMITED
-    cooldown that recovers by itself. With the upstream status (P0-3):
-
-      * 401 -> QUARANTINED immediately. A rejected credential is never
-        transient, and cooling it for 60s just re-arms the same dead account.
-      * 403 -> cooldown as today, plus QUARANTINED once QUARANTINE_AFTER_403
-        consecutive 403s pile up with no successful turn in between.
-      * anything else (429) -> cooldown, as landed.
-    """
-    if code == 401:
-        mark_quarantined(token_id, "upstream 401 (auth rejected)")
+def mark_limited(token_id, code=None, cooldown=None):
+    if code in (401, 40001, 40002, 40003):
+        mark_quarantined(token_id, f"upstream {code} (auth rejected)")
+        return
+    if code in (40012, "40012"):
+        mark_parked(token_id, "upstream 40012 (banned)", 86400)
+        return
+    if code in (40303, "40303"):
+        park_token_for_captcha(token_id, cooldown or 1800)
+        return
+    if code in (50006, "50006"):
+        secs = int(cooldown) if cooldown and cooldown > 0 else 3600
+        mark_parked(token_id, "upstream 50006 (muted)", secs)
         return
     if code == 403:
         streak = _bump_403_streak(token_id)
@@ -776,11 +1991,13 @@ def mark_limited(token_id, code=None):
                 f"{streak} consecutive upstream 403s (threshold {threshold})",
             )
             return
-    until = time.time() + TOKEN_COOLDOWN_SECONDS
+    secs = int(cooldown) if cooldown and cooldown > 0 else TOKEN_COOLDOWN_SECONDS
+    secs = min(secs, 7 * 86400)
+    until = time.time() + secs
     logger.warning(
         "Token #%d marked RATE_LIMITED for %ds (recovers automatically)",
         token_id,
-        TOKEN_COOLDOWN_SECONDS,
+        secs,
     )
     conn = get_db()
     conn.execute(
@@ -802,7 +2019,7 @@ def mark_active(token_id):
     conn = get_db()
     conn.execute(
         "UPDATE tokens SET status = ?, rate_limited_until = NULL, last_used = ?, "
-        "consecutive_403 = 0 WHERE id = ? AND status != 'QUARANTINED'",
+        "consecutive_403 = 0 WHERE id = ? AND status NOT IN ('QUARANTINED', 'PARKED')",
         ("ACTIVE", time.time(), token_id),
     )
     conn.commit()
@@ -932,17 +2149,41 @@ def get_pool_view():
     now = time.time()
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, alias, status, rate_limited_until, last_used, consecutive_403 "
+        "SELECT id, alias, status, rate_limited_until, last_used, consecutive_403, park_reason "
         "FROM tokens ORDER BY id"
     ).fetchall()
     conn.close()
 
     view = []
-    for tid, alias, status, until, last_used, streak in rows:
+    for tid, alias, status, until, last_used, streak, park_reason in rows:
         streak = streak or 0
-        if status == "QUARANTINED":
+        is_captcha = status == "PARKED" and (
+            "captcha" in str(park_reason or "").lower()
+            or "challenge" in str(park_reason or "").lower()
+            or (until and (until - now) <= 1805 and (until - now) > 0)
+        )
+        warming = status == "ACTIVE" and tid in _warming_token_ids
+        if warming:
+            state_class, cooldown = "warming", "—"
+            note = "warming up — building cookies and Shumei ID"
+        elif status == "QUARANTINED":
             state_class, cooldown = "err", "—"
             note = "quarantined — manual return required"
+        elif status == "PARKED" and until and until > now:
+            state_class = "warn"
+            cooldown = f"{_format_span(until - now)} left"
+            note = (
+                f"parked ({park_reason})"
+                if park_reason
+                else "parked — auto or manual return"
+            )
+        elif status == "PARKED":
+            state_class, cooldown = "warn", "expired"
+            note = (
+                f"parking expired ({park_reason}) — rejoins rotation on next pick"
+                if park_reason
+                else "parking expired — rejoins rotation on next pick"
+            )
         elif status == "RATE_LIMITED" and until and until > now:
             state_class = "warn"
             cooldown = f"{_format_span(until - now)} left"
@@ -953,7 +2194,7 @@ def get_pool_view():
         else:
             state_class, cooldown = "ok", "—"
             note = "in rotation"
-        if streak and status != "QUARANTINED":
+        if streak and status not in ("QUARANTINED", "PARKED"):
             note = f"{note}, 403 streak {streak}"
         age = "never" if not last_used else f"{_format_span(now - last_used)} ago"
         view.append(
@@ -961,34 +2202,108 @@ def get_pool_view():
                 "id": tid,
                 "label": alias if alias else f"untagged #{tid}",
                 "status": status,
+                "status_label": "WARMING" if warming else status,
+                "warming": warming,
                 "state_class": state_class,
                 "state_note": note,
                 "in_flight": _in_flight.get(tid, 0),
                 "last_used": age,
                 "cooldown": cooldown,
-                "can_restore": status == "QUARANTINED",
+                "can_restore": status in ("QUARANTINED", "PARKED"),
+                "can_solve_captcha": bool(is_captcha),
+                "park_reason": park_reason or "",
             }
         )
     return view
 
 
+async def probe_token(auth_token: str) -> dict:
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    try:
+        session = await get_session()
+        get_kwargs = {"timeout": aiohttp.ClientTimeout(total=10.0)}
+        if cookie:
+            get_kwargs["cookies"] = cookie
+        async with session.get(
+            f"{UPSTREAM_BASES[0]}/api/v0/users/current",
+            headers=headers,
+            **get_kwargs,
+        ) as resp:
+            if resp.status == 200:
+                js = await resp.json()
+                code = js.get("code")
+                biz = (js.get("data") or {}).get("biz_data") or {}
+                if code == 0:
+                    if biz.get("is_muted") == 1 or biz.get("biz_code") == 5:
+                        mute_until = biz.get("mute_until") or biz.get("end_at")
+                        return {"status": "muted", "mute_until": mute_until, "msg": "account muted"}
+                    return {"status": "valid", "msg": "ok"}
+                if code in (40001, 40002, 40003):
+                    return {"status": "invalid", "code": code, "msg": js.get("msg") or "invalid token"}
+                if code == 40012:
+                    return {"status": "banned", "code": code, "msg": js.get("msg") or "user banned"}
+                if code == 40029:
+                    return {"status": "rate_limited", "code": code, "msg": js.get("msg") or "too many requests"}
+                if code == 40303:
+                    return {
+                        "status": "challenge_required",
+                        "code": code,
+                        "msg": CAPTCHA_CHALLENGE_MESSAGE,
+                    }
+                return {"status": "unknown", "code": code, "msg": js.get("msg") or "unknown error"}
+            if resp.status == 202:
+                return {"status": "unknown", "msg": "WAF challenge (202)"}
+            if resp.status == 401:
+                return {"status": "invalid", "msg": "auth rejected (401)"}
+            return {"status": "unknown", "msg": f"upstream status {resp.status}"}
+    except Exception as e:
+        return {"status": "unknown", "msg": str(e)}
+
+
+_memory_sessions: dict[str, dict] = {}
+_memory_session_map: dict[str, dict] = {}
+
+
+def is_sessions_persistence_enabled() -> bool:
+    return os.getenv("DEEPSEEKER_PERSIST_SESSIONS", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
 def find_session(sig):
+    if not is_sessions_persistence_enabled():
+        sess = _memory_sessions.get(sig)
+        if sess:
+            sess["last_used"] = time.time()
+            return {
+                "token_id": sess["token_id"],
+                "session_id": sess["session_id"],
+                "parent_message_id": sess["parent_message_id"],
+                "sent_prompt": sess.get("sent_prompt"),
+            }
+        return None
+
     conn = get_db()
     row = conn.execute(
-        "SELECT token_id, deepseek_session_id, parent_message_id FROM sessions WHERE signature = ?",
+        "SELECT token_id, deepseek_session_id, parent_message_id, sent_prompt FROM sessions WHERE signature = ?",
         (sig,),
     ).fetchone()
     if row:
-        # B13: touch on read so pruning evicts by real recency of USE, not by
-        # insertion order — long-running chats get older rows every turn, and
-        # they are precisely the sessions pruning must protect.
         conn.execute(
             "UPDATE sessions SET last_used = ? WHERE signature = ?", (time.time(), sig)
         )
         conn.commit()
     conn.close()
     if row:
-        return {"token_id": row[0], "session_id": row[1], "parent_message_id": row[2]}
+        return {
+            "token_id": row[0],
+            "session_id": row[1],
+            "parent_message_id": row[2],
+            "sent_prompt": row[3] if len(row) > 3 else None,
+        }
     return None
 
 
@@ -1005,6 +2320,17 @@ _save_counter = {"n": 0}
 
 
 def prune_sessions():
+    if not is_sessions_persistence_enabled():
+        if len(_memory_sessions) > MAX_SESSIONS:
+            sorted_items = sorted(
+                _memory_sessions.items(),
+                key=lambda item: item[1].get("last_used") or 0.0,
+            )
+            excess = len(_memory_sessions) - MAX_SESSIONS
+            for k, _ in sorted_items[:excess]:
+                _memory_sessions.pop(k, None)
+        return
+
     conn = get_db()
     try:
         total = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
@@ -1031,12 +2357,26 @@ def prune_sessions():
         conn.close()
 
 
-def save_session(sig, token_id, session_id, parent_message_id=0):
+def save_session(sig, token_id, session_id, parent_message_id=0, sent_prompt=None):
+    if not is_sessions_persistence_enabled():
+        _memory_sessions[sig] = {
+            "token_id": token_id,
+            "session_id": session_id,
+            "parent_message_id": parent_message_id,
+            "sent_prompt": sent_prompt,
+            "last_used": time.time(),
+        }
+        _save_counter["n"] += 1
+        if _save_counter["n"] >= PRUNE_EVERY:
+            _save_counter["n"] = 0
+            prune_sessions()
+        return
+
     conn = get_db()
     conn.execute(
-        """INSERT OR REPLACE INTO sessions (signature, token_id, deepseek_session_id, parent_message_id)
-           VALUES (?, ?, ?, ?)""",
-        (sig, token_id, session_id, parent_message_id),
+        """INSERT OR REPLACE INTO sessions (signature, token_id, deepseek_session_id, parent_message_id, sent_prompt)
+           VALUES (?, ?, ?, ?, ?)""",
+        (sig, token_id, session_id, parent_message_id, sent_prompt),
     )
     conn.commit()
     conn.close()
@@ -1050,6 +2390,9 @@ def save_session(sig, token_id, session_id, parent_message_id=0):
 
 
 def delete_session(sig):
+    if not is_sessions_persistence_enabled():
+        _memory_sessions.pop(sig, None)
+        return
     conn = get_db()
     conn.execute("DELETE FROM sessions WHERE signature = ?", (sig,))
     conn.commit()
@@ -1073,6 +2416,15 @@ def next_parent(parent_message_id):
 
 
 def delete_sessions_for_chat(token_id, session_id):
+    if not is_sessions_persistence_enabled():
+        to_del = [
+            k
+            for k, v in _memory_sessions.items()
+            if v.get("token_id") == token_id and v.get("session_id") == session_id
+        ]
+        for k in to_del:
+            _memory_sessions.pop(k, None)
+        return
     conn = get_db()
     conn.execute(
         "DELETE FROM sessions WHERE token_id = ? AND deepseek_session_id = ?",
@@ -1080,6 +2432,29 @@ def delete_sessions_for_chat(token_id, session_id):
     )
     conn.commit()
     conn.close()
+
+
+def delete_sessions_for_token(token_id):
+    if not is_sessions_persistence_enabled():
+        to_del = [
+            k for k, v in _memory_sessions.items() if v.get("token_id") == token_id
+        ]
+        for k in to_del:
+            _memory_sessions.pop(k, None)
+        return
+    conn = get_db()
+    conn.execute("DELETE FROM sessions WHERE token_id = ?", (token_id,))
+    conn.commit()
+    conn.close()
+
+
+def delete_all_sessions():
+    _memory_sessions.clear()
+    if is_sessions_persistence_enabled():
+        conn = get_db()
+        conn.execute("DELETE FROM sessions")
+        conn.commit()
+        conn.close()
 
 
 # ==============================================================================
@@ -1271,6 +2646,35 @@ request_tools = contextvars.ContextVar("request_tools", default=None)
 reply_id = contextvars.ContextVar("reply_id", default=None)
 
 
+def _extract_upstream_message_id(data):
+    if not isinstance(data, dict):
+        return None
+    for k in ("response_message_id", "message_id"):
+        v = data.get(k)
+        if isinstance(v, int) or (isinstance(v, str) and v):
+            return v
+    for parent in ("response", "v"):
+        nested = data.get(parent)
+        if isinstance(nested, dict):
+            for k in ("response_message_id", "message_id"):
+                v = nested.get(k)
+                if isinstance(v, int) or (isinstance(v, str) and v):
+                    return v
+            v_nested = nested.get("response")
+            if isinstance(v_nested, dict):
+                for k in ("response_message_id", "message_id"):
+                    v = v_nested.get(k)
+                    if isinstance(v, int) or (isinstance(v, str) and v):
+                        return v
+    if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
+        for op in data["v"]:
+            if isinstance(op, dict):
+                mid = _extract_upstream_message_id(op)
+                if mid is not None:
+                    return mid
+    return None
+
+
 def _tool_schemas():
     schemas = {}
     for t in request_tools.get() or []:
@@ -1302,20 +2706,90 @@ def _infer_tool_name(args, schemas):
     return None
 
 
+def _repair_truncated_json(s: str) -> str:
+    s = s.strip()
+    if not s:
+        return s
+    stack = []
+    in_string = False
+    escape = False
+    for c in s:
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            if in_string:
+                escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if not in_string:
+            if c in ("{", "["):
+                stack.append("}" if c == "{" else "]")
+            elif c in ("}", "]") and stack and stack[-1] == c:
+                stack.pop()
+    if in_string:
+        s += '"'
+    s = s.rstrip()
+    if s.endswith(":"):
+        s += ' ""'
+    while s.endswith(","):
+        s = s[:-1].rstrip()
+    if stack:
+        s += "".join(reversed(stack))
+    return s
+
+
+def _match_or_predict_tool_name(raw_name, args, schemas):
+    if not schemas:
+        return raw_name
+    if raw_name in schemas:
+        return raw_name
+    raw_lower = (raw_name or "").lower().strip()
+    if raw_lower:
+        for s in schemas:
+            if s.lower() == raw_lower:
+                return s
+        clean_name = (
+            raw_name.split(".")[-1]
+            .split(":")[-1]
+            .rstrip("()")
+            .removesuffix("_tool")
+            .removesuffix("-tool")
+            .strip()
+        )
+        if clean_name:
+            clean_lower = clean_name.lower()
+            for s in schemas:
+                if s.lower() == clean_lower:
+                    return s
+        for s in schemas:
+            s_low = s.lower()
+            if s_low in raw_lower or (len(raw_lower) >= 3 and raw_lower in s_low):
+                return s
+    if isinstance(args, dict):
+        inferred = _infer_tool_name(args, schemas)
+        if inferred:
+            return inferred
+    if not raw_name and len(schemas) == 1 and isinstance(args, dict):
+        s_name = next(iter(schemas.keys()))
+        s_props = set(schemas[s_name].get("properties") or {})
+        if set(args.keys()) & s_props:
+            return s_name
+    return raw_name
+
+
 def _repair_tool_names(tools):
     schemas = _tool_schemas()
     if not schemas:
         return tools
     for t in tools:
         fn = t["function"]
-        if fn["name"] in schemas:
-            continue
-        try:
+        args = {}
+        with contextlib.suppress(Exception):
             args = json.loads(fn["arguments"])
-        except Exception:
-            continue
-        if isinstance(args, dict):
-            fn["name"] = _infer_tool_name(args, schemas) or fn["name"]
+        fn["name"] = _match_or_predict_tool_name(fn.get("name"), args, schemas)
     return tools
 
 
@@ -1324,6 +2798,66 @@ def _repair_tool_names(tools):
 # The request's reasoning effort ("high", "max", ...) when thinking is on, set by
 # the chat endpoints; build_prompt turns it into a think-harder instruction.
 request_effort = contextvars.ContextVar("request_effort", default=None)
+request_response_format = contextvars.ContextVar("request_response_format", default=None)
+
+
+def is_json_object_format(fmt):
+    if not fmt:
+        return False
+    if isinstance(fmt, str):
+        return fmt.strip().lower() in ("json_object", "json")
+    if isinstance(fmt, dict):
+        t = str(fmt.get("type", "")).strip().lower()
+        return t in ("json_object", "json_schema")
+    return False
+
+
+def json_mode_coerce(text: str) -> str:
+    if not text:
+        return "{}"
+    trimmed = text.strip()
+    if trimmed.startswith("```"):
+        lines = trimmed.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        trimmed = "\n".join(lines).strip()
+
+    try:
+        parsed = json.loads(trimmed)
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed, ensure_ascii=False)
+    except Exception:
+        pass
+
+    first_brace = trimmed.find("{")
+    last_brace = trimmed.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        candidate = trimmed[first_brace : last_brace + 1]
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, (dict, list)):
+                return json.dumps(parsed, ensure_ascii=False)
+        except Exception:
+            pass
+        repaired = _repair_truncated_json(candidate)
+        try:
+            parsed = json.loads(repaired)
+            if isinstance(parsed, (dict, list)):
+                return json.dumps(parsed, ensure_ascii=False)
+        except Exception:
+            pass
+
+    repaired = _repair_truncated_json(trimmed)
+    try:
+        parsed = json.loads(repaired)
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed, ensure_ascii=False)
+    except Exception:
+        pass
+
+    return json.dumps({"response": text.strip()}, ensure_ascii=False)
 
 
 def effort_level(body):
@@ -1670,36 +3204,6 @@ def parse_tools(text):
                 codeblock_pattern, "", clean_text, flags=re.DOTALL
             ).strip()
 
-    if not tools:
-        json_pattern = r"```json\s*(\{.*?\})\s*```"
-        json_matches = list(re.finditer(json_pattern, clean_text, flags=re.DOTALL))
-        for m in json_matches:
-            cleaned = clean_json_str(m.group(1))
-            try:
-                data = json.loads(cleaned)
-                if isinstance(data, dict) and (
-                    "name" in data or "tool" in data or "function" in data
-                ):
-                    name = (
-                        data.get("name")
-                        or data.get("tool")
-                        or data.get("function")
-                        or data.get("action")
-                    )
-                    args = (
-                        data.get("arguments")
-                        or data.get("parameters")
-                        or data.get("input")
-                        or data.get("args")
-                        or {}
-                    )
-                    norm = normalize_tool_call(name, args)
-                    if norm:
-                        tools.append(norm)
-            except Exception:
-                pass
-        if tools:
-            clean_text = re.sub(json_pattern, "", clean_text, flags=re.DOTALL).strip()
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
     clean_text = _strip_wrapper_tags(clean_text).strip()
@@ -2043,19 +3547,48 @@ def _find_pow_answer_blocking(challange_data):
     return result if result != 0xFFFFFFFFFFFFFFFF else None
 
 
+async def _safe_json(response, context="upstream", auth_token=None):
+    ct = (getattr(response, "headers", None) or {}).get("Content-Type", "").lower()
+    if response.status == 202 or "text/html" in ct:
+        invalidate_global_cookies()
+        if auth_token:
+            invalidate_token_cookies(auth_token)
+            asyncio.create_task(get_isolated_cookies_for_token(auth_token))
+        asyncio.create_task(get_cookies_safely())
+        raise UpstreamError(
+            429,
+            f"AWS WAF challenge (HTTP {response.status} text/html) on {context}: refreshing WAF cookie",
+            retry_after=15,
+        )
+    try:
+        return await response.json()
+    except aiohttp.ContentTypeError as e:
+        if auth_token:
+            invalidate_token_cookies(auth_token)
+            asyncio.create_task(get_isolated_cookies_for_token(auth_token))
+        status = getattr(e, "status", response.status) or 502
+        eff_status = 429 if status == 202 else (status if 400 <= status <= 599 else 502)
+        raise UpstreamError(
+            eff_status,
+            f"Upstream returned non-JSON response ({status}) on {context}: {e}",
+            retry_after=15 if eff_status == 429 else None,
+        ) from e
+
+
 async def create_challange_pow(target_path, auth_token):
-    headers = get_headers(auth_token)
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    kwargs = {"timeout": aiohttp.ClientTimeout(total=20)}
+    if cookie:
+        kwargs["cookies"] = cookie
     response = await post_with_failover(
         "/api/v0/chat/create_pow_challenge",
         headers=headers,
         json={"target_path": target_path},
-        # cookies=cookie,  # Backup WAF fallback
-        timeout=aiohttp.ClientTimeout(total=20),
+        **kwargs,
     )
     async with response:
-        data = await response.json()
+        data = await _safe_json(response, "create_pow_challenge", auth_token)
     return _biz_data(data, "chat/create_pow_challenge")["challenge"]
 
 
@@ -2089,18 +3622,60 @@ async def solve_create_pow(target_path, auth_token):
 
 
 async def create_new_chat(auth_token):
-    headers = get_headers(auth_token)
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    kwargs = {"timeout": aiohttp.ClientTimeout(total=20)}
+    if cookie:
+        kwargs["cookies"] = cookie
     response = await post_with_failover(
         "/api/v0/chat_session/create",
         headers=headers,
-        # cookies=cookie,  # Backup WAF fallback
-        timeout=aiohttp.ClientTimeout(total=20),
+        json={},
+        **kwargs,
     )
     async with response:
-        data = await response.json()
+        data = await _safe_json(response, "chat_session/create", auth_token)
     return _biz_data(data, "chat_session/create")["chat_session"]["id"]
+
+
+async def purge_chats_for_token(token_id: int):
+    tok = get_token(token_id)
+    if not tok:
+        return False
+    auth_token = tok["token"]
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    kwargs = {"timeout": aiohttp.ClientTimeout(total=30)}
+    if cookie:
+        kwargs["cookies"] = cookie
+    with contextlib.suppress(Exception):
+        resp = await post_with_failover(
+            "/api/v0/users/update_settings",
+            headers=headers,
+            json={"training_allowed": False},
+            **kwargs,
+        )
+        async with resp:
+            pass
+    with contextlib.suppress(Exception):
+        resp = await post_with_failover(
+            "/api/v0/chat_session/delete_all",
+            headers=headers,
+            json={},
+            **kwargs,
+        )
+        async with resp:
+            pass
+    delete_sessions_for_token(token_id)
+    return True
+
+
+async def purge_all_tokens_chats():
+    toks = get_tokens()
+    for tok in toks:
+        await purge_chats_for_token(tok["id"])
+    delete_all_sessions()
+    return True
 
 
 _EMPTY_SSE_DEFAULT = (
@@ -2242,7 +3817,33 @@ def _raise_empty_sse_response(
     )
     biz_code, biz_msg = _non_sse_biz_error(tail)
     if biz_code is not None or biz_msg:
-        raise UpstreamError(502, f"{msg}: code={biz_code} msg={biz_msg}")
+        code_map = {
+            40002: 401,
+            40003: 401,
+            40012: 403,
+            40029: 429,
+            40303: 403,
+            50006: 429,
+            40006: 502,
+        }
+        retry_after = None
+        if biz_code in (40012, "40012"):
+            retry_after = 86400
+        elif biz_code in (40303, "40303"):
+            retry_after = 1800
+        elif biz_code in (50006, "50006"):
+            retry_after = 3600
+        elif biz_code in (40029, "40029"):
+            retry_after = TOKEN_COOLDOWN_SECONDS
+        status = code_map.get(
+            biz_code, 403 if str(biz_code).startswith("403") else 502
+        )
+        raise UpstreamBizError(
+            status,
+            f"{msg}: code={biz_code} msg={biz_msg}",
+            biz_code=int(biz_code) if str(biz_code).isdigit() else biz_code,
+            retry_after=retry_after,
+        )
     raise UpstreamError(502, msg)
 
 
@@ -2273,6 +3874,17 @@ def token_busy(auth_token):
     return bool(lock and lock.locked())
 
 
+def are_all_tokens_busy() -> bool:
+    tokens = get_tokens()
+    active_tokens = [t for t in tokens if t.get("status") == "ACTIVE"]
+    if not active_tokens:
+        return False
+    return all(
+        token_busy(t.get("token")) or token_in_flight(t.get("id")) > 0
+        for t in active_tokens
+    )
+
+
 async def send_message(chat_id, auth_token, *args, **kwargs):
     # The upstream stream is drained by its own task, so the lock is released when
     # DeepSeek finishes even if the consumer abandons this generator mid-stream
@@ -2284,7 +3896,12 @@ async def send_message(chat_id, auth_token, *args, **kwargs):
 
     async def pump():
         try:
+            was_locked = lock.locked()
+            if was_locked:
+                logger.info("Token pool: account busy, request waiting for slot")
             async with lock:
+                if was_locked:
+                    logger.info("Token pool: slot acquired, proceeding with send")
                 gen = _send_message_unlocked(chat_id, auth_token, *args, **kwargs)
                 try:
                     async for chunk in gen:
@@ -2316,13 +3933,29 @@ async def _send_message_unlocked(
     search=False,
     file_ids_=None,
 ):
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    reply_id.set(None)
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
     file_ids = file_ids_ or []
 
-    headers = get_headers(
-        auth_token, await solve_create_pow("/api/v0/chat/completion", auth_token)
+    pow_resp = await solve_create_pow(
+        "/api/v0/chat/completion", auth_token
     )
+    headers = get_headers(auth_token, pow_resp, device_id=device_id)
+    hif_env = os.getenv("DEEPSEEKER_HIF_ENABLED")
+    should_hif = (
+        hif_env.lower() in ("true", "1", "yes")
+        if hif_env is not None
+        else True
+    )
+    if should_hif:
+        hif_leim = await get_hif_token("leim")
+        if hif_leim:
+            headers["x-hif-leim"] = hif_leim
+        hif_dliq = await get_hif_token("dliq")
+        if hif_dliq:
+            headers["x-hif-dliq"] = hif_dliq
+    if chat_id:
+        headers["referer"] = f"https://chat.deepseek.com/a/chat/s/{chat_id}"
     json_data = {
         "chat_session_id": chat_id,
         "model_type": DEFAULT_MODEL_TYPE,
@@ -2340,6 +3973,10 @@ async def _send_message_unlocked(
     if parent_message_id:
         json_data["parent_message_id"] = parent_message_id
 
+    resolved_shumei = normalize_shumei_device_id(shumei_id) or extract_shumei_device_id(cookie)
+    if resolved_shumei:
+        json_data["shumei_device_id"] = resolved_shumei
+
     think_open = False
     got_output = False
     # DeepSeek ends a reply it cut short (seen mid-thinking on long contexts) with
@@ -2347,13 +3984,27 @@ async def _send_message_unlocked(
     # finished one: an empty "stop" makes agent clients end the turn.
     incomplete = False
     got_response = False
+    post_kwargs = {}
+    if cookie:
+        post_kwargs["cookies"] = cookie
     resp = await post_with_failover(
         "/api/v0/chat/completion",
         headers=headers,
         json=json_data,
-        # cookies=cookie,  # Backup WAF fallback
+        **post_kwargs,
     )
     async with resp:
+        resp_ct = (getattr(resp, "headers", None) or {}).get("content-type") or ""
+        if resp.status == 202 or (resp.status != 200 and "text/html" in str(resp_ct).lower()):
+            invalidate_global_cookies()
+            invalidate_token_cookies(auth_token)
+            asyncio.create_task(get_cookies_safely())
+            asyncio.create_task(get_isolated_cookies_for_token(auth_token))
+            raise UpstreamError(
+                429,
+                f"AWS WAF challenge (HTTP {resp.status} text/html): refreshing WAF cookie",
+                retry_after=15,
+            )
         if resp.status != 200:
             error_text = await resp.text()
             logger.warning(
@@ -2370,8 +4021,6 @@ async def _send_message_unlocked(
         # protocol failures with a plain application/json envelope on this
         # endpoint; keeping the raw lines is what makes those diagnosable.
         non_sse_tail = []
-        # getattr: response doubles used by tests may not expose headers.
-        resp_ct = (getattr(resp, "headers", None) or {}).get("content-type") or ""
         line_buf = b""
 
         def _check_incomplete():
@@ -2442,7 +4091,8 @@ async def _send_message_unlocked(
                             yield fragment.get("content", "")
                 return
 
-            if data.get("p") == "response/fragments" and data.get("o") in ("APPEND", None):
+            _frag_op = data.get("o")
+            if data.get("p") == "response/fragments" and _frag_op in ("APPEND", None):
                 fragments = data.get("v")
                 if isinstance(fragments, list):
                     for fragment in fragments:
@@ -2452,16 +4102,18 @@ async def _send_message_unlocked(
                                 think_open = False
                             got_output = True
                             got_response = got_response or bool(fragment.get("content"))
-                            yield fragment.get("content", "")
+                            yield fragment.get("content") or ""
                         elif fragment.get("type") == "THINK":
+                            if _frag_op is None and think_open:
+                                continue
                             if not think_open:
                                 yield "<think>\n"
                                 think_open = True
                             got_output = True
-                            yield fragment.get("content", "")
+                            yield fragment.get("content") or ""
                         else:
                             got_output = True
-                            yield fragment.get("content", "")
+                            yield fragment.get("content") or ""
                 return
 
             v = data.get("v")
@@ -2485,8 +4137,9 @@ async def _send_message_unlocked(
                 parsed_events.append(data)
                 if len(parsed_events) > _SSE_RECENT_LINES:
                     del parsed_events[0]
-                if "response_message_id" in data:
-                    reply_id.set(data["response_message_id"])
+                mid = _extract_upstream_message_id(data)
+                if mid is not None:
+                    reply_id.set(mid)
             try:
                 async for chunk in _emit_from_event(data):
                     yield chunk
@@ -2527,11 +4180,12 @@ async def _send_message_unlocked(
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
     session = await get_session()
     file_size = len(file_bytes)
-    pow_response = await solve_create_pow("/api/v0/file/upload_file", auth_token)
+    pow_response = await solve_create_pow(
+        "/api/v0/file/upload_file", auth_token
+    )
     boundary = b"----WebKitFormBoundaryTB0pXOQR2RL219Hu"
     safe_name = re.sub(r"[^ -~]", "_", file_name).replace('"', "_") or "file.bin"
     body_parts = [
@@ -2542,36 +4196,40 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
         b"\r\n--" + boundary + b"--\r\n",
     ]
     reconstructed_body = b"".join(body_parts)
-    headers = get_headers(auth_token, pow_response)
+    headers = get_headers(auth_token, pow_response, device_id=device_id)
     headers.update(
         {
             "content-type": f"multipart/form-data; boundary={boundary.decode('utf-8')}",
             "x-file-size": str(file_size),
         }
     )
+    post_kwargs = {"timeout": aiohttp.ClientTimeout(total=120)}
+    if cookie:
+        post_kwargs["cookies"] = cookie
     response = await post_with_failover(
         "/api/v0/file/upload_file",
         data=reconstructed_body,
         headers=headers,
-        # cookies=cookie,  # Backup WAF fallback
-        timeout=aiohttp.ClientTimeout(total=120),
+        **post_kwargs,
     )
     async with response:
-        resp_json = await response.json()
+        resp_json = await _safe_json(response, "upload_file", auth_token)
     js_data = _biz_data(resp_json, "file/upload_file")
     file_id = js_data["id"]
     yield ("uploaded", file_id)
     status = js_data["status"]
-    headers = get_headers(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
     deadline = time.time() + 300
     while status in ["PENDING", "PARSING"] and time.time() < deadline:
         yield ("uploaded", file_id)
         await asyncio.sleep(0.3)
+        get_kwargs = {"timeout": aiohttp.ClientTimeout(total=30)}
+        if cookie:
+            get_kwargs["cookies"] = cookie
         async with session.get(
             "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
             headers=headers,
-            # cookies=cookie,  # Backup WAF fallback
-            timeout=aiohttp.ClientTimeout(total=30),
+            **get_kwargs,
         ) as resp:
             js_data = _biz_data(await resp.json(), "file/fetch_files")["files"][0]
         status = js_data["status"]
@@ -2591,15 +4249,16 @@ async def upload_file(file_bytes, file_name, file_content_type, auth_token):
 
 
 async def get_file_content(auth_token, file_id):
-    # Backup: WAF cookies not required with Android headers. Kept as fallback:
-    # cookie = await get_cookies()
+    cookie, shumei_id, device_id = await get_isolated_cookies_for_token(auth_token)
     session = await get_session()
-    headers = get_headers(auth_token)
+    headers = get_headers(auth_token, device_id=device_id)
+    get_kwargs = {"timeout": aiohttp.ClientTimeout(total=30)}
+    if cookie:
+        get_kwargs["cookies"] = cookie
     async with session.get(
         "https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=" + file_id,
         headers=headers,
-        # cookies=cookie,  # Backup WAF fallback
-        timeout=aiohttp.ClientTimeout(total=30),
+        **get_kwargs,
     ) as resp:
         resp_json = await resp.json()
     js_data = _biz_data(resp_json, "file/fetch_files")["files"][0]

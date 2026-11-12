@@ -150,6 +150,7 @@ Then:
 
 ```bash
 uv sync
+uv run patchright install chromium          # or --with-deps on Linux
 source .venv/bin/activate   # or activate.fish / activate.zsh
 cp .env.example .env
 uv run deeperseeker
@@ -160,11 +161,12 @@ uv run deeperseeker
 ```bash
 python3 -m venv .venv
 pip install -r requirements.txt
+patchright install chromium                 # or --with-deps on Linux
 cp .env.example .env
 python3 app.py
 ```
 
-> **Note:** thanks to PR <https://github.com/AmanCode22/deeperseeker/pull/16> by [@alan7383](https://github.com/alan7383), Playwright and Chromium are deprecated and kept as backup (DeepSeek does not enforce AWS WAF on requests using Android client headers). You no longer need to run `playwright install chromium` or `xvfb-run` unless reverting to the backup cookie mechanism — and it saves RAM and is much more stable than cookie harvesting.
+> **Note:** DeeperSeeker replicates the desktop PC Chrome client 1-to-1, including Sec-CH-UA hints, WebAssembly PoW challenge solving, Shumei device token forwarding, and HIF attestation tokens. Bypassing DeepSeek's Cloudflare / AWS WAF protection and acquiring Shumei device identifiers requires Patchright (stealth-hardened Playwright) and Chromium installed on the system (simply run the install command above).
 
 ## Auth token setup
 
@@ -198,6 +200,8 @@ Copy `.env.example` to `.env` and edit your secret values. The table below is th
 | `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` | Retries of one turn across the pool before the upstream error is surfaced to the client | `3` |
 | `DEEPSEEKER_MAX_USER_MESSAGE_TOKENS` | Hard cap for the latest user message inside a prompt; above it the message is tail-truncated with a marker instead of failing upstream | `900000` |
 | `DEEPSEEKER_PROMPT_OVERHEAD_TOKENS` | Flat overhead added to the rollover estimate for tool schemas, system expansion and summaries the raw history does not show | `4096` |
+| `DEEPSEEKER_FAST_START` | Shared Shumei ID on startup across accounts (fast boot) | `false` |
+| `DEEPSEEKER_WARMUP_NON_HEADLESS` | Run browser in non-headless (visible) mode during startup warmup / cookie generation for maximum stealth | `false` |
 | `DEEPSEEKER_MODE` | `bridge` (reverse-engineered web session) or `official` (official API passthrough). Explicit only — nothing falls back on its own | `bridge` |
 | `DEEPSEEKER_OFFICIAL_API_KEY` | Official API key used when mode is `official` (from platform.deepseek.com). Required in official mode | unset |
 | `DEEPSEEKER_OFFICIAL_BASE` | Official API base URL override in official mode | `https://api.deepseek.com` |

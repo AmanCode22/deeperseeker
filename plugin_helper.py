@@ -11,7 +11,26 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from functions import count_tokens, get_session, request_effort, upload_file
+from functions import (
+    count_tokens,
+    get_session,
+    is_json_object_format,
+    request_effort,
+    request_response_format,
+    upload_file,
+)
+
+MIRROR_SYSTEM_PROMPT = os.getenv("DEEPSEEKER_MIRROR_SYSTEM", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+JSON_OBJECT_INSTRUCTION = (
+    "CRITICAL: You must return a valid JSON object. "
+    "Do not include explanatory text or markdown code blocks: "
+    "output only the JSON object."
+)
 
 # Token budgets for injected history when (re)building a session prompt.
 MAX_HISTORY_TOKENS = int(os.getenv("DEEPSEEKER_MAX_HISTORY_TOKENS", "24000"))
@@ -193,20 +212,31 @@ TOOL_USE_INSTRUCTIONS = (
 )
 
 
-async def append_fresh_session_runtime(prompt, messages, tools_extract):
+async def append_fresh_session_runtime(
+    prompt, messages, tools_extract, response_format=None
+):
     """Inject the runtime contract for a new upstream chat: tool schemas and system instructions.
 
     Shared by the normal first-message path and post-rollover seeding so both stay in sync.
     """
+    if response_format is None:
+        response_format = request_response_format.get()
     if tools_extract:
         prompt += f"[TOOLS]\n{tools_extract}\n\n"
     system_prompt = await extract_system(messages)
     if system_prompt:
         if tools_extract:
             system_prompt += "\n\n" + TOOL_USE_INSTRUCTIONS
+        if is_json_object_format(response_format):
+            system_prompt += "\n\n" + JSON_OBJECT_INSTRUCTION
         prompt += f"[SYSTEM]\n{system_prompt}\n\n"
     elif tools_extract:
-        prompt += f"[SYSTEM]\n{TOOL_USE_INSTRUCTIONS}\n\n"
+        inst = TOOL_USE_INSTRUCTIONS
+        if is_json_object_format(response_format):
+            inst += "\n\n" + JSON_OBJECT_INSTRUCTION
+        prompt += f"[SYSTEM]\n{inst}\n\n"
+    elif is_json_object_format(response_format):
+        prompt += f"[SYSTEM]\n{JSON_OBJECT_INSTRUCTION}\n\n"
     return prompt
 
 
@@ -254,31 +284,113 @@ async def extract_system(messages):
     return "\n\n".join(parts) if parts else None
 
 
+_TOOLS_CACHE = {}
+
+
+def is_tools_schema_as_is() -> bool:
+    val = os.getenv(
+        "DEEPSEEKER_TOOLS_SCHEMA_AS_IS",
+        os.getenv("DEEPSEEKER_RAW_TOOL_SCHEMAS", "false"),
+    )
+    return str(val).strip().lower() in ("true", "1", "yes")
+
+
+def _render_tool_definition_classic(i):
+    if not isinstance(i, dict):
+        return f"Tool: {json.dumps(i, ensure_ascii=False)}"
+    if i.get("type") == "function":
+        fn = i.get("function") if isinstance(i.get("function"), dict) else i
+        name = fn.get("name", "")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {})
+        return f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params, ensure_ascii=False)}"
+    elif "name" in i:
+        name = i.get("name", "")
+        desc = i.get("description", "")
+        params = i.get("input_schema", i.get("parameters", {}))
+        return f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params, ensure_ascii=False)}"
+    elif i.get("type") in ["computer_use", "text_editor", "bash"]:
+        return f"Tool: {i['type']}\nDescription: {json.dumps(i, ensure_ascii=False)}"
+    else:
+        return f"Tool: {json.dumps(i, ensure_ascii=False)}"
+
+
+def _render_tool_definition(i):
+    if not isinstance(i, dict):
+        return f"Tool: {json.dumps(i, ensure_ascii=False)}"
+    if i.get("type") == "function":
+        fn = i.get("function") if isinstance(i.get("function"), dict) else i
+    elif "name" in i:
+        fn = i
+    elif i.get("type") in ["computer_use", "text_editor", "bash"]:
+        return f"Tool: {i['type']}\nDescription: {json.dumps(i, ensure_ascii=False)}"
+    else:
+        return f"Tool: {json.dumps(i, ensure_ascii=False)}"
+
+    name = fn.get("name", "")
+    desc = fn.get("description", "")
+    params = fn.get("parameters", fn.get("input_schema", {}))
+    if not isinstance(params, dict):
+        params = {}
+
+    lines = [f"Tool: {name}"]
+    if desc:
+        lines.append(f"Description: {desc}")
+
+    props = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+    req_set = set(params.get("required") or [])
+
+    lines.append(f"Parameters: {json.dumps(params, ensure_ascii=False)}")
+    if props:
+        for pname, pinfo in props.items():
+            if not isinstance(pinfo, dict):
+                pinfo = {}
+            ptype = pinfo.get("type", "any")
+            is_req = "required" if pname in req_set else "optional"
+            pdesc = pinfo.get("description", "")
+            penum = pinfo.get("enum")
+            extra = []
+            if penum:
+                extra.append(f"enum={penum}")
+            extra_str = f", {', '.join(extra)}" if extra else ""
+            desc_part = f": {pdesc}" if pdesc else ""
+            lines.append(f"  - {pname} ({ptype}, {is_req}{extra_str}){desc_part}")
+        lines.append(f"JSON Schema: {json.dumps(params, ensure_ascii=False)}")
+    return "\n".join(lines)
+
+
 async def extract_tools(tools):
     if not tools:
         return None
-    final_tools = []
+    if not is_tools_schema_as_is():
+        final_tools = []
+        for i in tools:
+            final_tools.append(_render_tool_definition_classic(i))
+        return "\n\n".join(final_tools) if final_tools else None
+
+    try:
+        cache_key = hashlib.sha256(
+            json.dumps(tools, sort_keys=True).encode()
+        ).hexdigest()
+        if cache_key in _TOOLS_CACHE:
+            return _TOOLS_CACHE[cache_key]
+    except Exception:
+        cache_key = None
+
+    json_schema_block = (
+        "<tools>\n"
+        + json.dumps(tools, indent=2, ensure_ascii=False)
+        + "\n</tools>"
+    )
+    final_tools = [json_schema_block]
     for i in tools:
-        if i.get("type") == "function":
-            fn = i.get("function") if isinstance(i.get("function"), dict) else i
-            name = fn.get("name", "")
-            desc = fn.get("description", "")
-            params = fn.get("parameters", fn.get("input_schema", {}))
-            final_tools.append(
-                f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}"
-            )
-        elif "name" in i:
-            name = i.get("name", "")
-            desc = i.get("description", "")
-            params = i.get("input_schema", i.get("parameters", {}))
-            final_tools.append(
-                f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}"
-            )
-        elif i.get("type") in ["computer_use", "text_editor", "bash"]:
-            final_tools.append(f"Tool: {i['type']}\nDescription: {json.dumps(i)}")
-        else:
-            final_tools.append(f"Tool: {json.dumps(i)}")
-    return "\n\n".join(final_tools) if final_tools else None
+        final_tools.append(_render_tool_definition(i))
+    res = "\n\n".join(final_tools)
+    if cache_key:
+        if len(_TOOLS_CACHE) > 256:
+            _TOOLS_CACHE.clear()
+        _TOOLS_CACHE[cache_key] = res
+    return res
 
 
 async def extract_tool_results(messages, latest_only=False):
@@ -518,93 +630,103 @@ def _capped_text(text, max_tokens, marker):
     return (marker + "\n" if truncated else "") + "\n\n".join(parts)
 
 
-def canonicalize_messages(messages):
-    canon = []
+def conversation_to_chat_text(messages):
+    blocks = []
     for m in messages:
-        role = m.get("role", "")
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role", "")).strip().lower()
         content = m.get("content", "")
         tool_calls = m.get("tool_calls")
-
+        msg_body = []
         if tool_calls and isinstance(tool_calls, list):
-            tc_parts = []
             for tc in tool_calls:
-                fn = tc.get("function", {})
-                name = fn.get("name") or tc.get("name")
-                args = fn.get("arguments") or tc.get("arguments")
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                name = fn.get("name") or tc.get("name") or ""
+                args = fn.get("arguments") or tc.get("arguments") or ""
                 if isinstance(args, str):
                     with contextlib.suppress(Exception):
                         args = json.loads(args)
-                tc_json = json.dumps({"arguments": args, "name": name}, sort_keys=True)
-                tc_parts.append("<tool_call>" + tc_json + "</tool_call>")
-            content = "\n".join(tc_parts)
+                if isinstance(args, dict):
+                    args_str = json.dumps(args, sort_keys=True, ensure_ascii=False)
+                else:
+                    args_str = str(args)
+                msg_body.append(f"[call: {name}({args_str})]")
         elif isinstance(content, list):
-            parts = []
-            for c in content:
-                if isinstance(c, dict):
-                    if c.get("type") == "text":
-                        parts.append(c.get("text", ""))
-                    elif c.get("type") == "tool_use":
-                        args = c.get("input", {})
-                        tc_json = json.dumps(
-                            {"arguments": args, "name": c.get("name")}, sort_keys=True
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type", "")
+                if ptype == "text":
+                    txt = part.get("text", "")
+                    if txt:
+                        msg_body.append(str(txt))
+                elif ptype == "tool_use":
+                    name = part.get("name", "")
+                    inp = part.get("input", {})
+                    if isinstance(inp, dict):
+                        inp_str = json.dumps(inp, sort_keys=True, ensure_ascii=False)
+                    else:
+                        inp_str = str(inp)
+                    msg_body.append(f"[call: {name}({inp_str})]")
+                elif ptype == "tool_result":
+                    tool_id = part.get("tool_use_id", "tool")
+                    res = part.get("content", "")
+                    if isinstance(res, list):
+                        res = " ".join(
+                            item.get("text", "")
+                            for item in res
+                            if isinstance(item, dict) and item.get("type") == "text"
                         )
-                        parts.append("<tool_call>" + tc_json + "</tool_call>")
-                    elif c.get("type") == "tool_result":
-                        res_content = c.get("content", "")
-                        if isinstance(res_content, list):
-                            res_content = " ".join(
-                                item.get("text", "")
-                                for item in res_content
-                                if isinstance(item, dict) and item.get("type") == "text"
-                            )
-                        tool_id = c.get("tool_use_id", "tool")
-                        parts.append(
-                            "[Tool Result for "
-                            + str(tool_id)
-                            + "]: "
-                            + str(res_content)
-                        )
-            content = "\n".join(parts)
-        elif isinstance(content, str):
-            content = re.sub(
-                r"<think>.*?</think>", "", content, flags=re.DOTALL
-            ).strip()
+                    msg_body.append(f"[result {tool_id}: {res}]")
+                elif ptype in ("image_url", "image", "file", "document"):
+                    desc = _describe_attachments([part])
+                    if desc:
+                        msg_body.append(desc)
+        elif isinstance(content, str) and content:
+            clean = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
-            def repl_tc(match):
-                raw_json = match.group(1).strip()
+            def _repl_tc(match):
+                raw = match.group(1).strip()
                 try:
-                    d = json.loads(raw_json)
-                    d_name = d.get("name")
-                    d_args = d.get("arguments", {})
-                    return (
-                        "<tool_call>"
-                        + json.dumps(
-                            {"arguments": d_args, "name": d_name}, sort_keys=True
-                        )
-                        + "</tool_call>"
-                    )
+                    d = json.loads(raw)
+                    fn_name = d.get("name", "")
+                    fn_args = d.get("arguments", {})
+                    if isinstance(fn_args, dict):
+                        args_str = json.dumps(fn_args, sort_keys=True, ensure_ascii=False)
+                    else:
+                        args_str = str(fn_args)
+                    return f"[call: {fn_name}({args_str})]"
                 except Exception:
                     return match.group(0)
 
-            content = re.sub(
-                r"<tool_call>(.*?)</tool_call>", repl_tc, content, flags=re.DOTALL
+            clean = re.sub(
+                r"<tool_call>(.*?)</tool_call>", _repl_tc, clean, flags=re.DOTALL
             )
+            if clean:
+                msg_body.append(clean)
+        elif content is not None and not isinstance(content, (str, list)):
+            msg_body.append(str(content))
 
-        canon.append({"role": role, "content": str(content).strip()})
-    return canon
+        body_str = "\n".join(msg_body).strip()
+        if role == "tool":
+            tool_id = m.get("tool_call_id", "")
+            header = f"[TOOL {tool_id}]" if tool_id else "[TOOL]"
+            blocks.append(f"{header}\n{body_str}".strip())
+        else:
+            blocks.append(f"[{role.upper()}]\n{body_str}".strip())
+
+    return "\n\n".join(blocks).strip()
+
+
+def canonicalize_messages(messages):
+    return conversation_to_chat_text(messages)
 
 
 def generate_signature_sync(messages, model, scope=""):
-    last_ast_idx = -1
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "assistant":
-            last_ast_idx = i
-            break
-
-    history = messages if last_ast_idx == -1 else messages[: last_ast_idx + 1]
-    canon_history = canonicalize_messages(history)
-    dump = json.dumps(canon_history, sort_keys=True)
-    return hashlib.sha256(f"{model}_{scope}_{dump}".encode()).hexdigest()
+    chat_text = conversation_to_chat_text(messages)
+    payload = f"{model}_{scope}\n{chat_text}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 async def generate_signature(messages, model, scope=""):
@@ -616,6 +738,10 @@ async def generate_signature(messages, model, scope=""):
 # "high" gets no instruction: in agent sessions it multiplied reasoning length
 # (median 452 -> 7401 chars) and long reasoning hit DeepSeek's cut-off (INCOMPLETE).
 EFFORT_INSTRUCTIONS = {
+    "low": (
+        "[REASONING EFFORT: low] Keep your internal thinking concise and brief. "
+        "Focus directly on the answer without over-analyzing."
+    ),
     "max": (
         "[REASONING EFFORT: max] Before answering, reason exhaustively in your thinking: try at least two "
         "different approaches, check edge cases, verify every step and re-check the final answer "
@@ -632,8 +758,15 @@ def _with_effort(prompt):
 
 
 async def build_prompt(
-    messages, tools, model, is_first_message=False, rollover_summary=None
+    messages,
+    tools,
+    model,
+    is_first_message=False,
+    rollover_summary=None,
+    response_format=None,
 ):
+    if response_format is None:
+        response_format = request_response_format.get()
     final_prompt = ""
     tools_extract = await extract_tools(tools)
     # PR #67 review fix (Medium): pass the tools through — the tool-aware
@@ -647,7 +780,7 @@ async def build_prompt(
         # (system prompt, tool schemas, tool-use instructions) before the
         # handoff summary and preserved conversation tail.
         final_prompt = await append_fresh_session_runtime(
-            final_prompt, messages, tools_extract
+            final_prompt, messages, tools_extract, response_format=response_format
         )
         if rollover_summary:
             final_prompt += build_summary_seed_prompt(rollover_summary)
@@ -673,7 +806,7 @@ async def build_prompt(
         return _with_effort(final_prompt.strip() + "\n\n")
     if is_first_message:
         final_prompt = await append_fresh_session_runtime(
-            final_prompt, messages, tools_extract
+            final_prompt, messages, tools_extract, response_format=response_format
         )
 
         if len(messages) > 1:
@@ -687,6 +820,17 @@ async def build_prompt(
                     content = " ".join(
                         c.get("text", "") for c in content if c.get("type") == "text"
                     )
+                if role == "assistant":
+                    tcs = msg.get("tool_calls")
+                    if tcs and isinstance(tcs, list):
+                        rendered_tcs = []
+                        for tc in tcs:
+                            fn = tc.get("function") or {}
+                            name = fn.get("name") or tc.get("name")
+                            args = fn.get("arguments") or tc.get("arguments")
+                            rendered_tcs.append(f"[called {name} with {args}]")
+                        tc_text = " ".join(rendered_tcs)
+                        content = f"{content} {tc_text}".strip() if content else tc_text
                 if content:
                     history_parts.append(f"{role.upper()}: {content}")
             if history_parts:
@@ -759,8 +903,21 @@ async def build_prompt(
                     else:
                         trailing_user_parts.append(txt)
 
-        if trailing_sys_parts:
-            final_prompt += f"[SYSTEM]\n{chr(10).join(trailing_sys_parts)}\n\n"
+        if MIRROR_SYSTEM_PROMPT:
+            mirrored_sys = await extract_system(messages)
+            if mirrored_sys:
+                if is_json_object_format(response_format):
+                    mirrored_sys += "\n\n" + JSON_OBJECT_INSTRUCTION
+                final_prompt += f"[SYSTEM]\n{mirrored_sys}\n\n"
+            elif is_json_object_format(response_format):
+                final_prompt += f"[SYSTEM]\n{JSON_OBJECT_INSTRUCTION}\n\n"
+        elif trailing_sys_parts:
+            trailing_sys_text = chr(10).join(trailing_sys_parts)
+            if is_json_object_format(response_format):
+                trailing_sys_text += "\n\n" + JSON_OBJECT_INSTRUCTION
+            final_prompt += f"[SYSTEM]\n{trailing_sys_text}\n\n"
+        elif is_json_object_format(response_format):
+            final_prompt += f"[SYSTEM]\n{JSON_OBJECT_INSTRUCTION}\n\n"
 
         if trailing_user_parts:
             trailing_user_text = chr(10).join(trailing_user_parts)
@@ -785,5 +942,7 @@ async def build_prompt(
 
         if tools_extract:
             final_prompt += TOOL_USE_INSTRUCTIONS + "\n"
+        if is_json_object_format(response_format) and JSON_OBJECT_INSTRUCTION not in final_prompt:
+            final_prompt += JSON_OBJECT_INSTRUCTION + "\n"
 
     return _with_effort(final_prompt)

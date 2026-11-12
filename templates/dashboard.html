@@ -1,7 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Dashboard - DeeperSeeker{% endblock %}
 {% block content %}
-<h1>Dashboard</h1>
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+    <h1 style="margin-bottom: 0;">Dashboard</h1>
+    <div id="live-indicator" style="font-size: 0.85em; color: #3fb950; display: inline-flex; align-items: center; gap: 6px; user-select: none;">
+        <span id="live-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#3fb950; box-shadow:0 0 6px #3fb950;"></span>
+        <span id="live-text">Live (0.5s)</span>
+    </div>
+</div>
 
 <section>
     <h2>Add Auth Token</h2>
@@ -22,14 +28,43 @@
     <div class="warning">
         If you logout from DeepSeek in browser, this token stops working.
     </div>
-    <form method="post" action="/tokens/add">
+    <form method="post" action="/tokens/add" id="add-token-form">
         <input type="text" name="alias" placeholder="Alias (optional, e.g. personal, work)" style="width:200px">
-        <input type="text" name="auth_token" placeholder="Paste auth token here (no quotes)" style="width:400px">
+        <input type="text" name="auth_token" id="auth-token-input" placeholder="Paste auth token here (quotes & value: trimmed automatically)" style="width:400px">
         <button type="submit">Add Token</button>
     </form>
+    <script>
+    (function() {
+        const inp = document.getElementById('auth-token-input');
+        if (!inp) return;
+        function clean(v) {
+            if (!v) return v;
+            let s = v.trim();
+            if (s.startsWith('{') && s.includes('value')) {
+                try {
+                    const p = JSON.parse(s);
+                    if (p && p.value) s = String(p.value).trim();
+                } catch(e) {}
+            }
+            s = s.replace(/^(?:"?value"?)\s*[:=]\s*/i, '').trim();
+            while ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+                s = s.slice(1, -1).trim();
+            }
+            return s;
+        }
+        inp.addEventListener('paste', function() {
+            setTimeout(function() { inp.value = clean(inp.value); }, 10);
+        });
+        inp.addEventListener('change', function() { inp.value = clean(inp.value); });
+        const form = document.getElementById('add-token-form');
+        if (form) {
+            form.addEventListener('submit', function() { inp.value = clean(inp.value); });
+        }
+    })();
+    </script>
 </section>
 
-<section>
+<section id="token-pool-section">
     <h2>Token pool ({{ tokens|length }})</h2>
     {% if tokens %}
     <table>
@@ -50,18 +85,28 @@
                 <td>{{ tok['id'] }}</td>
                 <td>{{ tok['label'] }}</td>
                 <td>
-                    <span class="status {{ tok['state_class'] }}">{{ tok['status'] }}</span>
+                    <span class="status {{ tok['state_class'] }}">{{ tok['status_label'] }}{% if tok['warming'] %}<span class="steam" aria-hidden="true"><i></i><i></i><i></i></span>{% endif %}</span>
                     <div class="state-note">{{ tok['state_note'] }}</div>
                 </td>
                 <td>{{ tok['in_flight'] }}</td>
                 <td>{{ tok['last_used'] }}</td>
                 <td>{{ tok['cooldown'] }}</td>
                 <td>
+                    {% if tok['can_solve_captcha'] %}
+                    <form method="post" action="/tokens/{{ tok['id'] }}/solve_captcha" style="display:inline"
+                          onsubmit="return confirm('A browser window will now open to solve some comrade captcha. Send any prompt in a new chat, solve the captcha, then close the browser. DO NOT FORGET TO CLICK THE Restore BUTTON IN THE PANEL AFTERWARDS.')">
+                        <button type="submit" class="btn-sm" style="background:#d97706;color:#fff;" title="Open real browser with this account on chat.deepseek.com to solve captcha">Solve Captcha</button>
+                    </form>
+                    {% endif %}
                     {% if tok['can_restore'] %}
                     <form method="post" action="/tokens/{{ tok['id'] }}/restore" style="display:inline">
                         <button type="submit" class="btn-sm">Restore</button>
                     </form>
                     {% endif %}
+                    <form method="post" action="/tokens/{{ tok['id'] }}/purge" style="display:inline"
+                          onsubmit="return confirm('This button will delete all your chats and disable some comrade tracking, possibly lowering account social credit with frequent purging. Are you sure?')">
+                        <button type="submit" class="btn-sm">Purge Chats</button>
+                    </form>
                     <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
                           onsubmit="return confirm('Delete?')">
                         <button type="submit" class="btn-sm btn-danger">Delete</button>
@@ -71,6 +116,12 @@
             {% endfor %}
         </tbody>
     </table>
+    <div style="margin-top: 10px; margin-bottom: 10px;">
+        <form method="post" action="/tokens/purge_all" style="display:inline"
+              onsubmit="return confirm('This button will delete all your chats and disable some comrade tracking, possibly lowering account social credit with frequent purging. Are you sure?')">
+            <button type="submit" class="btn-sm">Purge All Chats</button>
+        </form>
+    </div>
     <p class="state-note">
         RATE_LIMITED cools down and rejoins by itself. QUARANTINED never does —
         an auth failure or a repeated 403 takes the token out until Restore puts
@@ -81,7 +132,7 @@
     {% endif %}
 </section>
 
-<section>
+<section id="usage-section">
     <h2>Usage — last 30 days (per day × per key)</h2>
     {% if usage_rows %}
     <table>
@@ -128,4 +179,78 @@
     <p>Anthropic: <code>http://localhost:4000</code></p>
     <p>Model: <code>v4.1flash</code> (single default DeepSeek model)</p>
 </section>
+
+<script>
+(function() {
+    let isMouseDown = false;
+    let isSubmitting = false;
+
+    document.addEventListener('mousedown', function() { isMouseDown = true; });
+    document.addEventListener('mouseup', function() { isMouseDown = false; });
+    document.addEventListener('submit', function() { isSubmitting = true; });
+
+    const dot = document.getElementById('live-dot');
+    const text = document.getElementById('live-text');
+
+    async function updateDashboard() {
+        if (document.hidden || isMouseDown || isSubmitting) return;
+
+        const curPool = document.getElementById('token-pool-section');
+        const curUsage = document.getElementById('usage-section');
+        const active = document.activeElement;
+        if (active && ((curPool && curPool.contains(active)) || (curUsage && curUsage.contains(active)))) {
+            return;
+        }
+
+        try {
+            const res = await fetch(window.location.href, {
+                headers: { 'Cache-Control': 'no-cache' },
+                credentials: 'same-origin'
+            });
+
+            if (res.redirected && res.url.includes('/login')) {
+                window.location.href = '/login';
+                return;
+            }
+
+            if (!res.ok) {
+                if (dot) {
+                    dot.style.background = '#da3633';
+                    dot.style.boxShadow = 'none';
+                }
+                if (text) text.textContent = 'Offline';
+                return;
+            }
+
+            const html = await res.text();
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+
+            const newPool = doc.getElementById('token-pool-section');
+            if (newPool && curPool && curPool.innerHTML !== newPool.innerHTML) {
+                curPool.innerHTML = newPool.innerHTML;
+            }
+
+            const newUsage = doc.getElementById('usage-section');
+            if (newUsage && curUsage && curUsage.innerHTML !== newUsage.innerHTML) {
+                curUsage.innerHTML = newUsage.innerHTML;
+            }
+
+            if (dot) {
+                dot.style.background = '#3fb950';
+                dot.style.boxShadow = '0 0 6px #3fb950';
+            }
+            if (text) text.textContent = 'Live (0.5s)';
+        } catch (e) {
+            if (dot) {
+                dot.style.background = '#da3633';
+                dot.style.boxShadow = 'none';
+            }
+            if (text) text.textContent = 'Reconnecting...';
+        }
+    }
+
+    setInterval(updateDashboard, 500);
+})();
+</script>
 {% endblock %}

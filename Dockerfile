@@ -16,7 +16,10 @@ RUN uv sync --no-install-project    # deps only — no project wheel without sou
 COPY . .
 RUN uv sync                          # install the project now that source exists
 
-COPY . .
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN uv run patchright install --with-deps chromium \
+    && chmod -R 755 /ms-playwright \
+    && rm -rf /var/lib/apt/lists/*
 
 # P0-8 (Day 17): the service runs as an unprivileged user. Only the durable
 # state directory (SQLite database, cookie backup, generated api_key.txt) is
@@ -56,7 +59,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl 
 # keeps writing as root).
 USER appuser
 
-# If reverting to backup Playwright cookie generation, run under xvfb:
+# If reverting to backup Patchright cookie generation, run under xvfb:
 # CMD ["sh", "-c", "xvfb-run -a -s '-screen 0 1280x720x24' python3 app.py"]
-# might also need requirements-waf-backup edition
 CMD ["deeperseeker"]

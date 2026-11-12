@@ -39,11 +39,15 @@ def test_deep_probe_requires_auth_before_upstream():
 
 
 def test_deep_probe_healthy_reports_shape_without_secrets():
-    async def ok_create(token):
-        return "chat-session-id-1234"
+    async def fail_create(token):
+        raise AssertionError("create_new_chat must not be called by deep health probe")
+
+    async def ok_probe(token):
+        return {"status": "valid", "msg": "ok"}
 
     with (
-        mock.patch.object(app_module, "create_new_chat", ok_create),
+        mock.patch.object(app_module, "create_new_chat", fail_create),
+        mock.patch.object(app_module, "probe_token", ok_probe),
         # Review fix (PR #62): the probe rides the state-aware pick
         # (pick_token -> get_token) instead of the state-blind first row.
         mock.patch.object(app_module, "pick_token", lambda: 1),
@@ -62,7 +66,7 @@ def test_deep_probe_healthy_reports_shape_without_secrets():
     assert payload["upstream_reachable"] is True
     assert payload["pow_ok"] is True
     assert isinstance(payload["latency_ms"], (int, float))
-    assert payload["chat_created"] is True
+    assert payload["chat_created"] is False
     body = str(payload)
     assert "chat-session-id-1234" not in body, "no upstream session id may leak"
     assert "secret-token-material" not in body, "no token material may leak"
@@ -77,7 +81,7 @@ def test_deep_probe_failure_is_degraded_and_redacted():
         )
 
     with (
-        mock.patch.object(app_module, "create_new_chat", boom),
+        mock.patch.object(app_module, "probe_token", boom),
         mock.patch.object(app_module, "pick_token", lambda: 1),
         mock.patch.object(
             app_module,
