@@ -100,7 +100,7 @@ python-dotenv==1.2.4
     # via -r requirements.in
 python-multipart==0.0.33
     # via -r requirements.in
-ruff==0.17.3
+ruff==0.17.4
     # via -r requirements-dev.in
 setuptools==84.2.1
     # via pip-tools
