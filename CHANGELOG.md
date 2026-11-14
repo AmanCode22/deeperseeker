@@ -13,10 +13,21 @@ main.
 - Upstream business errors (HTTP 200 with `code=40003 INVALID_TOKEN`, "messages too frequent", a killed web session) surface as a typed 401/429 and rotate the token instead of raising `TypeError` inside the route and pinning the dead account forever. The pre-turn create hops (`create_new_chat`, `create_challange_pow`) go through the same classifier, outside the per-signature lock so the retry cannot deadlock. (PR #92)
 - Upstream hang-ups mid-stream log a warning and emit the terminal error frame instead of a traceback and a dead socket. (PR #92)
 - A single upstream turn is bounded by `DEEPSEEKER_REQUEST_DEADLINE` (default 600 s); a slowly-dripping upstream no longer holds a request until the client gives up. (PR #92)
+- The pool no longer hands out an account that is still cooling down. When every account is cooling, the request is refused with 429 and a `Retry-After` instead of being sent straight back into the same refusal — that fallback is the first half of the chain issue #105 traced from "messages too frequent" to a revoked account (40003). `DEEPSEEKER_REFUSE_WHEN_ALL_COOLING=0` restores the old behaviour. (#105)
+- A 429 now rests the account for longer with each consecutive refusal — 60 s, 300 s, 900 s, 3600 s — instead of a flat 60 s cooldown, and a successful turn resets the streak, so one bad minute no longer condemns an account. `DEEPSEEKER_RATE_LIMIT_LADDER` sets the ladder; after `DEEPSEEKER_RATE_LIMIT_PARK_AFTER` consecutive 429s the account is parked for an hour instead of cooled again. (#105)
+- Every rate refusal now answers with the shape of the surface it was sent to: the Anthropic routes return `{"type": "error", …}`, the OpenAI routes `{"error": {…}}`. The 429 body of the token-rotation path carried the OpenAI shape on the Anthropic routes, so a Claude Code client could not read it. (#105)
+- The token-rotation path — an existing conversation whose account is cooling and no other account is free — answers with 429 and a `Retry-After` like every other rate path, instead of a bare 429 that carried no wait time at all. (#105)
+- A conversation that moved to another account is refused against that account's budget, not against the budget of the account the session started on. (#105)
+- The deep-health probe tells "every account is cooling down or over its request budget" apart from "there is no account in the pool", and names the wait time in the first case. (#105)
+- The rolling per-minute window is read from worker threads and written from the event loop, so its reads, writes and pruning now run under one lock; an unguarded read-then-pop could empty the window between the check and the pop and turn a burst into a 500. (#105)
+- The file endpoints (`POST /v1/files`, `POST /v1/files/upload`, `GET /v1/files/{id}/content`) obey the same per-minute budget as a chat turn: they spend it, and they are refused with 429 and a `Retry-After` when the account is already over it. (#105)
+- The 429 and 403 streak counters increment and report in one statement, so the cooldown rung and the parking threshold can no longer be decided by another caller's increment. (#105)
 
 ### Added
 
 - `POST /v1/messages/count_tokens` (also at `/messages/count_tokens`) — Claude Code's context probes returned 404 before. (PR #92)
+- Every account can have a rolling per-minute request budget (`DEEPSEEKER_TOKEN_MAX_MSGS_PER_MIN`). It is **opt-in** — unset keeps today's unbounded behaviour, and `5` is the value issue #105 suggests for agent workloads, where one user turn is 5–15 upstream messages. When the budget is on, a request that would exceed it is refused with 429 and a `Retry-After` before it reaches upstream, and the scheduler prefers an account that still has room in its window. `DEEPSEEKER_TOKEN_MAX_WAIT` bounds how long a request waits for the window to slide instead of being refused. (#105)
+- Upstream `Retry-After` values now reach the client instead of being consumed internally, and the dashboard shows each account's budget usage and 429 streak next to its in-flight count. (#105)
 
 ## [6.0] — 2026-10-21
 

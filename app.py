@@ -36,6 +36,7 @@ security = HTTPBasic()
 
 
 from functions import (
+    TOKEN_MAX_WAIT_SECONDS,
     CookieGenerationError,
     StreamToolParser,
     UpstreamError,
@@ -71,9 +72,11 @@ from functions import (
     park_token_for_captcha,
     parse_tools,
     pick_token,
+    pool_rate_state,
     probe_token,
     purge_all_tokens_chats,
     purge_chats_for_token,
+    rate_budget_state,
     record_file,
     record_usage,
     reply_id,
@@ -702,7 +705,109 @@ def _api_error_response(e, is_anthropic=False):
     else:
         err_type = "rate_limit_error" if code == 429 else "api_error"
         payload = {"error": {"message": message, "type": err_type, "code": code}}
-    return JSONResponse(payload, status_code=code)
+    headers = {}
+    if code == 429:
+        # The upstream Retry-After used to be swallowed inside
+        # _record_upstream_limit(): the client was told "429" and nothing
+        # else, so the obvious reaction was to retry at once. Pass it on.
+        upstream_retry = getattr(e, "retry_after", None)
+        try:
+            if upstream_retry:
+                headers["Retry-After"] = str(max(1, int(upstream_retry)))
+        except (TypeError, ValueError):
+            pass  # a header is a nicety; the 429 itself must still go out
+    return JSONResponse(payload, status_code=code, headers=headers)
+
+
+def _rate_refusal(retry_after, message=None, is_anthropic=False):
+    """429 with a Retry-After header: the pool is over its rate budget.
+
+    A client that sees this must come back, not retry immediately — that is
+    exactly the behaviour issue #105 traced on the way to a revoked account.
+
+    The Anthropic surface gets the Anthropic error envelope ({"type":
+    "error", ...}), like every other error path in this file — a Claude Code
+    client parses the shape, not the prose.
+    """
+    retry = max(1, int(retry_after or 1))
+    text = message or (
+        "Upstream request rate limit reached for this account pool. "
+        "Retry after the indicated delay."
+    )
+    if is_anthropic:
+        payload = {
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": text},
+        }
+    else:
+        payload = {
+            "error": {
+                "message": text,
+                "type": "rate_limit_error",
+            }
+        }
+    return JSONResponse(
+        payload,
+        status_code=429,
+        headers={"Retry-After": str(retry)},
+    )
+
+
+async def _no_token_response(is_anthropic=False):
+    """The pool had nothing to hand out.
+
+    "Every account is cooling down" is a RATE condition and answers 429 with a
+    Retry-After; a pool with no usable account at all is a configuration
+    condition and keeps the old 503.
+    """
+    limited, retry_after = await _db(pool_rate_state)
+    if limited:
+        return _rate_refusal(retry_after, is_anthropic=is_anthropic)
+    return JSONResponse({"error": "No tokens available"}, status_code=503)
+
+
+async def _budget_refusal(token_id, is_anthropic=False):
+    """429 + Retry-After when this account is over its per-minute budget."""
+    state = await _db(rate_budget_state, token_id)
+    if not state["exhausted"]:
+        return None
+    return _rate_refusal(
+        state["retry_after"],
+        "This account has reached its per-minute request budget. "
+        "Retry after the indicated delay.",
+        is_anthropic=is_anthropic,
+    )
+
+
+async def _await_budget(token_id, is_anthropic=False):
+    """Wait for this account's minute to free up, or refuse.
+
+    #105 asks for a cap that WAITS rather than fails: an agent turn is a
+    burst of upstream messages, and the burst should ride out the rolling
+    window instead of the client being told to come back. DEEPSEEKER_TOKEN_MAX_WAIT
+    bounds the wait — past it the client gets a 429 with a Retry-After,
+    because a request that blocks for minutes is worse than one that fails
+    fast, and the client can retry on its own schedule.
+
+    The wait happens BEFORE the upstream call, so a request that waits costs
+    the account nothing.
+    """
+    state = await _db(rate_budget_state, token_id)
+    if not state["exhausted"]:
+        return None
+    max_wait = TOKEN_MAX_WAIT_SECONDS
+    if max_wait > 0 and state["retry_after"] <= max_wait:
+        await asyncio.sleep(state["retry_after"] + 0.05)
+        # Somebody else may have taken the freed slot while we waited.
+        state = await _db(rate_budget_state, token_id)
+        if not state["exhausted"]:
+            return None
+    return _rate_refusal(
+        state["retry_after"],
+        "This account has reached its per-minute request budget. "
+        "Retry after the indicated delay.",
+        is_anthropic=is_anthropic,
+    )
 
 
 # P0-4: credential-shaped material must never reach a client-visible error
@@ -1316,15 +1421,16 @@ async def handle_chat(
                         if rot_owner is not None:
                             rot_owner.release()
                         return format_response(resp_text, model, messages, tools)
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": "No active tokens available (all rate limited). Try again later.",
-                        "type": "rate_limit_error",
-                    }
-                },
-                status_code=429,
-            )
+            # The pool had nothing to hand out for this session's account:
+            # every account is cooling down or over its per-minute budget.
+            # That is a RATE condition, so the client gets the same answer
+            # the create path gives — 429 with a Retry-After that says when
+            # to come back, in the Anthropic envelope on the Anthropic
+            # surface. The raw 429 that used to stand here carried neither a
+            # Retry-After nor the right body shape, so a retrying client had
+            # nothing to wait for and a Claude Code client could not parse
+            # it (issue #105).
+            return await _no_token_response(is_anthropic)
     else:
         create_lock = _take_lock("sig", _sig_locks, sig, SIG_LOCKS_MAX)
         setup_retry = None
@@ -1341,9 +1447,11 @@ async def handle_chat(
                     exclude={_exclude_token} if _exclude_token is not None else None,
                 )
                 if not token_id:
-                    return JSONResponse(
-                        {"error": "No tokens available"}, status_code=503
-                    )
+                    # Every account cooling down is a RATE condition, not a
+                    # missing-configuration one: answer 429 with a
+                    # Retry-After so the client waits instead of retrying
+                    # into the same refusal (issue #105).
+                    return await _no_token_response(is_anthropic)
                 # B4: upstream files are account-scoped. If the conversation's
                 # first turn references uploaded files with a single known
                 # owner, run the chat on that token — a scheduler pick from a
@@ -1365,6 +1473,12 @@ async def handle_chat(
                 tok = await _db(get_token, token_id)
                 if not tok:
                     return JSONResponse({"error": "Token not found"}, status_code=503)
+                # Per-minute budget for this account (issue #105). The check
+                # sits BEFORE the first upstream call: an upstream refusal
+                # costs the account, a 429 with a Retry-After does not.
+                refusal = await _await_budget(token_id, is_anthropic)
+                if refusal is not None:
+                    return refusal
 
                 # Accumulated-context rollover (issue #22): when the conversation is
                 # nearing the observed remembered-context limit, first obtain a
@@ -1447,6 +1561,13 @@ async def handle_chat(
         return JSONResponse({"error": "Token expired"}, status_code=503)
     _set_key_name(tok.get("alias"))
 
+    # Per-minute budget for this account (issue #105) — same reasoning as the
+    # create path: refuse before the first upstream call, and tell the client
+    # exactly when to come back.
+    refusal = await _await_budget(token_id, is_anthropic)
+    if refusal is not None:
+        return refusal
+
     # B1 (Stage 1 audit): the accumulated-context rollover used to run BEFORE
     # the per-chat lock was acquired — only first-time creation was guarded by
     # the sig-lock — so two concurrent requests with the same signature could
@@ -1475,6 +1596,11 @@ async def handle_chat(
                 if not tok:
                     return JSONResponse({"error": "Token expired"}, status_code=503)
                 _set_key_name(tok.get("alias"))
+                # The chat moved to ANOTHER account, so the budget of the one
+                # checked above does not apply to this one.
+                refusal = await _await_budget(token_id, is_anthropic)
+                if refusal is not None:
+                    return refusal
                 lock_owner = await _own_chat_lock(session_id)
                 # B1 residual (Stage 1 review, finding 3): the parent adopted
                 # above was read while we still held the OLD chat's lock; the
@@ -3121,11 +3247,20 @@ async def files_upload(request: Request):
         return JSONResponse({"error": "Invalid API key"}, status_code=401)
     tok_id = await _db(pick_token)
     if not tok_id:
-        return JSONResponse({"error": "No tokens available"}, status_code=503)
+        return await _no_token_response()
     tok = await _db(get_token, tok_id)
     if not tok:
         return JSONResponse({"error": "Token not found"}, status_code=503)
     _set_key_name(tok.get("alias"))
+    # An upload is an upstream turn against this account: it spends the same
+    # per-minute budget a chat turn spends (acquire_token_slot below debits
+    # it). Refuse it BEFORE the upstream call when the budget is already
+    # spent, so a busy account is not pushed further into "messages too
+    # frequent" (issue #105). The debit happens either way — the check only
+    # decides whether the call goes out at all.
+    refusal = await _await_budget(tok_id)
+    if refusal is not None:
+        return refusal
     slot = acquire_token_slot(
         tok_id
     )  # B3: upload counts toward the token's in-flight load
@@ -3191,11 +3326,19 @@ async def files_content(file_id: str, request: Request):
     if tok_id is None:
         tok_id = await _db(pick_token)
         if not tok_id:
-            return JSONResponse({"error": "No tokens available"}, status_code=503)
+            return await _no_token_response()
     tok = await _db(get_token, tok_id)
     if not tok:
         return JSONResponse({"error": "Token not found"}, status_code=503)
     _set_key_name(tok.get("alias"))
+    # The fetch is an upstream turn against the owning account, so it obeys
+    # the same per-minute budget as a chat turn (issue #105). Upstream files
+    # are account-scoped: no other account could serve this id, so the honest
+    # answer when the owner is over budget is 429 + Retry-After, not a
+    # pointless retry elsewhere.
+    refusal = await _await_budget(tok_id)
+    if refusal is not None:
+        return refusal
     slot = acquire_token_slot(tok_id)
     try:
         gen = get_file_content(tok["token"], file_id)
@@ -4693,11 +4836,20 @@ async def _deep_health_probe():
     row = await _db(get_token, token_id) if token_id is not None else None
     auth_token = row["token"] if row else None
     if not auth_token:
+        # The pool may hold usable accounts that are merely cooling down (the
+        # scheduler refuses to hand those out — issue #105), which is a
+        # different situation from having no accounts at all. Say which.
+        limited, retry_after = await _db(pool_rate_state)
         return {
             "upstream_reachable": False,
             "pow_ok": False,
             "latency_ms": None,
-            "reason": "no ACTIVE token in pool",
+            "reason": (
+                f"all accounts cooling down or over their request budget "
+                f"(retry in {retry_after}s)"
+                if limited
+                else "no ACTIVE token in pool"
+            ),
         }
     started = time.perf_counter()
     try:

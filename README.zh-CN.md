@@ -165,6 +165,11 @@ python3 app.py
 | `DEEPSEEKER_RATE_LIMIT_COOLDOWN` | 被限流的 token 冷却多少秒后自动回到轮换池 | `60` |
 | `DEEPSEEKER_TOKEN_CONCURRENCY` | 单 token 软并发上限；满载的 token 只在无其他空闲时使用 | `8` |
 | `DEEPSEEKER_QUARANTINE_AFTER_403` | 连续多少次 403 会把 token 移出轮换，直到手动恢复（`0` 关闭升级） | `3` |
+| `DEEPSEEKER_RATE_LIMIT_LADDER` | 连续 429 的冷却阶梯（秒，逗号分隔） | `60,300,900,3600` |
+| `DEEPSEEKER_RATE_LIMIT_PARK_AFTER` | 连续多少次 429 后改为停放一小时而不是继续冷却（`0` 关闭） | `5` |
+| `DEEPSEEKER_REFUSE_WHEN_ALL_COOLING` | 所有 token 都在冷却时用 429 + `Retry-After` 拒绝请求，而不是复用正在冷却的 token（`0` 恢复旧行为） | `1` |
+| `DEEPSEEKER_TOKEN_MAX_MSGS_PER_MIN` | 单 token 的滚动每分钟请求预算——**默认不启用**，不设置即保持现有的无上限行为；agent 场景（一次用户轮次 = 5–15 次上游消息）建议 `5`。超出的请求在触达上游之前就被 429 + `Retry-After` 拒绝（`0` 关闭）。每一次上游调用都计入预算，包括文件上传与文件下载 | 未设置 |
+| `DEEPSEEKER_TOKEN_MAX_WAIT` | 请求为等待预算窗口滑动最多等待多少秒；超过则返回 429 + `Retry-After`（`0` = 立即拒绝） | `0` |
 | `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` | 一轮对话在池内的重试次数，用尽后才把上游错误返回给客户端 | `3` |
 | `DEEPSEEKER_MAX_USER_MESSAGE_TOKENS` | 提示内最新一条用户消息的硬上限；超过后按尾部截断并加标记，而不是让上游失败 | `900000` |
 | `DEEPSEEKER_PROMPT_OVERHEAD_TOKENS` | 滚动估算时加上的固定开销，覆盖工具模式、系统扩写与原始历史中看不到的摘要 | `4096` |
@@ -202,7 +207,7 @@ python3 app.py
 - **基于上下文的会话选择器**：对规范化后的消息历史（截至最后一条 assistant 轮次）、模型与 API 密钥作用域计算 SHA-256 签名，用来匹配并续用已有的网页聊天会话。会话创建有锁保护，避免重复建会话。
 - **摘要滚动上下文策略**：当会话累计上下文接近观测到的记忆上限（约 393K 输入 token）时，桥接会向模型要一份精简的交接摘要（在临时会话里生成），开一个新网页会话，并用该摘要加最新用户消息做种子。最近相关的工具调用/结果会保留（受 `DEEPSEEKER_MAX_TOOL_RESULT_TOKENS` 约束，另有更紧的单条上限 `DEEPSEEKER_PER_TOOL_RESULT_TOKENS`）；附件在摘要中以文字描述，不做转发。第一条消息无论多大都绝不滚动（首条消息路径可接受约 1M token）。`/v1/models` 声明的限额（`context_window`、`max_output_tokens`）反映的是观测行为，不是有保证的上游限额。摘要提示词要求模型把对话内容当作数据，绝不当作指令。
 - **全量历史注入**：当会话签名不在数据库中或账号发生故障转移时，把完整对话历史注入新会话。
-- **限流恢复与隔离**：429——或低于升级阈值的 403——会让 token 冷却 `DEEPSEEKER_RATE_LIMIT_COOLDOWN` 秒并自动回到轮换；而 401，或连续 `DEEPSEEKER_QUARANTINE_AFTER_403` 次 403 且中间没有成功轮次，会把它标记为 `QUARANTINED` 并永久移出轮换——被拒绝的凭据不是限流，每分钟重新武装一次正是账号被封的方式。除了仪表盘上的 **Restore**（`POST /tokens/{id}/restore`），没有任何路径能离开隔离。上游 401/403/429 时，坏掉的网页会话被丢弃，该轮在*另一个*池内 token 上以抖动退避重试——最多 `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` 次，然后返回规范的 API 错误——重试带全量历史注入，账号维度的文件会先重新挂到该 token 上；桥接只在你添加的 token 之间轮换，绝不会自己注册新号。池视图按别名显示每个 token 的状态、在途数、最近使用与剩余冷却时间，不含任何凭据信息；迟到的在途成功无法解除隔离。在途计数按进程统计，多 worker 部署只能看到自己 worker 的数字。
+- **限流恢复与隔离**：429——或低于升级阈值的 403——会让 token 冷却 `DEEPSEEKER_RATE_LIMIT_COOLDOWN` 秒并自动回到轮换；而 401，或连续 `DEEPSEEKER_QUARANTINE_AFTER_403` 次 403 且中间没有成功轮次，会把它标记为 `QUARANTINED` 并永久移出轮换——被拒绝的凭据不是限流，每分钟重新武装一次正是账号被封的方式。除了仪表盘上的 **Restore**（`POST /tokens/{id}/restore`），没有任何路径能离开隔离。上游 401/403/429 时，坏掉的网页会话被丢弃，该轮在*另一个*池内 token 上以抖动退避重试——最多 `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` 次，然后返回规范的 API 错误——重试带全量历史注入，账号维度的文件会先重新挂到该 token 上；桥接只在你添加的 token 之间轮换，绝不会自己注册新号。429 被当作封禁链的第一步而不是偶发抖动：冷却时间随连续 429 递增（60 秒、300 秒、900 秒、3600 秒），一次成功轮次即可清零；当池中所有 token 都在冷却时，请求会带着 `Retry-After` 返回 429，而不是把仍在冷却的 token 再交出去。每个 token 还可以设置滚动每分钟请求预算（`DEEPSEEKER_TOKEN_MAX_MSGS_PER_MIN`，默认不启用——不设置即保持现有的无上限行为；agent 场景建议 `5`，因为一次用户轮次就是 5–15 次上游消息）。超出预算的请求会等待窗口滑动（`DEEPSEEKER_TOKEN_MAX_WAIT` 限定等待上限），只有等待过久时才以 429 + `Retry-After` 拒绝——并且拒绝发生在触达上游之前，因此拒绝本身不会消耗账号。每一次上游调用都计入该预算，包括文件上传与文件下载；所有限流拒绝都按所处接口的形状返回（OpenAI 为 `{"error": …}`，Anthropic 为 `{"type": "error", …}`）。池视图按别名显示每个 token 的状态、在途数、预算用量、429 连击、最近使用与剩余冷却时间，不含任何凭据信息；迟到的在途成功无法解除隔离。在途计数按进程统计，多 worker 部署只能看到自己 worker 的数字。
 - **长上下文韧性**：上游网页会话失败或返回空响应（如上下文溢出）时，坏会话被丢弃，请求在全新会话上以压缩、限 token 的历史注入重试一次；不可恢复的上游错误以规范的 JSON API 错误返回，而不是裸 500。
 - **工具调用与流式**：SSE 流式输出，think 标签跨 chunk 边界重组（不截断），多格式工具调用解析——DSML XML、XML 块、`<function_call>` 块与 JSON——统一映射为 OpenAI/Anthropic 工具模式。
 - **文件与视觉**：base64/URL 图片提取（含 SSRF 防护）与文档上传流式处理。图片和文档通过 `ref_file_ids` 直接引用——视觉的文件分叉步骤（`fork_file_task`）已移除，因为 `v4.1flash` 原生支持视觉。

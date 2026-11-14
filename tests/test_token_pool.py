@@ -13,6 +13,13 @@ token instead of cooling it for 60s, repeated 403s must escalate, and a
 quarantined token must return only by manual action. Those three are RED on
 today's tree by design — see the before-matrix in the branch's Day 6 commit.
 
+Rate discipline (issue #105) changes ONE thing above: with every token
+cooling, pick_token() now REFUSES instead of returning the soonest-to-recover
+one. Handing a cooling account straight back out is how a single "messages too
+frequent" became a revocation (40003) minutes later. The refusal is what the
+routes turn into a 429 with a Retry-After; the old fallback stays one env var
+away (DEEPSEEKER_REFUSE_WHEN_ALL_COOLING=0).
+
 Run:  python tests/test_token_pool.py   (pytest-compatible)
 """
 
@@ -63,9 +70,12 @@ def test_cooldown_auto_recovery(tmpdir=None):
         "picking a recovered token must flip it back to ACTIVE"
     )
 
-    # Still-cooling tokens are never "available", but the soonest-to-recover
-    # one is returned as a bounded-wait fallback (the old code returned the
-    # first token by id with no backoff logic at all).
+    # Still-cooling tokens are never "available". Issue #105: with every token
+    # cooling, pick_token() now REFUSES instead of handing the soonest-to-
+    # recover one straight back out. That fallback is how a single "messages
+    # too frequent" became a revocation (40003) minutes later: the account was
+    # never given a real rest. The refusal is what the routes turn into a 429
+    # with a Retry-After.
     conn = fns.get_db()
     conn.execute(
         "UPDATE tokens SET status='RATE_LIMITED', rate_limited_until=? WHERE id=1",
@@ -73,9 +83,19 @@ def test_cooldown_auto_recovery(tmpdir=None):
     )
     conn.commit()
     conn.close()
-    assert fns.pick_token() == 1, (
-        "with every token cooling, the soonest-to-recover token must be returned"
+    assert fns.pick_token() is None, (
+        "with every token cooling, the pool must refuse rather than hand a "
+        "cooling account back out"
     )
+    # The old fallback is still one env var away, for operators who want it.
+    fns.REFUSE_WHEN_ALL_COOLING = False
+    try:
+        assert fns.pick_token() == 1, (
+            "with DEEPSEEKER_REFUSE_WHEN_ALL_COOLING=0 the soonest-to-recover "
+            "token must be returned"
+        )
+    finally:
+        fns.REFUSE_WHEN_ALL_COOLING = True
     # An empty pool still yields None.
     fns.delete_token(1)
     fns.delete_token(2)
@@ -432,8 +452,9 @@ def test_stale_success_cannot_lift_a_quarantine(tmpdir=None):
         f"got {fns.get_token(1)['status']}"
     )
 
-    # Healthy token cooling too: the landed fallback may still reach for the
-    # cooling token (it recovers by itself), but never for the quarantined one.
+    # Healthy token cooling too: the pool refuses while every account is
+    # cooling (issue #105) — and a refusal must never launder the quarantine
+    # by handing the dead credential back out.
     conn = fns.get_db()
     conn.execute(
         "UPDATE tokens SET status='RATE_LIMITED', rate_limited_until=? WHERE id=2",
@@ -441,8 +462,9 @@ def test_stale_success_cannot_lift_a_quarantine(tmpdir=None):
     )
     conn.commit()
     conn.close()
-    assert fns.pick_token() == 2, (
-        "the soonest-to-recover fallback may use a cooling token..."
+    assert fns.pick_token() is None, (
+        "with every remaining token cooling the pool must refuse, and must "
+        "never hand out the quarantined credential"
     )
     assert fns.get_token(1)["status"] == "QUARANTINED", (
         "...but a laundered quarantine would hand a dead credential back to it"

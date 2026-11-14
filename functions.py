@@ -1,15 +1,18 @@
 import asyncio
 import base64
+import collections
 import contextlib
 import contextvars
 import json
 import logging
+import math
 import mimetypes
 import os
 import random
 import re
 import sqlite3
 import string
+import threading
 import time
 import urllib.parse
 import uuid
@@ -83,6 +86,11 @@ def get_db():
 
 
 def init_db():
+    # A fresh database means a fresh process's worth of in-memory state: the
+    # rolling per-minute windows must not survive it (tests rebuild the store
+    # between cases; a long-lived process rebuilds it only at start-up).
+    with _rate_lock:
+        _rate_windows.clear()
     conn = get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS tokens (
@@ -124,6 +132,14 @@ def init_db():
     if "consecutive_403" not in existing_cols:
         conn.execute(
             "ALTER TABLE tokens ADD COLUMN consecutive_403 INTEGER NOT NULL DEFAULT 0"
+        )
+    # Rate-discipline migration: how many upstream 429s ("messages too
+    # frequent") this token has seen with no successful turn in between. The
+    # counter drives the cooldown ladder (issue #105) and is reset by
+    # mark_active() and by restore_token(), exactly like the 403 counter.
+    if "consecutive_429" not in existing_cols:
+        conn.execute(
+            "ALTER TABLE tokens ADD COLUMN consecutive_429 INTEGER NOT NULL DEFAULT 0"
         )
     if "cookies" not in existing_cols:
         conn.execute("ALTER TABLE tokens ADD COLUMN cookies TEXT")
@@ -1747,6 +1763,62 @@ def delete_token(token_id):
 TOKEN_COOLDOWN_SECONDS = max(1, int(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "60")))
 TOKEN_CONCURRENCY_CAP = max(1, int(os.getenv("DEEPSEEKER_TOKEN_CONCURRENCY", "8")))
 
+# --- Rate discipline (issue #105) -------------------------------------------
+# A 429 is not a blip. Issue #105 traced a kill-chain: an account that had been
+# told "messages too frequent" was handed straight back out by the all-cooling
+# fallback a minute later, kept being hit, and was revoked (40003) minutes
+# later with no upstream traffic in between. Two changes close that chain:
+#
+#   1. the cooldown GROWS with the streak instead of being a flat 60 s, so a
+#      repeatedly-refused account rests long enough to stop being refused, and
+#   2. an account that is still cooling is not handed out at all.
+#
+# The ladder is built from DEEPSEEKER_RATE_LIMIT_COOLDOWN so the existing knob
+# still sets its first rung; DEEPSEEKER_RATE_LIMIT_LADDER overrides it outright.
+_ladder_env = os.getenv("DEEPSEEKER_RATE_LIMIT_LADDER", "").strip()
+if _ladder_env:
+    RATE_LIMIT_LADDER = tuple(
+        max(1, int(part))
+        for part in _ladder_env.split(",")
+        if part.strip() and part.strip().isdigit()
+    ) or (TOKEN_COOLDOWN_SECONDS,)
+else:
+    RATE_LIMIT_LADDER = (
+        TOKEN_COOLDOWN_SECONDS,
+        TOKEN_COOLDOWN_SECONDS * 5,
+        TOKEN_COOLDOWN_SECONDS * 15,
+        TOKEN_COOLDOWN_SECONDS * 60,
+    )
+# After this many consecutive 429s the account is parked for an hour instead
+# of being cooled again: a streak this long is an upstream rate strike, not
+# bad luck. 0 disables the park and keeps the ladder forever.
+RATE_LIMIT_PARK_AFTER = max(0, int(os.getenv("DEEPSEEKER_RATE_LIMIT_PARK_AFTER", "5")))
+
+# Per-token request budget: how many upstream turns one account may start
+# inside a rolling 60 s window. One client turn costs one send, but a turn
+# that fails upstream is retried (MAX_UPSTREAM_ATTEMPTS), and every retry is
+# another upstream call against the same account.
+#
+# OPT-IN, as asked for in #105: unset (0) keeps today's unbounded behaviour,
+# because a cap that silently starts refusing requests changes what every
+# existing deployment does on day one. Agent workloads (one user turn = 5-15
+# upstream messages in a minute) are what the cap is FOR, and 5 is the value
+# the #105 reporter suggested for them.
+TOKEN_MAX_MSGS_PER_MIN = max(0, int(os.getenv("DEEPSEEKER_TOKEN_MAX_MSGS_PER_MIN", "0")))
+# How long a request may WAIT for the account's window to slide instead of
+# being refused. #105 asks for a cap that waits rather than fails, so a
+# tool-calling agent rides out the window rather than being told to come
+# back; this bounds that wait, because a request that blocks for minutes is
+# worse than one that fails fast. 0 = no waiting, refuse immediately.
+TOKEN_MAX_WAIT_SECONDS = max(0, int(os.getenv("DEEPSEEKER_TOKEN_MAX_WAIT", "0")))
+# Refuse to hand out an account that is still cooling down, instead of
+# returning the soonest-to-recover one. With this off, the old hammer-through
+# behaviour returns.
+REFUSE_WHEN_ALL_COOLING = (
+    os.getenv("DEEPSEEKER_REFUSE_WHEN_ALL_COOLING", "1").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+
 # P0-3: a 403 seen this many times in a row (no successful turn in between) is
 # not a transient refusal — it is the ban ladder, so the token leaves rotation
 # until an operator restores it. 0 disables escalation and keeps today's
@@ -1797,13 +1869,118 @@ class _TokenSlot:
 
 
 def acquire_token_slot(token_id):
-    """Reserve one in-flight slot for token_id; pair it with slot.release()."""
+    """Reserve one in-flight slot for token_id; pair it with slot.release().
+
+    Every reservation is one upstream turn against this account, so the
+    per-minute budget counts it here — one place, every send site, including
+    the file endpoints and the rotation path.
+    """
+    note_rate_send(token_id)
     return _TokenSlot(token_id)
 
 
 def token_in_flight(token_id):
     """Current in-flight request count for a token (selection signal)."""
     return _in_flight.get(token_id, 0)
+
+
+# --- Per-token request budget (issue #105) ----------------------------------
+# A rolling window of the timestamps at which each account started an upstream
+# turn. In-memory per process, like _in_flight: it protects one worker, and a
+# multi-worker deployment still gets the DB-side cooldown ladder.
+#
+# The window is touched from two threads: note_rate_send() runs in the event
+# loop (every send reserves a slot there), while rate_budget_state() runs in a
+# worker thread (the routes read the budget through _db() -> to_thread). The
+# pruning loop pops from the deque, so an unguarded read-then-pop can empty
+# the deque between the check and the pop. A lock keeps the two apart.
+_RATE_WINDOW_SECONDS = 60.0
+_rate_windows = {}
+_rate_lock = threading.Lock()
+
+
+def note_rate_send(token_id, now=None):
+    """Record that this account just started an upstream turn."""
+    if TOKEN_MAX_MSGS_PER_MIN <= 0:
+        return
+    now = time.time() if now is None else now
+    with _rate_lock:
+        window = _rate_windows.get(token_id)
+        if window is None:
+            window = _rate_windows[token_id] = collections.deque()
+        cutoff = now - _RATE_WINDOW_SECONDS
+        while window and window[0] <= cutoff:
+            window.popleft()
+        window.append(now)
+
+
+def rate_budget_state(token_id, now=None):
+    """How much of this account's per-minute budget is spent.
+
+    Returns {"used", "limit", "exhausted", "retry_after"}: `retry_after` is the
+    number of seconds until the oldest recorded turn leaves the window, i.e.
+    exactly how long the caller has to wait before it may send again.
+    """
+    limit = TOKEN_MAX_MSGS_PER_MIN
+    now = time.time() if now is None else now
+    if limit <= 0:
+        return {"used": 0, "limit": 0, "exhausted": False, "retry_after": 0}
+    with _rate_lock:
+        window = _rate_windows.get(token_id)
+        used = 0
+        oldest = None
+        if window:
+            cutoff = now - _RATE_WINDOW_SECONDS
+            while window and window[0] <= cutoff:
+                window.popleft()
+            if not window:
+                _rate_windows.pop(token_id, None)
+            else:
+                used = len(window)
+                oldest = window[0]
+        retry_after = 0
+        if used >= limit and oldest is not None:
+            retry_after = max(
+                1, int(math.ceil(oldest + _RATE_WINDOW_SECONDS - now))
+            )
+        return {
+            "used": used,
+            "limit": limit,
+            "exhausted": used >= limit,
+            "retry_after": retry_after,
+        }
+
+
+def pool_rate_state():
+    """Is the pool rate-limited right now, and if so for how long?
+
+    Answers the question the routes need: "every account is cooling down or
+    over its per-minute budget" is a RATE condition (429 with a Retry-After),
+    not a missing-configuration condition (503). Returns (rate_limited, retry
+    _after_seconds) — retry_after is the shortest wait that would let the pool
+    take a request again.
+    """
+    now = time.time()
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, status, rate_limited_until FROM tokens"
+    ).fetchall()
+    conn.close()
+    waits = []
+    for tid, status, until in rows:
+        if status == "QUARANTINED":
+            continue  # operator action, not a rate condition
+        if status in ("RATE_LIMITED", "PARKED") and until and until > now:
+            waits.append(int(until - now) + 1)
+            continue
+        state = rate_budget_state(tid, now)
+        if state["exhausted"]:
+            waits.append(state["retry_after"])
+    if waits:
+        # The soonest moment the pool could take a request again — whichever
+        # account frees up first, cooling or budget.
+        return True, int(min(waits))
+    return False, 0
 
 
 def pick_token(exclude=None):
@@ -1840,6 +2017,10 @@ def pick_token(exclude=None):
 
     pickable = [entry for entry in available if entry[0] not in excluded] or available
     if pickable:
+        # One budget read per candidate, not per comparison.
+        budget_used = {
+            tid: rate_budget_state(tid)["exhausted"] for tid, _ in pickable
+        }
         if recovered:
             conn = get_db()
             conn.executemany(
@@ -1857,9 +2038,23 @@ def pick_token(exclude=None):
             in_flight = _in_flight.get(tid, 0)
             # Soft cap: over-cap tokens sort behind every under-cap one.
             over_cap = 1 if in_flight >= TOKEN_CONCURRENCY_CAP else 0
-            return (over_cap, in_flight, last_used, tid)
+            # Soft cap: an account that is over its per-minute budget sorts
+            # behind every account that still has room, so a pool of several
+            # accounts spreads the load instead of piling onto the first one.
+            over_budget = 1 if budget_used.get(tid) else 0
+            return (over_cap, over_budget, in_flight, last_used, tid)
 
         return min(pickable, key=_sort_key)[0]
+
+    # Every token is rate-limited and still cooling. Issue #105: handing a
+    # cooling account straight back out is how one "messages too frequent"
+    # became a revocation — the caller has to be told to come back later
+    # instead. With DEEPSEEKER_REFUSE_WHEN_ALL_COOLING on (the default) the
+    # pool answers 429 with a Retry-After and the account rejoins rotation
+    # when its cooldown expires. With it off, the old soonest-to-recover
+    # fallback below returns.
+    if REFUSE_WHEN_ALL_COOLING:
+        return None
 
     # Every token is rate-limited and still cooling: pick the one that
     # recovers first (bounded wait) instead of stampeding onto the lowest id
@@ -1945,7 +2140,7 @@ def restore_token(token_id):
     conn = get_db()
     conn.execute(
         "UPDATE tokens SET status = ?, rate_limited_until = NULL, "
-        "consecutive_403 = 0, park_reason = NULL WHERE id = ?",
+        "consecutive_403 = 0, consecutive_429 = 0, park_reason = NULL WHERE id = ?",
         ("ACTIVE", token_id),
     )
     conn.commit()
@@ -1953,19 +2148,80 @@ def restore_token(token_id):
     logger.info("Token #%d restored to ACTIVE by operator", token_id)
 
 
+def _sqlite_has_returning():
+    """Does this SQLite understand UPDATE ... RETURNING? (3.35 and newer)"""
+    try:
+        probe = sqlite3.connect(":memory:")
+        try:
+            probe.execute("CREATE TABLE t (v INTEGER)")
+            probe.execute("INSERT INTO t (v) VALUES (0)")
+            row = probe.execute("UPDATE t SET v = v + 1 RETURNING v").fetchone()
+            return row is not None
+        finally:
+            probe.close()
+    except sqlite3.Error:
+        return False
+
+
+_SQLITE_HAS_RETURNING = _sqlite_has_returning()
+
+# The only counters _bump_streak() may touch. A whitelist, because the
+# column name is the one part of the statement that cannot be a parameter.
+_STREAK_COLUMNS = ("consecutive_403", "consecutive_429")
+
+
+def _bump_streak(token_id, column):
+    """Increment a consecutive-error counter and return THIS call's value.
+
+    The counter decides the cooldown rung and whether the account is parked
+    (429) or quarantined (403). Reading it back with a separate SELECT left
+    a window in which a concurrent caller's increment landed in between: both
+    callers then saw the same, higher number, so the account was escalated —
+    or parked, or quarantined — one step too early, and the ladder skipped a
+    rung. The increment and the read are therefore one atomic statement, and
+    the value returned is the one this call produced.
+    """
+    if column not in _STREAK_COLUMNS:
+        raise ValueError(f"unknown streak column: {column}")
+    conn = get_db()
+    try:
+        if _SQLITE_HAS_RETURNING:
+            row = conn.execute(
+                f"UPDATE tokens SET {column} = {column} + 1 "
+                f"WHERE id = ? RETURNING {column}",
+                (token_id,),
+            ).fetchone()
+            conn.commit()
+            return row[0] if row else 0
+        # SQLite older than 3.35 has no RETURNING: take the write lock
+        # explicitly so no other writer can interleave between the
+        # increment and the read.
+        conn.rollback()
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                f"UPDATE tokens SET {column} = {column} + 1 WHERE id = ?",
+                (token_id,),
+            )
+            row = conn.execute(
+                f"SELECT {column} FROM tokens WHERE id = ?", (token_id,)
+            ).fetchone()
+        finally:
+            conn.execute("COMMIT")
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
 def _bump_403_streak(token_id):
     """Increment and return this token's consecutive-403 counter."""
-    conn = get_db()
-    conn.execute(
-        "UPDATE tokens SET consecutive_403 = consecutive_403 + 1 WHERE id = ?",
-        (token_id,),
-    )
-    row = conn.execute(
-        "SELECT consecutive_403 FROM tokens WHERE id = ?", (token_id,)
-    ).fetchone()
-    conn.commit()
-    conn.close()
-    return row[0] if row else 0
+    return _bump_streak(token_id, "consecutive_403")
+
+
+def _bump_429_streak(token_id):
+    """Increment and return this token's consecutive-429 counter."""
+    return _bump_streak(token_id, "consecutive_429")
 
 
 def mark_limited(token_id, code=None, cooldown=None):
@@ -1991,6 +2247,39 @@ def mark_limited(token_id, code=None, cooldown=None):
                 f"{streak} consecutive upstream 403s (threshold {threshold})",
             )
             return
+    if code in (429, "429", 40029, "40029"):
+        # "Messages too frequent": the cooldown grows with the streak, so a
+        # refused account rests long enough to stop being refused instead of
+        # being handed straight back out after a flat 60 s (issue #105). An
+        # upstream-provided Retry-After wins when it is longer than the rung.
+        streak = _bump_429_streak(token_id)
+        rung = RATE_LIMIT_LADDER[
+            min(max(streak, 1), len(RATE_LIMIT_LADDER)) - 1
+        ]
+        secs = int(cooldown) if cooldown and cooldown > 0 else 0
+        secs = max(secs, rung)
+        secs = min(secs, 7 * 86400)
+        if RATE_LIMIT_PARK_AFTER and streak >= RATE_LIMIT_PARK_AFTER:
+            mark_parked(
+                token_id,
+                f"upstream rate limit x{streak} (429 streak)",
+                max(secs, 3600),
+            )
+            return
+        logger.warning(
+            "Token #%d marked RATE_LIMITED for %ds (429 streak %d, recovers automatically)",
+            token_id,
+            secs,
+            streak,
+        )
+        conn = get_db()
+        conn.execute(
+            "UPDATE tokens SET status = ?, rate_limited_until = ? WHERE id = ?",
+            ("RATE_LIMITED", time.time() + secs, token_id),
+        )
+        conn.commit()
+        conn.close()
+        return
     secs = int(cooldown) if cooldown and cooldown > 0 else TOKEN_COOLDOWN_SECONDS
     secs = min(secs, 7 * 86400)
     until = time.time() + secs
@@ -2019,7 +2308,8 @@ def mark_active(token_id):
     conn = get_db()
     conn.execute(
         "UPDATE tokens SET status = ?, rate_limited_until = NULL, last_used = ?, "
-        "consecutive_403 = 0 WHERE id = ? AND status NOT IN ('QUARANTINED', 'PARKED')",
+        "consecutive_403 = 0, consecutive_429 = 0 "
+        "WHERE id = ? AND status NOT IN ('QUARANTINED', 'PARKED')",
         ("ACTIVE", time.time(), token_id),
     )
     conn.commit()
@@ -2149,14 +2439,15 @@ def get_pool_view():
     now = time.time()
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, alias, status, rate_limited_until, last_used, consecutive_403, park_reason "
-        "FROM tokens ORDER BY id"
+        "SELECT id, alias, status, rate_limited_until, last_used, consecutive_403, "
+        "consecutive_429, park_reason FROM tokens ORDER BY id"
     ).fetchall()
     conn.close()
 
     view = []
-    for tid, alias, status, until, last_used, streak, park_reason in rows:
+    for tid, alias, status, until, last_used, streak, rate_streak, park_reason in rows:
         streak = streak or 0
+        rate_streak = rate_streak or 0
         is_captcha = status == "PARKED" and (
             "captcha" in str(park_reason or "").lower()
             or "challenge" in str(park_reason or "").lower()
@@ -2196,6 +2487,8 @@ def get_pool_view():
             note = "in rotation"
         if streak and status not in ("QUARANTINED", "PARKED"):
             note = f"{note}, 403 streak {streak}"
+        if rate_streak and status not in ("QUARANTINED", "PARKED"):
+            note = f"{note}, 429 streak {rate_streak}"
         age = "never" if not last_used else f"{_format_span(now - last_used)} ago"
         view.append(
             {
@@ -2207,6 +2500,13 @@ def get_pool_view():
                 "state_class": state_class,
                 "state_note": note,
                 "in_flight": _in_flight.get(tid, 0),
+                # Rate discipline (issue #105): how much of this account's
+                # per-minute budget is spent, and how long its 429 streak is.
+                # Without these numbers the pool view cannot show WHY an
+                # account is being refused.
+                "rate_used": rate_budget_state(tid)["used"],
+                "rate_limit": TOKEN_MAX_MSGS_PER_MIN,
+                "rate_streak": rate_streak,
                 "last_used": age,
                 "cooldown": cooldown,
                 "can_restore": status in ("QUARANTINED", "PARKED"),
