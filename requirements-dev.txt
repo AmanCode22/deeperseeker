@@ -59,7 +59,7 @@ multidict==6.9.1
     # via
     #   aiohttp
     #   yarl
-opentelemetry-api==1.45.1
+opentelemetry-api==1.45.2
     # via fastapi
 packaging==26.3
     # via
@@ -68,6 +68,8 @@ packaging==26.3
     #   wheel
 patchright==1.64.4
     # via -r requirements.in
+pip==26.3
+    # via pip-tools
 pip-tools==7.6.2
     # via -r requirements-dev.in
 pluggy==1.6.0
@@ -100,6 +102,8 @@ python-multipart==0.0.33
     # via -r requirements.in
 ruff==0.17.4
     # via -r requirements-dev.in
+setuptools==84.2.1
+    # via pip-tools
 starlette==1.7.0
     # via fastapi
 typing-extensions==4.16.0
