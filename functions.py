@@ -2887,6 +2887,58 @@ def _is_wrapper_name(name, args):
     return not args and name.lower() in _DSML_WRAPPER_NAMES and name not in _tool_schemas()
 
 
+def _extract_json_tool_candidates(data, allow_bare=False):
+    items = []
+    if not isinstance(data, dict):
+        return items
+    if "tool_calls" in data and isinstance(data["tool_calls"], list):
+        for entry in data["tool_calls"]:
+            if isinstance(entry, dict):
+                fn = entry.get("function") if isinstance(entry.get("function"), dict) else entry
+                name = fn.get("name") or entry.get("name")
+                args = fn.get("arguments") or fn.get("parameters") or entry.get("arguments") or {}
+                norm = normalize_tool_call(name, args)
+                if norm:
+                    items.append(norm)
+        return items
+    if "tool_call" in data and isinstance(data["tool_call"], dict):
+        entry = data["tool_call"]
+        fn = entry.get("function") if isinstance(entry.get("function"), dict) else entry
+        name = fn.get("name") or entry.get("name")
+        args = fn.get("arguments") or fn.get("parameters") or entry.get("arguments") or {}
+        norm = normalize_tool_call(name, args)
+        if norm:
+            return [norm]
+    if "function_call" in data and isinstance(data["function_call"], dict):
+        entry = data["function_call"]
+        name = entry.get("name")
+        args = entry.get("arguments") or entry.get("parameters") or {}
+        norm = normalize_tool_call(name, args)
+        if norm:
+            return [norm]
+    if allow_bare:
+        name = (
+            data.get("name")
+            or data.get("tool")
+            or data.get("tool_name")
+            or data.get("function")
+            or data.get("action")
+        )
+        args = (
+            data.get("arguments")
+            or data.get("parameters")
+            or data.get("input")
+            or data.get("args")
+            or data.get("params")
+            or {}
+        )
+        if name and isinstance(name, str):
+            norm = normalize_tool_call(name, args)
+            if norm:
+                return [norm]
+    return items
+
+
 def parse_tools(text):
     tools = []
     clean_text = text
@@ -3174,35 +3226,47 @@ def parse_tools(text):
             ).strip()
 
     if not tools:
-        codeblock_pattern = r"```(?:tool_call|function_call)\s*(.*?)\s*```"
-        cb_matches = list(re.finditer(codeblock_pattern, clean_text, flags=re.DOTALL))
+        codeblock_pattern = r"```(?:tool_call|function_call|json)?\s*(.*?)\s*```"
+        cb_matches = list(
+            re.finditer(codeblock_pattern, clean_text, flags=re.DOTALL | re.IGNORECASE)
+        )
         for m in cb_matches:
             cleaned = clean_json_str(m.group(1))
+            allow_bare = bool(re.search(r"```(?:tool_call|function_call)\b", m.group(0), re.IGNORECASE))
             try:
                 data = json.loads(cleaned)
-                if isinstance(data, dict):
-                    name = (
-                        data.get("name")
-                        or data.get("tool")
-                        or data.get("function")
-                        or data.get("action")
-                    )
-                    args = (
-                        data.get("arguments")
-                        or data.get("parameters")
-                        or data.get("input")
-                        or data.get("args")
-                        or {}
-                    )
-                    norm = normalize_tool_call(name, args)
-                    if norm:
-                        tools.append(norm)
+                extracted = _extract_json_tool_candidates(data, allow_bare=allow_bare)
+                if extracted:
+                    tools.extend(extracted)
+                    clean_text = clean_text.replace(m.group(0), "")
             except Exception:
                 pass
-        if tools:
-            clean_text = re.sub(
-                codeblock_pattern, "", clean_text, flags=re.DOTALL
-            ).strip()
+        clean_text = clean_text.strip()
+
+    if not tools:
+        decoder = json.JSONDecoder()
+        pos = 0
+        while pos < len(clean_text):
+            idx_obj = clean_text.find("{", pos)
+            idx_arr = clean_text.find("[", pos)
+            candidates = [i for i in (idx_obj, idx_arr) if i != -1]
+            if not candidates:
+                break
+            start_pos = min(candidates)
+            try:
+                data, consumed = decoder.raw_decode(clean_text[start_pos:])
+                extracted = _extract_json_tool_candidates(data)
+                if extracted:
+                    tools.extend(extracted)
+                    clean_text = (
+                        clean_text[:start_pos] + clean_text[start_pos + consumed :]
+                    )
+                    pos = start_pos
+                    continue
+                pos = start_pos + 1
+            except Exception:
+                pos = start_pos + 1
+        clean_text = clean_text.strip()
 
     # Keep companion text: the tool-call blocks themselves were already removed
     # from clean_text above; only leftover bare tags are stripped here.
@@ -3228,8 +3292,9 @@ _TOOL_END_TAG_RE = re.compile(
 # Also enters on "</…invoke name=…>": the model opens an invoke with a closing
 # tag. Only with name=, so a real "</invoke>" closer never opens a block.
 _STREAM_ENTRY_RE = re.compile(
-    r"<(?:/(?=[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*invoke\s+name\s*=))?"
-    r"[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>",
+    r"(?:<(?:/(?=[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*invoke\s+name\s*=))?"
+    r"[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*(tool_calls?|calls|function_calls?|invoke)\b[^>]*>"
+    r"|```(?:json|tool_call|function_call)\b)",
     re.IGNORECASE,
 )
 
@@ -3377,36 +3442,38 @@ class StreamToolParser:
         self.has_tool = False
         self.json_done = False
         self._end_re = None
+        self._is_codeblock = False
+        self._codeblock_search_start = 0
 
     def feed(self, chunk):
         self.buffer += chunk
         results = []
         while True:
             if self.in_tool:
-                # [FIX 3] Family-wide closer fallback: accept ANY wrapper closer
-                # the tool-call family can emit (including |/｜-decorated
-                # variants parse_tools tolerates) instead of hanging an open
-                # block until flush() when the model closes with a wrong tag.
-                # [FIX 4] Prefer the closer for the tag that OPENED the block
-                # so nested wrappers (<｜｜DSML｜｜ calls> wrapping invokes)
-                # close as one unit; fall back to the family-wide closer for
-                # mismatched or decorated closers [FIX 3].
-                end_match = self._end_re.search(self.buffer) if self._end_re else None
-                if end_match is None:
-                    end_match = _TOOL_END_TAG_RE.search(self.buffer)
+                if self._is_codeblock:
+                    end_match = self._end_re.search(self.buffer, self._codeblock_search_start) if self._end_re else None
+                else:
+                    end_match = self._end_re.search(self.buffer) if self._end_re else None
+                    if end_match is None:
+                        end_match = _TOOL_END_TAG_RE.search(self.buffer)
                 if end_match:
                     if not self.json_done:
                         tool_xml = self.buffer[: end_match.end()]
                         parsed, _ = parse_tools(tool_xml)
-                        for item in parsed:
-                            results.append({"tool": item})
+                        if parsed:
+                            for item in parsed:
+                                results.append({"tool": item})
+                        else:
+                            _append_clean_text(results, tool_xml)
                     self.buffer = self.buffer[end_match.end() :]
                     self.in_tool = False
                     self.json_done = False
                     self._end_re = None
+                    self._is_codeblock = False
+                    self._codeblock_search_start = 0
                     continue
                 brace_idx = self.buffer.find("{")
-                if brace_idx != -1 and not self.json_done:
+                if brace_idx != -1 and not self.json_done and not self._is_codeblock:
                     decoder = json.JSONDecoder()
                     try:
                         data, consumed = decoder.raw_decode(self.buffer[brace_idx:])
@@ -3420,27 +3487,30 @@ class StreamToolParser:
                         pass
                 break
             else:
-                # [FIX 4] Regex entry detection replaces plain substring finds
-                # so decorated/spaced DSML openers enter tool mode.
                 m = _STREAM_ENTRY_RE.search(self.buffer)
                 if m:
                     start = m.start()
                     if start > 0:
                         _append_clean_text(results, self.buffer[:start])
                     self.buffer = self.buffer[start:]
-                    tag_name = m.group(1).lower()
-                    self._end_re = re.compile(
-                        r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*"
-                        + re.escape(tag_name)
-                        + r"[｜\|]{0,2}\s*>",
-                        re.IGNORECASE,
-                    )
+                    matched_str = m.group(0)
+                    if matched_str.startswith("```"):
+                        self._is_codeblock = True
+                        self._codeblock_search_start = len(matched_str)
+                        self._end_re = re.compile(r"```")
+                    else:
+                        self._is_codeblock = False
+                        self._codeblock_search_start = 0
+                        tag_name = (m.group(1) or "invoke").lower()
+                        self._end_re = re.compile(
+                            r"</[｜\|]{0,2}(?:DSML[｜\|]{0,2})?\s*"
+                            + re.escape(tag_name)
+                            + r"[｜\|]{0,2}\s*>",
+                            re.IGNORECASE,
+                        )
                     self.in_tool = True
                     self.has_tool = True
                     continue
-                # [FIX 2] Hold an unclosed '<' tail only while it remains a
-                # plausible partial match of _STREAM_ENTRY_RE or of a wrapper
-                # closer ("</..."), so a split closer is never dumped as prose.
                 last_lt = self.buffer.rfind("<")
                 tail = self.buffer[last_lt:] if last_lt != -1 else ""
                 hold = ">" not in tail and (
@@ -3448,6 +3518,13 @@ class StreamToolParser:
                     or _is_plausible_stream_closer_prefix(tail)
                     or "\uff5c" in tail
                 )
+                last_tick = self.buffer.rfind("`")
+                if last_tick != -1 and not hold:
+                    tick_tail = self.buffer[last_tick:]
+                    if len(tick_tail) < 7 and "```" in tick_tail:
+                        hold = True
+                        last_lt = last_tick
+                        tail = tick_tail
                 if last_lt != -1 and hold:
                     if last_lt > 0:
                         _append_clean_text(results, self.buffer[:last_lt])
@@ -3464,10 +3541,6 @@ class StreamToolParser:
         if self.buffer and not self.in_tool:
             _append_clean_text(out, self.buffer)
         elif self.in_tool:
-            # [FIX 1] Recover the tool before stripping: if the stream was cut
-            # off before the closing tag arrived but the payload itself is
-            # parseable, emit the tool call instead of dumping raw parameter
-            # values into the chat text. Strip only when nothing parses.
             parsed, _ = parse_tools(self.buffer)
             if parsed:
                 for item in parsed:
@@ -3476,13 +3549,12 @@ class StreamToolParser:
                 stripped = _strip_wrapper_tags(self.buffer).strip()
                 if stripped:
                     out.append({"text": stripped})
-            # With json_done set, whatever is left after the consumed JSON
-            # payload is wrapper noise (partial closers / whitespace) and is
-            # dropped instead of leaking into the chat text.
         self.buffer = ""
         self.in_tool = False
         self.json_done = False
         self._end_re = None
+        self._is_codeblock = False
+        self._codeblock_search_start = 0
         return out
 
 

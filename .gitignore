@@ -10,3 +10,6 @@ deeperseeker.db-shm
 .python-version
 .pytest_cache/
 .ruff_cache
+mask.json
+server.log
+static/fonts/

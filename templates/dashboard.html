@@ -1,45 +1,73 @@
 {% extends "base.html" %}
 {% block title %}Dashboard - DeeperSeeker{% endblock %}
 {% block content %}
-<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-    <h1 style="margin-bottom: 0;">Dashboard</h1>
-    <div id="live-indicator" style="font-size: 0.85em; color: #3fb950; display: inline-flex; align-items: center; gap: 6px; user-select: none;">
-        <span id="live-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#3fb950; box-shadow:0 0 6px #3fb950;"></span>
-        <span id="live-text">Live (0.5s)</span>
-    </div>
-</div>
+<h1 style="margin-bottom: 16px;">Dashboard</h1>
 
 <section>
     <h2>Add Auth Token</h2>
     <div class="steps">
         <p><strong>Steps:</strong></p>
         <ol>
-            <li>Open <strong>incognito/private</strong> window</li>
-            <li>Go to <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a> and login</li>
-            <li>Open DevTools (F12) → Console → paste:</li>
+            <li>Open an <strong>incognito / private</strong> browser window</li>
+            <li>Go to <a href="https://chat.deepseek.com" target="_blank" rel="noopener noreferrer">chat.deepseek.com</a> and log in</li>
+            <li>Open DevTools (<code>F12</code>) &rarr; <strong>Console</strong>, copy and run the command below:</li>
         </ol>
-        <code>JSON.parse(localStorage.getItem("userToken")).value</code>
+        <div style="position: relative; margin: 8px 0;">
+            <pre style="background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px 85px 10px 10px; font-family: monospace; font-size: 0.85em; overflow-x: auto; white-space: pre-wrap; word-break: break-all; margin: 0;"><code id="export-cmd">(()=>{try{let s=(window.SMSdk&amp;&amp;typeof window.SMSdk.getDeviceId==='function')?window.SMSdk.getDeviceId():null;let did=localStorage.getItem('deepseek-device-id:chat');let d=JSON.stringify({shumei:s,deviceId:did,cookies:document.cookie,localStorage:{...localStorage},sessionStorage:{...sessionStorage}});copy(d);console.log(d);console.log('✅ Copied to clipboard!')}catch(e){console.error('Failed to export:',e)}})()</code></pre>
+            <button type="button" id="copy-cmd-btn" style="position: absolute; top: 8px; right: 8px; padding: 4px 10px; font-size: 0.8em; cursor: pointer; border-radius: 4px; border: 1px solid #30363d; background: #21262d; color: #c9d1d9;">Copy</button>
+        </div>
         <ol start="4">
-            <li>Copy the token and paste below</li>
-            <li><strong>Remove any surrounding quotes</strong> — paste only the raw token string</li>
-            <li><strong>Close the incognito window</strong> to preserve the login</li>
+            <li>It will automatically copy your session data to the clipboard &mdash; paste it in the field below</li>
+            <li><strong>Close the incognito window</strong> to preserve the login (<strong>do NOT click Logout</strong>, just close the window)</li>
         </ol>
+        <div style="margin-top: 10px; padding: 8px 12px; background: #161b22; border: 1px solid #30363d; border-left: 3px solid #2ea043; border-radius: 4px; font-size: 0.85em; color: #8b949e;">
+            <strong>Tip:</strong> Drag this to your bookmarks bar &rarr; <a href="javascript:(function(){try{let s=(window.SMSdk&amp;&amp;typeof window.SMSdk.getDeviceId==='function')?window.SMSdk.getDeviceId():null;let did=localStorage.getItem('deepseek-device-id:chat');let d=JSON.stringify({shumei:s,deviceId:did,cookies:document.cookie,localStorage:{...localStorage},sessionStorage:{...sessionStorage}});if(navigator.clipboard&amp;&amp;navigator.clipboard.writeText){navigator.clipboard.writeText(d).then(()=&gt;alert('&#x2705; Copied to clipboard!')).catch(()=&gt;prompt('Copy credentials:',d));}else{prompt('Copy credentials:',d);}}catch(e){alert('Export failed: '+e);}})();" style="display:inline-block; padding:2px 8px; background:#238636; color:#fff; text-decoration:none; border-radius:4px; font-weight:600; font-size:0.9em; margin-left: 4px;">&#x1F4CC; DeepSeek Exporter</a> to copy session data in 1 click directly from chat.deepseek.com.
+        </div>
     </div>
     <div class="warning">
-        If you logout from DeepSeek in browser, this token stops working.
+        Do not click Logout in DeepSeek, or the token and session will be invalidated immediately.
     </div>
     <form method="post" action="/tokens/add" id="add-token-form">
         <input type="text" name="alias" placeholder="Alias (optional, e.g. personal, work)" style="width:200px">
-        <input type="text" name="auth_token" id="auth-token-input" placeholder="Paste auth token here (quotes & value: trimmed automatically)" style="width:400px">
+        <input type="text" name="auth_token" id="auth-token-input" placeholder="Paste session dump or auth token here" style="width:400px">
         <button type="submit">Add Token</button>
     </form>
     <script>
     (function() {
+        const copyBtn = document.getElementById('copy-cmd-btn');
+        if (copyBtn) {
+            copyBtn.addEventListener('click', function() {
+                const cmdEl = document.getElementById('export-cmd');
+                const text = cmdEl ? cmdEl.textContent.trim() : '';
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text).then(function() {
+                        copyBtn.textContent = 'Copied! ✅';
+                        setTimeout(function() { copyBtn.textContent = 'Copy'; }, 2000);
+                    }).catch(function() {
+                        fallbackCopy(text);
+                    });
+                } else {
+                    fallbackCopy(text);
+                }
+                function fallbackCopy(val) {
+                    const ta = document.createElement('textarea');
+                    ta.value = val;
+                    document.body.appendChild(ta);
+                    ta.select();
+                    try { document.execCommand('copy'); copyBtn.textContent = 'Copied! ✅'; } catch(e) {}
+                    document.body.removeChild(ta);
+                    setTimeout(function() { copyBtn.textContent = 'Copy'; }, 2000);
+                }
+            });
+        }
         const inp = document.getElementById('auth-token-input');
         if (!inp) return;
         function clean(v) {
             if (!v) return v;
             let s = v.trim();
+            if ((s.startsWith('{') && s.endsWith('}')) || (s.startsWith('[') && s.endsWith(']')) || s.startsWith('curl ') || s.includes('-H ')) {
+                return s;
+            }
             if (s.startsWith('{') && s.includes('value')) {
                 try {
                     const p = JSON.parse(s);
@@ -88,7 +116,13 @@
                     <span class="status {{ tok['state_class'] }}">{{ tok['status_label'] }}{% if tok['warming'] %}<span class="steam" aria-hidden="true"><i></i><i></i><i></i></span>{% endif %}</span>
                     <div class="state-note">{{ tok['state_note'] }}</div>
                 </td>
-                <td>{{ tok['in_flight'] }}</td>
+                <td>
+                    {% if tok['in_flight'] >= 2 %}
+                    <span class="in-flight-warn" style="color: #f85149; font-weight: bold;">&#9888;&#xFE0E; {{ tok['in_flight'] }}</span>
+                    {% else %}
+                    {{ tok['in_flight'] }}
+                    {% endif %}
+                </td>
                 <td>{{ tok['last_used'] }}</td>
                 <td>{{ tok['cooldown'] }}</td>
                 <td>
@@ -189,9 +223,6 @@
     document.addEventListener('mouseup', function() { isMouseDown = false; });
     document.addEventListener('submit', function() { isSubmitting = true; });
 
-    const dot = document.getElementById('live-dot');
-    const text = document.getElementById('live-text');
-
     async function updateDashboard() {
         if (document.hidden || isMouseDown || isSubmitting) return;
 
@@ -214,11 +245,6 @@
             }
 
             if (!res.ok) {
-                if (dot) {
-                    dot.style.background = '#da3633';
-                    dot.style.boxShadow = 'none';
-                }
-                if (text) text.textContent = 'Offline';
                 return;
             }
 
@@ -235,18 +261,7 @@
             if (newUsage && curUsage && curUsage.innerHTML !== newUsage.innerHTML) {
                 curUsage.innerHTML = newUsage.innerHTML;
             }
-
-            if (dot) {
-                dot.style.background = '#3fb950';
-                dot.style.boxShadow = '0 0 6px #3fb950';
-            }
-            if (text) text.textContent = 'Live (0.5s)';
         } catch (e) {
-            if (dot) {
-                dot.style.background = '#da3633';
-                dot.style.boxShadow = 'none';
-            }
-            if (text) text.textContent = 'Reconnecting...';
         }
     }
 

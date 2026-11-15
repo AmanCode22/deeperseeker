@@ -137,18 +137,31 @@ from middleware import (
 )
 from plugin_helper import (
     MAX_SUMMARY_TOKENS,
+    apply_text_masking,
     build_prompt,
     build_summary_request_prompt,
     context_window_tokens,
     extract_and_upload_files,
     generate_signature,
     generate_signature_sync,
+    get_masking_config,
     max_output_tokens,
     needs_rollover,
+    reset_masking_config,
     strip_summary_tags,
+    update_masking_config,
 )
 
 logger = logging.getLogger("uvicorn.error")
+
+
+class _DashboardFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        return not ("GET /dashboard" in msg and "200" in msg)
+
+
+logging.getLogger("uvicorn.access").addFilter(_DashboardFilter())
 
 # Surface deeperseeker.* logs (cookie generation, prunes, rate-limit events,
 # upstream failures) alongside uvicorn's own output, unless already configured.
@@ -4594,6 +4607,38 @@ async def dashboard(request: Request):
         "dashboard.html",
         {"tokens": tokens, "usage_rows": usage_rows},
     )
+
+
+@app.get("/api/masking/config")
+async def api_get_masking_config(request: Request):
+    return JSONResponse(get_masking_config())
+
+
+@app.post("/api/masking/config")
+async def api_update_masking_config(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    updated = update_masking_config(data)
+    return JSONResponse({"status": "ok", "config": updated})
+
+
+@app.post("/api/masking/reset")
+async def api_reset_masking_config(request: Request):
+    cfg = reset_masking_config()
+    return JSONResponse({"status": "ok", "config": cfg})
+
+
+@app.post("/api/masking/preview")
+async def api_preview_masking_text(request: Request):
+    try:
+        data = await request.json()
+        txt = data.get("text", "")
+    except Exception:
+        txt = ""
+    res = apply_text_masking(txt)
+    return JSONResponse({"result": res})
 
 
 def clean_auth_token(raw: str) -> str:
