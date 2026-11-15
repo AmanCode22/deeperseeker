@@ -20,12 +20,17 @@ build==1.6.1
     # via pip-tools
 certifi==2026.10.19
     # via
+    #   curl-cffi
     #   httpcore
     #   httpx
+cffi==2.1.1
+    # via curl-cffi
 click==8.5.0
     # via
     #   pip-tools
     #   uvicorn
+curl-cffi==0.17.0
+    # via -r requirements.in
 deepseek-tokenizer==0.3.0
     # via -r requirements.in
 fastapi==0.162.0
@@ -78,6 +83,8 @@ propcache==0.5.4
     # via
     #   aiohttp
     #   yarl
+pycparser==3.12
+    # via cffi
 pydantic==2.13.5
     # via fastapi
 pydantic-core==2.46.5

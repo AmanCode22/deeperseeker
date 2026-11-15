@@ -195,13 +195,38 @@ Copy `.env.example` to `.env` and edit your secret values. The table below is th
 | `DEEPSEEKER_MAX_SUMMARY_TOKENS` | Budget for the model-generated handoff summary | `4096` |
 | `DEEPSEEKER_PER_TOOL_RESULT_TOKENS` | Per-result tool-output cap (so one giant output can't eat the budget) | `2000` |
 | `DEEPSEEKER_RATE_LIMIT_COOLDOWN` | Seconds a rate-limited token cools before it rejoins the pool automatically | `60` |
-| `DEEPSEEKER_TOKEN_CONCURRENCY` | Soft per-token in-flight cap; at-cap tokens are used only when nothing else is free | `8` |
 | `DEEPSEEKER_QUARANTINE_AFTER_403` | Consecutive 403s that take a token out of rotation until you restore it (`0` disables escalation) | `3` |
+| `DEEPSEEKER_DEDUPLICATE_DEVICE_IDS` | Enforce unique device ID across tokens (regenerates a new UUID if any two tokens share the same device_id) | `true` |
 | `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` | Retries of one turn across the pool before the upstream error is surfaced to the client | `3` |
 | `DEEPSEEKER_MAX_USER_MESSAGE_TOKENS` | Hard cap for the latest user message inside a prompt; above it the message is tail-truncated with a marker instead of failing upstream | `900000` |
 | `DEEPSEEKER_PROMPT_OVERHEAD_TOKENS` | Flat overhead added to the rollover estimate for tool schemas, system expansion and summaries the raw history does not show | `4096` |
-| `DEEPSEEKER_FAST_START` | Shared Shumei ID on startup across accounts (fast boot) | `false` |
+| `DEEPSEEKER_MAX_SIG_LOCKS` | Cap in-memory per-signature creation locks (memory-leak guard) | `4096` |
+| `DEEPSEEKER_MAX_SESSIONS` | Cap stored session signatures + prune frequency (DB-growth guard) | `20000` |
+| `DEEPSEEKER_PRUNE_EVERY` | Frequency of session signature pruning | `500` |
+| `TRUSTED_PROXIES` | Comma-separated CIDR ranges of reverse proxies allowed to set `X-Forwarded-For` | unset |
+| `DEEPSEEKER_UPSTREAM_BASE` | Primary upstream endpoint (override only for testing/proxying) | `https://chat.deepseek.com` |
+| `DEEPSEEKER_UPSTREAM_FALLBACK` | Optional fallback upstream endpoint replayed on connect error/timeout/HTTP 5xx | unset |
+| `DEEPSEEKER_MAX_CHAT_LOCKS` | Cap in-memory per-chat locks (session-collision guard, memory-leak guard) | `4096` |
+| `DEEPSEEKER_CLIENT_VERSION` | DeepSeek web client version sent as `x-client-version` | `2.8.0` |
+| `DEEPSEEKER_BROWSER_USER_AGENT` | Custom browser User-Agent for PC profile | `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36` |
+| `DEEPSEEKER_BROWSER_PLATFORM` | Browser platform for PC profile (`Windows`, `Linux`, `macOS`) | `Windows` |
+| `DEEPSEEKER_CALL_GAP_SECONDS` | Randomized quiet window call gap after each turn in seconds | `4.0` |
+| `DEEPSEEKER_COOKIE_PATH` | Where the WAF cookie file is stored | `/app/data/aws_cookies_deepseek.json` |
+| `DEEPSEEKER_WAF_COOKIE` | Optional manual WAF cookie string or JSON | unset |
+| `DEEPSEEKER_COOKIE_HEADLESS` | Playwright headless mode | `true` |
+| `DEEPSEEKER_COOKIE_ATTEMPTS` | Cookie regeneration attempts per cycle | `2` |
+| `DEEPSEEKER_COOKIE_TIMEOUT` | Cookie regeneration per-cycle timeout in seconds | `120` |
+| `DEEPSEEKER_COOKIE_COOLDOWN` | Cookie regeneration fail-fast cooldown in seconds | `20` |
+| `DEEPSEEKER_TOOLS_SCHEMA_AS_IS` | Raw JSON schema tools format | `false` |
+| `DEEPSEEKER_MIRROR_SYSTEM` | Mirror all system prompt messages into `[SYSTEM]` on continuation turns | `false` |
+| `DEEPSEEKER_HIF_URL` | URL for fetching `x-hif-leim` token | `https://hif-leim.deepseek.com/query` |
+| `DEEPSEEKER_HIF_DLIQ_URL` | URL for fetching `x-hif-dliq` token | `https://hif-dliq.deepseek.com/query` |
+| `DEEPSEEKER_HIF_ENABLED` | Whether HIF token fetching is enabled | `true` |
+| `DEEPSEEKER_AUTO_MODE_MOCK` | Intercept security monitor prompts from Claude Code auto mode and mock severity | `false` |
+| `DEEPSEEKER_AUTO_MODE_SEVERITY` | Optional fixed severity (0-9) instead of random | unset |
+| `DEEPSEEKER_AUTO_MODE_RESPONSE` | Optional fixed custom response string | unset |
 | `DEEPSEEKER_WARMUP_NON_HEADLESS` | Run browser in non-headless (visible) mode during startup warmup / cookie generation for maximum stealth | `false` |
+| `DEEPSEEKER_PERSIST_SESSIONS` | Persist sessions/session_map to SQLite (`false` keeps in RAM until restart) | `true` |
 | `DEEPSEEKER_MODE` | `bridge` (reverse-engineered web session) or `official` (official API passthrough). Explicit only — nothing falls back on its own | `bridge` |
 | `DEEPSEEKER_OFFICIAL_API_KEY` | Official API key used when mode is `official` (from platform.deepseek.com). Required in official mode | unset |
 | `DEEPSEEKER_OFFICIAL_BASE` | Official API base URL override in official mode | `https://api.deepseek.com` |

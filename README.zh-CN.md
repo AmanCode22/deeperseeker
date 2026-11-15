@@ -163,13 +163,38 @@ python3 app.py
 | `DEEPSEEKER_MAX_SUMMARY_TOKENS` | 模型生成的交接摘要预算 | `4096` |
 | `DEEPSEEKER_PER_TOOL_RESULT_TOKENS` | 单条工具输出的上限（防止一条巨型输出吃光预算） | `2000` |
 | `DEEPSEEKER_RATE_LIMIT_COOLDOWN` | 被限流的 token 冷却多少秒后自动回到轮换池 | `60` |
-| `DEEPSEEKER_TOKEN_CONCURRENCY` | 单 token 软并发上限；满载的 token 只在无其他空闲时使用 | `8` |
 | `DEEPSEEKER_QUARANTINE_AFTER_403` | 连续多少次 403 会把 token 移出轮换，直到手动恢复（`0` 关闭升级） | `3` |
+| `DEEPSEEKER_DEDUPLICATE_DEVICE_IDS` | 强制 token 间 device_id 唯一（若发现重复则强制生成新 UUID） | `true` |
 | `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` | 一轮对话在池内的重试次数，用尽后才把上游错误返回给客户端 | `3` |
 | `DEEPSEEKER_MAX_USER_MESSAGE_TOKENS` | 提示内最新一条用户消息的硬上限；超过后按尾部截断并加标记，而不是让上游失败 | `900000` |
 | `DEEPSEEKER_PROMPT_OVERHEAD_TOKENS` | 滚动估算时加上的固定开销，覆盖工具模式、系统扩写与原始历史中看不到的摘要 | `4096` |
-| `DEEPSEEKER_FAST_START` | 启动时跨账号共享数美设备 ID（快速启动） | `false` |
+| `DEEPSEEKER_MAX_SIG_LOCKS` | 内存中会话签名锁上限（防内存泄漏） | `4096` |
+| `DEEPSEEKER_MAX_SESSIONS` | 存储会话签名上限及清理频率（防数据库膨胀） | `20000` |
+| `DEEPSEEKER_PRUNE_EVERY` | 会话签名清理频率 | `500` |
+| `TRUSTED_PROXIES` | 允许设置 `X-Forwarded-For` 的反向代理 CIDR 范围（逗号分隔） | 未设置 |
+| `DEEPSEEKER_UPSTREAM_BASE` | 主上游端点（仅在测试/代理时覆盖） | `https://chat.deepseek.com` |
+| `DEEPSEEKER_UPSTREAM_FALLBACK` | 备选上游端点（主上游连接错误/超时/HTTP 5xx 时重试） | 未设置 |
+| `DEEPSEEKER_MAX_CHAT_LOCKS` | 内存中每会话锁上限（防会话冲突和内存泄漏） | `4096` |
+| `DEEPSEEKER_CLIENT_VERSION` | 作为 `x-client-version` 发送的网页客户端版本 | `2.8.0` |
+| `DEEPSEEKER_BROWSER_USER_AGENT` | PC 端自定义浏览器 User-Agent | `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36` |
+| `DEEPSEEKER_BROWSER_PLATFORM` | PC 端浏览器平台（`Windows`、`Linux`、`macOS`） | `Windows` |
+| `DEEPSEEKER_CALL_GAP_SECONDS` | 每轮对话后的随机静默间隔秒数 | `4.0` |
+| `DEEPSEEKER_COOKIE_PATH` | WAF cookie 文件存储路径 | `/app/data/aws_cookies_deepseek.json` |
+| `DEEPSEEKER_WAF_COOKIE` | 可选的手动 WAF cookie 字符串或 JSON | 未设置 |
+| `DEEPSEEKER_COOKIE_HEADLESS` | Playwright 无头模式 | `true` |
+| `DEEPSEEKER_COOKIE_ATTEMPTS` | 每次 cookie 重新生成尝试次数 | `2` |
+| `DEEPSEEKER_COOKIE_TIMEOUT` | cookie 生成超时秒数 | `120` |
+| `DEEPSEEKER_COOKIE_COOLDOWN` | cookie 生成快速失败冷却秒数 | `20` |
+| `DEEPSEEKER_TOOLS_SCHEMA_AS_IS` | 原始 JSON schema 工具格式 | `false` |
+| `DEEPSEEKER_MIRROR_SYSTEM` | 在后续轮次中将系统提示镜像到 `[SYSTEM]` | `false` |
+| `DEEPSEEKER_HIF_URL` | 获取 `x-hif-leim` token 的 URL | `https://hif-leim.deepseek.com/query` |
+| `DEEPSEEKER_HIF_DLIQ_URL` | 获取 `x-hif-dliq` token 的 URL | `https://hif-dliq.deepseek.com/query` |
+| `DEEPSEEKER_HIF_ENABLED` | 是否启用 HIF token 获取 | `true` |
+| `DEEPSEEKER_AUTO_MODE_MOCK` | 拦截 Claude Code auto 模式安全监控提示并模拟严重级别 | `false` |
+| `DEEPSEEKER_AUTO_MODE_SEVERITY` | 可选的固定严重级别（0-9） | 未设置 |
+| `DEEPSEEKER_AUTO_MODE_RESPONSE` | 可选的固定自定义响应文本 | 未设置 |
 | `DEEPSEEKER_WARMUP_NON_HEADLESS` | 启动预热/采集时以有头（可见）模式运行浏览器，获得最强抗检测能力 | `false` |
+| `DEEPSEEKER_PERSIST_SESSIONS` | 是否持久化会话到 SQLite（`false` 则保存在内存直到重启） | `true` |
 | `DEEPSEEKER_MODE` | `bridge`（逆向网页会话）或 `official`（官方 API 直通）。必须显式设置——没有任何自动回退 | `bridge` |
 | `DEEPSEEKER_OFFICIAL_API_KEY` | `official` 模式使用的官方 API 密钥（来自 platform.deepseek.com）。官方模式下必填 | 未设置 |
 | `DEEPSEEKER_OFFICIAL_BASE` | 官方模式下官方 API 基址覆盖 | `https://api.deepseek.com` |

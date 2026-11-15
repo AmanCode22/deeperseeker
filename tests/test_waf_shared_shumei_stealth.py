@@ -50,7 +50,7 @@ def test_waf_shared_across_tokens_while_shumei_isolated(monkeypatch, tmp_path):
     assert da != db
 
 
-def test_warmup_always_refreshes_tokens_when_fast_start_disabled(monkeypatch, tmp_path):
+def test_warmup_refreshes_tokens_without_shumei(monkeypatch, tmp_path):
     db_path = str(tmp_path / "test_warmup_fast.db")
     monkeypatch.setattr(functions, "_db", db_path)
     functions.init_db()
@@ -59,14 +59,12 @@ def test_warmup_always_refreshes_tokens_when_fast_start_disabled(monkeypatch, tm
         functions.add_token(
             f"token-{i}",
             alias=f"tok-{i}",
-            shumei_id=f"Bshumei_{i}",
             device_id=f"dev-id-{i}",
         )
 
     monkeypatch.setattr(functions, "_read_cookie_file", lambda: {"aws-waf-token": "waf"})
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv("DEEPSEEKER_DISABLE_WARMUP", raising=False)
-    monkeypatch.delenv("DEEPSEEKER_FAST_START", raising=False)
 
     batch_mock = mock.AsyncMock()
     monkeypatch.setattr(functions, "_generate_shumei_ids_for_tokens", batch_mock)
@@ -78,7 +76,7 @@ def test_warmup_always_refreshes_tokens_when_fast_start_disabled(monkeypatch, tm
     assert len(called_tokens) == 5
 
 
-def test_warmup_batches_all_tokens_even_if_some_have_shumei(monkeypatch, tmp_path):
+def test_warmup_skips_tokens_with_existing_shumei(monkeypatch, tmp_path):
     db_path = str(tmp_path / "test_warmup_batch.db")
     monkeypatch.setattr(functions, "_db", db_path)
     functions.init_db()
@@ -90,7 +88,6 @@ def test_warmup_batches_all_tokens_even_if_some_have_shumei(monkeypatch, tmp_pat
     monkeypatch.setattr(functions, "_read_cookie_file", lambda: {"aws-waf-token": "waf"})
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv("DEEPSEEKER_DISABLE_WARMUP", raising=False)
-    monkeypatch.delenv("DEEPSEEKER_FAST_START", raising=False)
 
     batch_mock = mock.AsyncMock()
     monkeypatch.setattr(functions, "_generate_shumei_ids_for_tokens", batch_mock)
@@ -99,11 +96,11 @@ def test_warmup_batches_all_tokens_even_if_some_have_shumei(monkeypatch, tmp_pat
 
     batch_mock.assert_called_once()
     called_tokens = batch_mock.call_args[0][0]
-    assert len(called_tokens) == 3
+    assert len(called_tokens) == 2
     token_strs = [t[1] for t in called_tokens]
     assert "tok-needs-1" in token_strs
     assert "tok-needs-2" in token_strs
-    assert "tok-ready" in token_strs
+    assert "tok-ready" not in token_strs
 
 
 def test_stealth_evasion_configuration():
@@ -141,39 +138,6 @@ def test_auto_mode_mock_default_false(monkeypatch):
 
     monkeypatch.setenv("DEEPSEEKER_AUTO_MODE_MOCK", "true")
     assert app.is_auto_mode_mock_enabled() is True
-
-
-def test_fast_start_applies_shared_shumei_id(monkeypatch, tmp_path):
-    db_path = str(tmp_path / "test_fast_start.db")
-    monkeypatch.setattr(functions, "_db", db_path)
-    functions.init_db()
-
-    functions.add_token("tok-1", alias="one", shumei_id="Bold_1")
-    functions.add_token("tok-2", alias="two", shumei_id="Bold_2")
-
-    monkeypatch.setenv("DEEPSEEKER_FAST_START", "true")
-    monkeypatch.setattr(
-        functions,
-        "_generate_cookies",
-        mock.AsyncMock(return_value=({"aws-waf-token": "waf-fresh"}, 1799999999, "Bshared_shumei_fast")),
-    )
-    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    monkeypatch.delenv("DEEPSEEKER_DISABLE_WARMUP", raising=False)
-
-    batch_mock = mock.AsyncMock()
-    monkeypatch.setattr(functions, "_generate_shumei_ids_for_tokens", batch_mock)
-
-    asyncio.run(functions.warmup_all_tokens_cookies())
-
-    batch_mock.assert_not_called()
-
-    t1 = functions.get_token(1)
-    t2 = functions.get_token(2)
-    assert t1["shumei_id"] == "Bshared_shumei_fast"
-    assert t2["shumei_id"] == "Bshared_shumei_fast"
-    import json
-    c1 = json.loads(t1["cookies"])
-    assert c1["cookie"]["aws-waf-token"] == "waf-fresh"
 
 
 def test_warmup_headless_toggle(monkeypatch):

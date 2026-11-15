@@ -186,17 +186,22 @@ class RequestIDMiddleware:
             await self.app(scope, receive, send_wrapper)
         finally:
             duration_ms = (time.perf_counter() - started) * 1000.0
-            logger.info(
-                '%s "%s %s" %s %.1fms ip=%s',
-                request_id,
-                scope.get("method", "-"),
-                scope.get("path", "-"),
+            st = (
                 status_holder["status"]
                 if status_holder["status"] is not None
-                else "ERR",
-                duration_ms,
-                state.get("real_ip", "-"),
+                else "ERR"
             )
+            path = scope.get("path", "-")
+            if not (path == "/dashboard" and st == 200):
+                logger.info(
+                    '%s "%s %s" %s %.1fms ip=%s',
+                    request_id,
+                    scope.get("method", "-"),
+                    path,
+                    st,
+                    duration_ms,
+                    state.get("real_ip", "-"),
+                )
 
 
 # ==============================================================================

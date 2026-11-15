@@ -69,6 +69,7 @@ from functions import (
     mask_api_key,
     next_parent,
     park_token_for_captcha,
+    parse_session_payload,
     parse_tools,
     pick_token,
     probe_token,
@@ -85,9 +86,11 @@ from functions import (
     send_message,
     solve_captcha_interactive,
     token_busy,
+    token_in_flight,
     upload_file,
     usage_by_day_key,
     warmup_all_tokens_cookies,
+    warmup_single_token,
 )
 
 
@@ -398,7 +401,10 @@ async def limit_body_size(request: Request, call_next):
     cl = request.headers.get("content-length", "")
     if cl.isdigit() and int(cl) > 32 * 1024 * 1024:
         return JSONResponse({"error": "Request body too large"}, status_code=413)
-    return await call_next(request)
+    response = await call_next(request)
+    if request.url.path.startswith("/static/fonts/"):
+        response.headers["cache-control"] = "public, max-age=31536000, immutable"
+    return response
 
 
 # Stage 0.1 + 0.2 — core rails: fail-closed real-client-IP resolution behind
@@ -680,6 +686,7 @@ async def _record_upstream_limit(token_id, exc, code):
     retry_after = getattr(exc, "retry_after", None)
     if getattr(exc, "status", None) == 202:
         await _db(invalidate_token_cookies, token_id)
+        asyncio.create_task(warmup_single_token(token_id))
     if biz == 40303 or code == 40303 or "40303" in str(exc):
         captcha_dock_duration = retry_after or 1800
         await _db(
@@ -698,13 +705,13 @@ async def _record_upstream_limit(token_id, exc, code):
 def _api_error_response(e, is_anthropic=False):
     code = _upstream_http_code(e) or 502
     if isinstance(e, CookieGenerationError):
-        code = 503  # WAF cookies cannot be produced right now — upstream unreachable, not a client error
+        code = 500
     if code < 400 or code > 599:
         code = 502
     # P0-7: official-mode error bodies carry upstream text too — every
     # client-visible error body passes the secret scrub, one discipline.
     message = _redact_secret_material(str(e)[:500])
-    if getattr(e, "biz_code", None) == 40303 or "40303" in str(e):
+    if getattr(e, "biz_code", None) == 40303 or "40303" in str(e) or isinstance(e, CookieGenerationError):
         code = 500
         message = "Internal server error"
     if is_anthropic:
@@ -750,14 +757,14 @@ def _terminal_error_response(e, is_anthropic=False):
     """
     code = _upstream_http_code(e) or 502
     if isinstance(e, CookieGenerationError):
-        code = 503
+        code = 500
     if code < 400 or code > 599:
         code = 502
     trace = request_id_var.get()
     if trace == "-":
         trace = uuid.uuid4().hex  # direct invocation path (tests, scripts)
     message = _redact_secret_material(str(e)[:500])
-    if getattr(e, "biz_code", None) == 40303 or "40303" in str(e):
+    if getattr(e, "biz_code", None) == 40303 or "40303" in str(e) or isinstance(e, CookieGenerationError):
         code = 500
         message = "Internal server error"
     if is_anthropic:
@@ -1141,6 +1148,7 @@ async def handle_chat(
             {"error": "No auth token. Add via dashboard."}, status_code=401
         )
 
+    slot = None
     if are_all_tokens_busy():
         logger.info("Token pool: all tokens busy, request waiting for available slot")
 
@@ -1193,10 +1201,10 @@ async def handle_chat(
         # A conversation whose account is busy generating moves to an
         # idle account (fresh chat, full history) instead of queueing behind it.
         moved_off_busy = False
-        if tok and tok["status"] == "ACTIVE" and token_busy(tok["token"]):
+        if tok and tok["status"] == "ACTIVE" and (token_busy(tok["token"]) or token_in_flight(token_id) >= 1):
             cand = await _db(pick_token)
             cand_tok = await _db(get_token, cand) if cand and cand != token_id else None
-            moved_off_busy = bool(cand_tok) and not token_busy(cand_tok["token"])
+            moved_off_busy = bool(cand_tok) and not token_busy(cand_tok["token"]) and token_in_flight(cand) == 0
         if not tok or tok["status"] != "ACTIVE" or moved_off_busy:
             new_token_id = await _db(pick_token)
             if new_token_id and (not tok or new_token_id != token_id):
@@ -1431,6 +1439,8 @@ async def handle_chat(
                 },
                 status_code=429,
             )
+        else:
+            slot = acquire_token_slot(token_id)
     else:
         create_lock = _take_lock("sig", _sig_locks, sig, SIG_LOCKS_MAX)
         setup_retry = None
@@ -1472,6 +1482,7 @@ async def handle_chat(
                 if not tok:
                     return JSONResponse({"error": "Token not found"}, status_code=503)
 
+                slot = acquire_token_slot(token_id)
                 # Accumulated-context rollover (issue #22): when the conversation is
                 # nearing the observed remembered-context limit, first obtain a
                 # model-generated handoff summary via a scratch chat (the request
@@ -1513,6 +1524,9 @@ async def handle_chat(
                     await _db(save_session, sig, token_id, session_id, 0)
                     parent_message_id = 0
                 except Exception as e:
+                    if slot is not None:
+                        slot.release()
+                        slot = None
                     # Classify here, RETRY OUTSIDE the lock: the retry
                     # re-enters handle_chat, which takes this same
                     # non-reentrant asyncio.Lock — recursing in here hung
@@ -1542,6 +1556,7 @@ async def handle_chat(
                 token_id = sess["token_id"]
                 session_id = sess["session_id"]
                 parent_message_id = sess["parent_message_id"]
+                slot = acquire_token_slot(token_id)
 
         if setup_retry is not None:
             if isinstance(setup_retry, dict):
@@ -1550,6 +1565,9 @@ async def handle_chat(
 
     tok = await _db(get_token, token_id)
     if not tok:
+        if slot is not None:
+            slot.release()
+            slot = None
         return JSONResponse({"error": "Token expired"}, status_code=503)
     _set_key_name(tok.get("alias"))
 
@@ -1562,10 +1580,10 @@ async def handle_chat(
     # CURRENT chat's lock, and the stored session state is re-read once the
     # lock is held: a concurrent same-signature request may have already
     # rolled the chat over (or advanced its parent) while this frame waited.
-    lock_owner = await _own_chat_lock(session_id)
+    lock_owner = None
     lock_transferred = False
-    slot = None  # B3: in-flight token reservation for the send below
     try:
+        lock_owner = await _own_chat_lock(session_id)
         fresh = await _db(find_session, sig)
         if not fresh and prior_sig:
             fresh = await _db(find_session, prior_sig)
@@ -1574,12 +1592,16 @@ async def handle_chat(
                 # The chat moved under us (a concurrent request already rolled
                 # it over). Follow it and hold the NEW chat's lock instead.
                 lock_owner.release()
+                old_token_id = token_id
                 token_id = fresh["token_id"]
                 session_id = fresh["session_id"]
                 parent_message_id = fresh["parent_message_id"]
                 tok = await _db(get_token, token_id)
                 if not tok:
                     return JSONResponse({"error": "Token expired"}, status_code=503)
+                if token_id != old_token_id and slot is not None:
+                    slot.release()
+                    slot = acquire_token_slot(token_id)
                 _set_key_name(tok.get("alias"))
                 lock_owner = await _own_chat_lock(session_id)
                 # B1 residual (Stage 1 review, finding 3): the parent adopted
@@ -1639,7 +1661,8 @@ async def handle_chat(
         # both the freshly picked (create path) and the session-owned token.
         # Streams take the slot with them via _release_chat_lock_stream; every
         # other exit releases it in the finally below.
-        slot = acquire_token_slot(token_id)
+        if slot is None:
+            slot = acquire_token_slot(token_id)
 
         is_first = parent_message_id == 0
         # Stage 0.3: the lock is held across the whole send -> save critical
@@ -1828,6 +1851,9 @@ async def handle_chat(
                         new_token_id,
                     )
                     lock_owner.release()
+                    if slot is not None:
+                        slot.release()
+                        slot = None
                     return await handle_chat(
                         messages,
                         model,
@@ -1895,6 +1921,9 @@ async def handle_chat(
         # a no-op, the retry re-acquires cleanly, and queued same-chat requests
         # are no longer starved for the entire retry either.
         lock_owner.release()
+        if slot is not None:
+            slot.release()
+            slot = None
         # B10: jittered backoff, then retry on a DIFFERENT token — the old
         # single retry re-entered pick_token()'s random draw and could land on
         # the same poisoned token/session again (the #33 symptom persisting).
@@ -1919,7 +1948,8 @@ async def handle_chat(
         )
     finally:
         if not lock_transferred:
-            lock_owner.release()
+            if lock_owner is not None:
+                lock_owner.release()
             if slot is not None:
                 slot.release()
 
@@ -4669,11 +4699,21 @@ async def tokens_add(request: Request):
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     form = await request.form()
-    auth_token = clean_auth_token(form.get("auth_token", ""))
+    raw_input = form.get("auth_token", "")
+    payload = parse_session_payload(raw_input)
+    auth_token = payload.get("token")
     alias = form.get("alias", "").strip() or None
     if auth_token:
-        await _db(add_token, auth_token, alias)
-        asyncio.create_task(get_isolated_cookies_for_token(auth_token))
+        await _db(
+            add_token,
+            auth_token,
+            alias,
+            cookies=payload.get("cookies"),
+            shumei_id=payload.get("shumei_id"),
+            device_id=payload.get("device_id"),
+        )
+        if not payload.get("shumei_id") or not payload.get("cookies"):
+            asyncio.create_task(get_isolated_cookies_for_token(auth_token))
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 
@@ -4695,6 +4735,7 @@ async def tokens_restore(token_id: int, request: Request):
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     await _db(restore_token, token_id)
+    asyncio.create_task(warmup_single_token(token_id))
     return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
 
 

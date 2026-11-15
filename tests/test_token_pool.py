@@ -344,6 +344,7 @@ def test_pool_race_proof_ten_concurrent_requests(tmpdir=None):
 
     tmpdir = tmpdir or tempfile.mkdtemp()
     fns = _fresh_pool(tmpdir, ["a", "b", "c"])
+    fns.TOKEN_CONCURRENCY_CAP = 8
 
     # Token 2 is cooling for an hour: it must receive zero requests.
     fns.mark_limited(2)
@@ -453,6 +454,86 @@ def test_stale_success_cannot_lift_a_quarantine(tmpdir=None):
     assert fns.pick_token() == 1
 
 
+def test_parse_session_payload_full_export():
+    import json
+    raw = json.dumps({
+        "cookies": "smidV2=20261107; aws-waf-token=tok123; .thumbcache_abc=sh456",
+        "localStorage": {
+            "userToken": json.dumps({"value": "auth_token_xyz"}),
+            "deepseek-device-id:chat": "dev_xyz_123",
+            ".thumbcache_abc": "sh456",
+            "smidV2": "20261107",
+        },
+        "sessionStorage": {},
+    })
+    payload = functions.parse_session_payload(raw)
+    assert payload["token"] == "auth_token_xyz"
+    assert payload["device_id"] == "dev_xyz_123"
+    assert payload["shumei_id"] == "Bsh456"
+    assert payload["cookies"]["cookie"]["aws-waf-token"] == "tok123"
+    assert payload["cookies"]["cookie"]["smidV2"] == "20261107"
+
+
+def test_parse_session_payload_curl():
+    raw = (
+        "curl 'https://chat.deepseek.com/api/v0/chat/completion' \\\n"
+        "  -H 'authorization: Bearer curl_tok_777' \\\n"
+        "  -H 'cookie: ds_session_id=sess_999; smidV2=smid_888; .thumbcache_6b2e5483f9d858d7c661c5e276b6a6ae=thumb_val%3D%3D' \\\n"
+        "  -H 'x-device-id: dev_curl_uuid'\n"
+    )
+    payload = functions.parse_session_payload(raw)
+    assert payload["token"] == "curl_tok_777"
+    assert payload["device_id"] == "dev_curl_uuid"
+    assert payload["shumei_id"] == "Bthumb_val=="
+    assert payload["cookies"]["cookie"]["ds_session_id"] == "sess_999"
+    assert payload["cookies"]["cookie"]["smidV2"] == "smid_888"
+
+
+def test_parse_session_payload_raw_headers():
+    raw = (
+        "authorization: Bearer raw_tok_555\n"
+        "cookie: ds_session_id=sess_111; smidV2=smid_222; .thumbcache_6b2e5483f9d858d7c661c5e276b6a6ae=raw_thumb%3D%3D\n"
+        "x-device-id: dev_raw_uuid\n"
+    )
+    payload = functions.parse_session_payload(raw)
+    assert payload["token"] == "raw_tok_555"
+    assert payload["device_id"] == "dev_raw_uuid"
+    assert payload["shumei_id"] == "Braw_thumb=="
+    assert payload["cookies"]["cookie"]["ds_session_id"] == "sess_111"
+    assert payload["cookies"]["cookie"]["smidV2"] == "smid_222"
+
+
+def test_parse_session_payload_cookie_editor():
+    import json
+    raw = json.dumps([
+        {"name": "token", "value": "ce_tok_888"},
+        {"name": "smidV2", "value": "ce_smid_999"},
+        {"name": ".thumbcache_6b2e5483f9d858d7c661c5e276b6a6ae", "value": "ce_thumb%3D%3D"},
+        {"name": "x-device-id", "value": "ce_dev_uuid"}
+    ])
+    payload = functions.parse_session_payload(raw)
+    assert payload["token"] == "ce_tok_888"
+    assert payload["device_id"] == "ce_dev_uuid"
+    assert payload["shumei_id"] == "Bce_thumb=="
+    assert payload["cookies"]["cookie"]["smidV2"] == "ce_smid_999"
+
+
+def test_parse_session_payload_freedeepseek():
+    import json
+    raw = json.dumps({
+        "token": "fds_tok_111",
+        "cookie": "smidV2=fds_smid; aws-waf-token=waf_fds",
+        "hif_leim": "test_leim_val",
+        "hif_dliq": "test_dliq_val"
+    })
+    payload = functions.parse_session_payload(raw)
+    assert payload["token"] == "fds_tok_111"
+    assert payload["cookies"]["cookie"]["smidV2"] == "fds_smid"
+    assert payload["cookies"]["cookie"]["aws-waf-token"] == "waf_fds"
+    assert payload["cookies"]["hif_leim"] == "test_leim_val"
+    assert payload["cookies"]["hif_dliq"] == "test_dliq_val"
+
+
 TESTS = [
     test_cooldown_auto_recovery,
     test_mark_limited_sets_and_clears_cooldown,
@@ -465,6 +546,11 @@ TESTS = [
     test_quarantine_returns_only_by_manual_action,
     test_pool_race_proof_ten_concurrent_requests,
     test_stale_success_cannot_lift_a_quarantine,
+    test_parse_session_payload_full_export,
+    test_parse_session_payload_curl,
+    test_parse_session_payload_raw_headers,
+    test_parse_session_payload_cookie_editor,
+    test_parse_session_payload_freedeepseek,
 ]
 
 

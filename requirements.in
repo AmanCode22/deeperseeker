@@ -7,3 +7,4 @@ jinja2
 deepseek-tokenizer
 python-dotenv
 patchright
+curl_cffi
