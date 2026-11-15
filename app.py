@@ -1000,6 +1000,88 @@ async def _setup_failure_outcome(e, token_id, retry_kwargs):
     return retry_kwargs
 
 
+async def _offload_prompt_if_needed(
+    prompt,
+    is_first,
+    tools,
+    response_format,
+    token_id,
+    auth_token,
+    file_ids,
+    session_id=None,
+    parent_message_id=0,
+):
+    fast_char_limit = int(os.getenv("DEEPSEEKER_FAST_CHAR_LIMIT", "100000"))
+    if len(prompt) <= fast_char_limit:
+        return prompt, file_ids, parent_message_id
+
+    tokens = deepseek_tokenizer.ds_token.encode(prompt)
+    token_limit = int(os.getenv("DEEPSEEKER_TOKEN_LIMIT", "30000"))
+    if len(tokens) <= token_limit:
+        return prompt, file_ids, parent_message_id
+
+    token_chunks = [
+        tokens[i : i + token_limit] for i in range(0, len(tokens), token_limit)
+    ]
+    if not token_chunks:
+        return prompt, file_ids, parent_message_id
+
+    chunks = [deepseek_tokenizer.ds_token.decode(c) for c in token_chunks]
+    curr_parent = parent_message_id
+    if len(chunks) > 1 and session_id:
+        logger.info(
+            "Prompt exceeds limit (%d chars, %d tokens): splitting into %d parts",
+            len(prompt),
+            len(tokens),
+            len(chunks),
+        )
+        for idx, chunk in enumerate(chunks[:-1], start=1):
+            stage_prompt = (
+                chunk
+                + "\n\n[System note: This is part "
+                + str(idx)
+                + "/"
+                + str(len(chunks))
+                + " of context. Remember it and reply with exactly: BURMALDA "
+                + str(idx)
+                + "]"
+            )
+            try:
+                logger.info(
+                    "Staging part %d/%d (%d tokens, BURMALDA %d)",
+                    idx,
+                    len(chunks),
+                    len(token_chunks[idx - 1]),
+                    idx,
+                )
+                async for _ in send_message(
+                    session_id,
+                    auth_token,
+                    stage_prompt,
+                    curr_parent,
+                    False,
+                    False,
+                    file_ids,
+                ):
+                    pass
+                curr_parent = next_parent(curr_parent)
+                logger.info("Part %d/%d staged successfully", idx, len(chunks))
+            except Exception as e:
+                logger.warning("Stage BURMALDA %d failed: %s", idx, e)
+            await asyncio.sleep(1)
+
+    final_chunk = chunks[-1]
+    if len(chunks) > 1:
+        logger.info(
+            "Submitting final part %d/%d (%d tokens, %d chars) for main request",
+            len(chunks),
+            len(chunks),
+            len(token_chunks[-1]),
+            len(final_chunk),
+        )
+    return final_chunk, file_ids, curr_parent
+
+
 async def handle_chat(
     messages,
     model,
@@ -1147,13 +1229,24 @@ async def handle_chat(
                         )
                         for fid in file_ids:
                             await _db(record_file, fid, new_token_id)
+                        prompt, file_ids, rot_parent = await _offload_prompt_if_needed(
+                            prompt,
+                            True,
+                            tools or [],
+                            response_format,
+                            new_token_id,
+                            new_tok["token"],
+                            file_ids,
+                            session_id=new_session_id,
+                            parent_message_id=0,
+                        )
                         reply_id.set(None)
                         gen = _with_deadline(
                             send_message(
                                 new_session_id,
                                 new_tok["token"],
                                 prompt,
-                                0,
+                                rot_parent,
                                 thinking,
                                 search,
                                 file_ids,
@@ -1554,6 +1647,17 @@ async def handle_chat(
                     await _db(record_file, fid, token_id)
         prompt = await build_prompt(
             messages, tools or [], model, is_first, rollover_summary=rollover_summary
+        )
+        prompt, file_ids, parent_message_id = await _offload_prompt_if_needed(
+            prompt,
+            is_first,
+            tools or [],
+            response_format,
+            token_id,
+            tok["token"],
+            file_ids,
+            session_id=session_id,
+            parent_message_id=parent_message_id,
         )
 
         reply_id.set(None)
