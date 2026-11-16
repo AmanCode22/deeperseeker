@@ -88,6 +88,10 @@ def get_db():
 def init_db():
     conn = get_db()
     conn.executescript("""
+        CREATE TABLE IF NOT EXISTS mask_config (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            config TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             alias TEXT,
@@ -157,12 +161,20 @@ def init_db():
             surface TEXT NOT NULL,
             model TEXT,
             input_tokens INTEGER NOT NULL DEFAULT 0,
-            output_tokens INTEGER NOT NULL DEFAULT 0
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_hit INTEGER NOT NULL DEFAULT 0
         );
     """)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_usage_day_key ON usage(day, key_alias)"
     )
+    existing_usage_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(usage)").fetchall()
+    }
+    if "cache_hit" not in existing_usage_cols:
+        conn.execute(
+            "ALTER TABLE usage ADD COLUMN cache_hit INTEGER NOT NULL DEFAULT 0"
+        )
     with contextlib.suppress(Exception):
         rows = conn.execute("SELECT id, token, device_id FROM tokens WHERE device_id IS NOT NULL").fetchall()
         for row in rows:
@@ -2609,7 +2621,7 @@ def mask_api_key(key):
     return "…" + key[-4:]
 
 
-def record_usage(key_alias, surface, model, in_tokens, out_tokens, ts=None):
+def record_usage(key_alias, surface, model, in_tokens, out_tokens, ts=None, cache_hit=False):
     """Record one completed turn. `key_alias` is expected PRE-MASKED — pass
     mask_api_key(raw_key) at the call site; this function never stores raw
     key material as a defense against future callers forgetting."""
@@ -2622,8 +2634,9 @@ def record_usage(key_alias, surface, model, in_tokens, out_tokens, ts=None):
     day = time.strftime("%Y-%m-%d", time.gmtime(when))
     conn = get_db()
     conn.execute(
-        "INSERT INTO usage (ts, day, key_alias, surface, model, input_tokens, output_tokens) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO usage (ts, day, key_alias, surface, model, input_tokens, "
+        "output_tokens, cache_hit) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             when,
             day,
@@ -2632,6 +2645,7 @@ def record_usage(key_alias, surface, model, in_tokens, out_tokens, ts=None):
             str(model or ""),
             max(0, int(in_tokens or 0)),
             max(0, int(out_tokens or 0)),
+            1 if cache_hit else 0,
         ),
     )
     conn.commit()
@@ -2651,7 +2665,8 @@ def usage_by_day_key(since_ts=0.0):
     rows = conn.execute(
         "SELECT day, key_alias, "
         "GROUP_CONCAT(DISTINCT surface), COUNT(*), "
-        "SUM(input_tokens), SUM(output_tokens) "
+        "SUM(input_tokens), SUM(output_tokens), "
+        "SUM(CASE WHEN cache_hit = 1 THEN input_tokens ELSE 0 END) "
         "FROM usage WHERE ts >= ? "
         "GROUP BY day, key_alias ORDER BY day DESC, key_alias ASC",
         (float(since_ts or 0.0),),
@@ -2660,11 +2675,14 @@ def usage_by_day_key(since_ts=0.0):
 
     tariff = DEEPSEEK_TARIFFS["deepseek-v4.1-flash"]
     out = []
-    for day, alias, surfaces, requests, in_tok, out_tok in rows:
+    for day, alias, surfaces, requests, in_tok, out_tok, hit_tok in rows:
         in_tok = in_tok or 0
         out_tok = out_tok or 0
-        cost = (in_tok / 1_000_000 * tariff["cache_miss_input"]) + (
-            out_tok / 1_000_000 * tariff["output_generation"]
+        hit_tok = hit_tok or 0
+        cost = (
+            hit_tok / 1_000_000 * tariff["cache_hit_input"]
+            + (in_tok - hit_tok) / 1_000_000 * tariff["cache_miss_input"]
+            + out_tok / 1_000_000 * tariff["output_generation"]
         )
         out.append(
             {
@@ -2761,6 +2779,40 @@ def get_pool_view():
             }
         )
     return view
+
+
+_MASK_TABLE_DDL = (
+    "CREATE TABLE IF NOT EXISTS mask_config ("
+    "id INTEGER PRIMARY KEY CHECK (id = 1), config TEXT NOT NULL)"
+)
+
+
+def load_mask_config():
+    conn = get_db()
+    try:
+        conn.execute(_MASK_TABLE_DDL)
+        row = conn.execute("SELECT config FROM mask_config WHERE id = 1").fetchone()
+        return json.loads(row["config"]) if row else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def save_mask_config(cfg):
+    conn = get_db()
+    try:
+        conn.execute(_MASK_TABLE_DDL)
+        conn.execute(
+            "INSERT INTO mask_config (id, config) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET config = excluded.config",
+            (json.dumps(cfg, ensure_ascii=False),),
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
 
 
 async def probe_token(auth_token: str) -> dict:
@@ -3048,8 +3100,9 @@ DEFAULT_MODEL_TYPE = "default"
 # per https://api-docs.deepseek.com/quick_start/pricing
 DEEPSEEK_TARIFFS = {
     "deepseek-v4.1-flash": {
-        "cache_miss_input": 0.44,
-        "output_generation": 1.32,
+        "cache_miss_input": 0.30,
+        "cache_hit_input": 0.006,
+        "output_generation": 1.20,
     },
 }
 

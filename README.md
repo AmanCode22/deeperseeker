@@ -288,15 +288,17 @@ docker run --rm -u root -v deeperseeker_deeperseeker_data:/app/data alpine \
 - **Empty or blank replies, then an HTTP 502** — *Symptom:* the client gets `Empty response from DeepSeek (no parseable SSE content)` (or an upstream error event) and finally a `502` with an `error.request_id` (OpenAI surface) or a `[trace: …]` suffix in the message (Anthropic surface). *What the service does now:* the turn is retried across the pool — each attempt on a different token, jittered backoff between attempts — up to `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` tries; when every attempt comes back empty, the designed 502 is returned with the correlation id stamped in the body and the `X-Request-ID` header, and nothing upstream-derived reaches the body unredacted. *What to check:* open the dashboard pool view and look for tokens stuck `RATE_LIMITED`/`QUARANTINED`; match the `request_id`/`trace` against the access log line to see which states the turn traversed.
 - **"Context limit" errors in an agent harness** (Claude Code, Cline, coding harnesses) — *Symptom:* the harness reports a context-limit failure while plain chat clients keep working. *Root cause:* the upstream context belongs to the **chat session**, not the token — the old plain retry re-sent the same oversized context (a harness replays its whole history every turn) and every attempt failed the same way. *What the service does now:* (1) a context-class failure (upstream context wording, or the empty-SSE-with-context-hint error) makes the retry **force a summarize-and-rollover** — the fresh chat is seeded with a model-generated handoff summary, so the turn recovers with full continuity instead of dying or amputating the history; (2) the latest user message is hard-capped (`DEEPSEEKER_MAX_USER_MESSAGE_TOKENS`, tail kept) so a first message above the ~975K upstream ceiling passes instead of failing on every attempt; (3) the rollover estimate counts tool schemas and prompt overhead (`DEEPSEEKER_PROMPT_OVERHEAD_TOKENS`) so the proactive rollover fires **before** the remembered session dies, not after.
 
-## Pricing (per 1M tokens, as of 2026-09-06)
+## Pricing (per 1M tokens, as of 2026-11-15)
 
 Flat peak-hour rates for the single default model:
 
-| Model Tier | Input Cost (Cache Miss) | Output Cost |
-|---|---|---|
-| **DeepSeek V4.1 Flash** (`v4.1flash`) | $0.44 | $1.32 |
+| Model Tier | Input Cost (Cache Miss) | Input Cost (Cache Hit) | Output Cost |
+|---|---|---|---|
+| **DeepSeek V4.1 Flash** (`v4.1flash`) | $0.30 | $0.006 | $1.20 |
 
-The `cost` reported in API responses uses these flat rates.
+The `cost` reported in API responses uses these flat rates. A turn that
+continues a chat this gateway already holds locally is billed as a cache hit;
+new chats (first turn, rotation, context rollover) bill input at the miss rate.
 
 ## Project docs
 

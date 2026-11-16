@@ -68,8 +68,8 @@ def test_every_cell_of_the_expected_table():
         assert a_today["requests"] == 2
         assert a_today["input_tokens"] == 300
         assert a_today["output_tokens"] == 200
-        # cost = 300/1M*0.44 + 200/1M*1.32 = 0.000132 + 0.000264 = 0.000396
-        assert abs(a_today["cost"] - 0.000396) < 1e-9
+        # cost = 300/1M*0.30 + 200/1M*1.20 = 0.00009 + 0.00024 = 0.00033
+        assert abs(a_today["cost"] - 0.00033) < 1e-9
         assert (
             a_today["pricing_source"]
             == "flat tariff table (not metered upstream usage)"

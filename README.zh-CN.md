@@ -255,15 +255,16 @@ docker run --rm -u root -v deeperseeker_deeperseeker_data:/app/data alpine \
 - **回复为空或空白，最后收到 HTTP 502** —— *症状：* 客户端收到 `Empty response from DeepSeek (no parseable SSE content)`（或上游错误事件），最终收到一个带 `error.request_id`（OpenAI 面）或消息尾部 `[trace: …]`（Anthropic 面）的 `502`。*服务现在的行为：* 该轮在池内重试——每次换一个 token，尝试间抖动退避——最多 `DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS` 次；当所有尝试都返回空时，返回设计好的 502，相关 id 盖在响应体和 `X-Request-ID` 头里，上游来源的信息不会未脱敏地进入响应体。*要查什么：* 打开仪表盘池视图，找卡在 `RATE_LIMITED`/`QUARANTINED` 的 token；拿 `request_id`/`trace` 对照访问日志行，看该轮走过了哪些状态。
 - **Agent 框架（Claude Code、Cline 等编程 harness）报 "Context limit" 错误** —— *症状：* harness 上报上下文超限失败，而普通聊天客户端一直正常。*根因：* 上游上下文属于**聊天会话**而不是 token——旧的朴素重试原样重发同一个超长上下文（harness 每轮都会重放全部历史），每次尝试都以同样方式失败。*服务现在的行为：*（1）上下文类失败（上游上下文措辞，或带上下文提示的空 SSE 错误）会让重试**强制走摘要滚动**——新会话用模型生成的交接摘要做种子，轮次带着完整连续性恢复，而不是死掉或截肢历史；（2）最新用户消息有硬上限（`DEEPSEEKER_MAX_USER_MESSAGE_TOKENS`，保留尾部），超过约 975K 上游上限的首条消息也能通过，而不是每次尝试都失败；（3）滚动估算把工具模式和提示开销计入（`DEEPSEEKER_PROMPT_OVERHEAD_TOKENS`），让主动滚动在记忆会话死掉**之前**触发，而不是之后。
 
-## 价格（每 1M token，截至 2026-09-06）
+## 价格（每 1M token，截至 2026-11-15）
 
 唯一默认模型的统一高峰时段费率：
 
-| 模型层 | 输入成本（缓存未命中） | 输出成本 |
-|---|---|---|
-| **DeepSeek V4.1 Flash**（`v4.1flash`） | $0.44 | $1.32 |
+| 模型层 | 输入成本（缓存未命中） | 输入成本（缓存命中） | 输出成本 |
+|---|---|---|---|
+| **DeepSeek V4.1 Flash**（`v4.1flash`） | $0.30 | $0.006 | $1.20 |
 
-API 响应里的 `cost` 就用这套统一费率。
+API 响应里的 `cost` 就用这套统一费率。续接网关本地已有会话的轮次按缓存命中计费；
+新建会话（首轮、轮换、上下文滚动）的输入按未命中费率计费。
 
 ## 项目文档
 

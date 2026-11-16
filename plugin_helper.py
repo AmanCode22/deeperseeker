@@ -18,8 +18,10 @@ from functions import (
     count_tokens,
     get_session,
     is_json_object_format,
+    load_mask_config,
     request_effort,
     request_response_format,
+    save_mask_config,
     upload_file,
 )
 
@@ -35,11 +37,10 @@ JSON_OBJECT_INSTRUCTION = (
     "output only the JSON object."
 )
 
-_MASK_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "mask.json")
 _mask_lock = threading.Lock()
 
 _DEFAULT_MASK_CONFIG = {
-    "master_enabled": False,
+    "master_enabled": True,
     "tags": {
         "USER": "[USER]",
         "SYSTEM": "[SYSTEM]",
@@ -48,15 +49,15 @@ _DEFAULT_MASK_CONFIG = {
         "TOOL_RESULTS": "[TOOL RESULTS]",
     },
     "homoglyphs": {
-        "enabled": False,
+        "enabled": True,
         "rate": 0.2,
     },
     "noise": {
-        "enabled": False,
+        "enabled": True,
         "invisible_chars": True,
-        "spaces_enabled": False,
+        "spaces_enabled": True,
         "spaces_rate": 0.05,
-        "letters_enabled": False,
+        "letters_enabled": True,
         "letters_rate": 0.03,
     },
     "replacements": {
@@ -108,28 +109,19 @@ _INVISIBLE_CHARS = ["\u200b", "\u200c", "\u200d", "\u200a"]
 def _load_mask_config():
     if os.getenv("PYTEST_CURRENT_TEST"):
         return json.loads(json.dumps(_DEFAULT_MASK_CONFIG))
-    if os.path.exists(_MASK_CONFIG_PATH):
-        try:
-            with open(_MASK_CONFIG_PATH, encoding="utf-8") as f:
-                data = json.load(f)
-            merged = json.loads(json.dumps(_DEFAULT_MASK_CONFIG))
-            for k, v in data.items():
-                if isinstance(v, dict) and k in merged and isinstance(merged[k], dict):
-                    merged[k].update(v)
-                else:
-                    merged[k] = v
-            return merged
-        except Exception:
-            return json.loads(json.dumps(_DEFAULT_MASK_CONFIG))
-    return json.loads(json.dumps(_DEFAULT_MASK_CONFIG))
+    merged = json.loads(json.dumps(_DEFAULT_MASK_CONFIG))
+    data = load_mask_config()
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if isinstance(v, dict) and k in merged and isinstance(merged[k], dict):
+                merged[k].update(v)
+            else:
+                merged[k] = v
+    return merged
 
 
 def _save_mask_config(cfg):
-    try:
-        with open(_MASK_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+    save_mask_config(cfg)
 
 
 _current_mask_config = _load_mask_config()

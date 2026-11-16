@@ -899,7 +899,8 @@ async def _record_usage_safe(scope, surface, model, in_tokens, out_tokens):
     The key is masked here so raw key material never reaches the store."""
     try:
         return await _db(
-            record_usage, mask_api_key(scope), surface, model, in_tokens, out_tokens
+            record_usage, mask_api_key(scope), surface, model, in_tokens, out_tokens,
+            cache_hit=chat_cache_hit.get(),
         )
     except Exception:
         logger.warning("usage record failed (non-fatal)", exc_info=True)
@@ -932,6 +933,7 @@ MAX_UPSTREAM_ATTEMPTS = max(1, int(os.getenv("DEEPSEEKER_MAX_UPSTREAM_ATTEMPTS",
 # and used by stream_response when DeepSeek drops the stream before any visible
 # output reached the client (None once the attempt budget is spent).
 _stream_retry = contextvars.ContextVar("stream_retry", default=None)
+chat_cache_hit = contextvars.ContextVar("chat_cache_hit", default=False)
 
 
 def _setup_retry_kwargs(
@@ -1665,6 +1667,7 @@ async def handle_chat(
             slot = acquire_token_slot(token_id)
 
         is_first = parent_message_id == 0
+        chat_cache_hit.set(not is_first)
         # Stage 0.3: the lock is held across the whole send -> save critical
         # section; for streams, ownership transfers to the response generator
         # via _release_chat_lock_stream (the final save_session happens there).
@@ -2469,7 +2472,8 @@ def format_response(text, model, messages, tools=None, response_format=None):
     usage_text = _completion_usage_text(clean_text, parsed_tools)
     out_tokens = count_tok(usage_text) if usage_text else 0
     tariff = DEEPSEEK_TARIFFS["deepseek-v4.1-flash"]
-    cost = (in_tokens / 1_000_000 * tariff["cache_miss_input"]) + (
+    in_rate = "cache_hit_input" if chat_cache_hit.get() else "cache_miss_input"
+    cost = (in_tokens / 1_000_000 * tariff[in_rate]) + (
         out_tokens / 1_000_000 * tariff["output_generation"]
     )
 
@@ -4650,13 +4654,13 @@ async def api_update_masking_config(request: Request):
         data = await request.json()
     except Exception:
         data = {}
-    updated = update_masking_config(data)
+    updated = await _db(update_masking_config, data)
     return JSONResponse({"status": "ok", "config": updated})
 
 
 @app.post("/api/masking/reset")
 async def api_reset_masking_config(request: Request):
-    cfg = reset_masking_config()
+    cfg = await _db(reset_masking_config)
     return JSONResponse({"status": "ok", "config": cfg})
 
 
