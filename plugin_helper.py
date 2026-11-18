@@ -176,13 +176,29 @@ def get_custom_instructions():
     return text
 
 
+# Fenced code blocks (```python, ```json, bare ```, …) are exempt from
+# masking: homoglyphs, invisible characters and injected spaces corrupt code
+# and break JSON. An unclosed fence runs to the end of the text, matching
+# how a Markdown renderer treats it.
+_FENCED_BLOCK_RE = re.compile(r"(```[\s\S]*?(?:```|\Z))")
+
+
 def apply_text_masking(text):
     if not text:
         return text
     cfg = get_masking_config()
     if not cfg.get("master_enabled"):
         return text
+    # Mask only the prose between fences — the same exemption
+    # mask_tool_instructions already applies to tool instructions.
+    parts = _FENCED_BLOCK_RE.split(text)
+    for i in range(0, len(parts), 2):
+        if parts[i]:
+            parts[i] = _mask_plain_text(parts[i], cfg)
+    return "".join(parts)
 
+
+def _mask_plain_text(text, cfg):
     repl = cfg.get("replacements") or {}
     if repl.get("enabled"):
         items = repl.get("items") or []

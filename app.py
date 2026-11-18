@@ -705,14 +705,20 @@ async def _record_upstream_limit(token_id, exc, code):
 def _api_error_response(e, is_anthropic=False):
     code = _upstream_http_code(e) or 502
     if isinstance(e, CookieGenerationError):
-        code = 500
+        # WAF cookies cannot be produced right now — upstream unreachable,
+        # so the status stays 503 ("retry later"), not 500.
+        code = 503
     if code < 400 or code > 599:
         code = 502
     # P0-7: official-mode error bodies carry upstream text too — every
     # client-visible error body passes the secret scrub, one discipline.
     message = _redact_secret_material(str(e)[:500])
-    if getattr(e, "biz_code", None) == 40303 or "40303" in str(e) or isinstance(e, CookieGenerationError):
+    if getattr(e, "biz_code", None) == 40303 or "40303" in str(e):
         code = 500
+        message = "Internal server error"
+    elif isinstance(e, CookieGenerationError):
+        # Generic body on top of that 503: both the retry-later signal and
+        # the internals-hiding the 500 change was made for.
         message = "Internal server error"
     if is_anthropic:
         payload = {
@@ -757,15 +763,21 @@ def _terminal_error_response(e, is_anthropic=False):
     """
     code = _upstream_http_code(e) or 502
     if isinstance(e, CookieGenerationError):
-        code = 500
+        # WAF cookies cannot be produced right now — upstream unreachable,
+        # so the status stays 503 ("retry later"), not 500.
+        code = 503
     if code < 400 or code > 599:
         code = 502
     trace = request_id_var.get()
     if trace == "-":
         trace = uuid.uuid4().hex  # direct invocation path (tests, scripts)
     message = _redact_secret_material(str(e)[:500])
-    if getattr(e, "biz_code", None) == 40303 or "40303" in str(e) or isinstance(e, CookieGenerationError):
+    if getattr(e, "biz_code", None) == 40303 or "40303" in str(e):
         code = 500
+        message = "Internal server error"
+    elif isinstance(e, CookieGenerationError):
+        # Generic body on top of that 503: both the retry-later signal and
+        # the internals-hiding the 500 change was made for.
         message = "Internal server error"
     if is_anthropic:
         payload = {
@@ -1089,7 +1101,23 @@ async def _offload_prompt_if_needed(
                 curr_parent = next_parent(curr_parent)
                 logger.info("Part %d/%d staged successfully", idx, len(chunks))
             except Exception as e:
-                logger.warning("Stage BURMALDA %d failed: %s", idx, e)
+                # A chunk that never staged is context the model does NOT
+                # have: swallowing the failure here would submit the final
+                # chunk against a half-staged history and silently drop this
+                # part. Propagate instead — the caller's failure path drops
+                # the session rows (delete_sessions_for_chat) and retries on
+                # a NEW chat, where the whole prompt is staged again from
+                # scratch. If the budget is spent the client gets the normal
+                # terminal error rather than a quietly truncated prompt.
+                logger.warning(
+                    "Stage part %d/%d failed in chat %s, giving the chat up "
+                    "so the retry re-stages the prompt in a new one: %s",
+                    idx,
+                    len(chunks),
+                    session_id,
+                    e,
+                )
+                raise
             await asyncio.sleep(1)
 
     final_chunk = chunks[-1]
@@ -4643,13 +4671,19 @@ async def dashboard(request: Request):
     )
 
 
+# The masking config is injected into every outgoing prompt and /preview is
+# a text-transform oracle, so these JSON routes carry the same admin guard as
+# the dashboard pages. The guard's 401/403 propagates as JSON here instead of
+# the HTML login redirect the HTML routes use.
 @app.get("/api/masking/config")
 async def api_get_masking_config(request: Request):
+    get_current_admin(request)
     return JSONResponse(get_masking_config())
 
 
 @app.post("/api/masking/config")
 async def api_update_masking_config(request: Request):
+    get_current_admin(request)
     try:
         data = await request.json()
     except Exception:
@@ -4660,12 +4694,14 @@ async def api_update_masking_config(request: Request):
 
 @app.post("/api/masking/reset")
 async def api_reset_masking_config(request: Request):
+    get_current_admin(request)
     cfg = await _db(reset_masking_config)
     return JSONResponse({"status": "ok", "config": cfg})
 
 
 @app.post("/api/masking/preview")
 async def api_preview_masking_text(request: Request):
+    get_current_admin(request)
     try:
         data = await request.json()
         txt = data.get("text", "")
