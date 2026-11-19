@@ -12,6 +12,7 @@ annotated-types==0.8.0
     # via pydantic
 anyio==4.15.1
     # via
+    #   fastapi
     #   httpx
     #   starlette
 attrs==26.1.0
@@ -33,7 +34,7 @@ curl-cffi==0.17.0
     # via -r requirements.in
 deepseek-tokenizer==0.3.0
     # via -r requirements.in
-fastapi==0.162.0
+fastapi==0.163.1
     # via -r requirements.in
 frozenlist==1.8.0
     # via
