@@ -7,15 +7,816 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <nav>
-        <a href="/">Dashboard</a>
-        <span class="sep">|</span>
-        <a href="/logout">Logout</a>
-        <span class="sep">|</span>
-        <span class="brand">DeeperSeeker</span>
+    <nav style="display: flex; justify-content: space-between; align-items: center;">
+        <div>
+            <a href="/">Dashboard</a>
+            <span class="sep">|</span>
+            <a href="/logout">Logout</a>
+            <span class="sep">|</span>
+            <span class="brand">DeeperSeeker</span>
+        </div>
+        <div>
+            {% block masking_button %}
+            <button type="button" id="masking-open-btn" class="amoled-gear-btn" title="Prompt Masking Settings" aria-label="Settings">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+                <span id="nav-mask-dot" class="mask-dot"></span>
+            </button>
+            {% endblock %}
+        </div>
     </nav>
     <main>
         {% block content %}{% endblock %}
     </main>
+
+    {% block masking_modal %}
+    <div id="masking-modal-backdrop" class="mask-backdrop hidden">
+        <div id="masking-modal" class="amoled-modal">
+            <div class="modal-header">
+                <div class="header-left">
+                    <h3 class="modal-title">Prompt Masking</h3>
+                </div>
+                <div class="header-right">
+                    <label class="master-switch" title="Toggle prompt masking">
+                        <input type="checkbox" id="mask-master-toggle">
+                        <span class="master-slider"></span>
+                        <span class="master-label" id="master-status-label">OFF</span>
+                    </label>
+                    <button type="button" id="mask-close-btn" class="close-btn" aria-label="Close">&times;</button>
+                </div>
+            </div>
+
+            <div id="modal-body-container" class="modal-body">
+                <div id="view-categories" class="view-panel active">
+                    <div class="category-cards">
+                        <div class="cat-card" data-target="cat-tags">
+                            <div class="cat-info">
+                                <h4>Role Delimiters &amp; Tags</h4>
+                                <p>Customize [USER], [SYSTEM], [TOOLS], and [TOOL RESULTS]</p>
+                            </div>
+                            <div class="cat-arrow">&rarr;</div>
+                        </div>
+
+                        <div class="cat-card" data-target="cat-replacements">
+                            <div class="cat-info">
+                                <h4>Phrase Replacements</h4>
+                                <p>Replace tool names and phrases (e.g. claude code)</p>
+                            </div>
+                            <div class="cat-badge" id="badge-repl-status">OFF</div>
+                            <div class="cat-arrow">&rarr;</div>
+                        </div>
+
+                        <div class="cat-card" data-target="cat-homoglyphs">
+                            <div class="cat-info">
+                                <h4>Homoglyph Scrambler</h4>
+                                <p>Substitute Latin letters with visually identical Cyrillic lookalikes</p>
+                            </div>
+                            <div class="cat-badge" id="badge-homo-status">OFF</div>
+                            <div class="cat-arrow">&rarr;</div>
+                        </div>
+
+                        <div class="cat-card" data-target="cat-noise">
+                            <div class="cat-info">
+                                <h4>Noise &amp; Degradation</h4>
+                                <p>Inject zero-width characters, random spaces, and letters</p>
+                            </div>
+                            <div class="cat-badge" id="badge-noise-status">OFF</div>
+                            <div class="cat-arrow">&rarr;</div>
+                        </div>
+
+                        <div class="cat-card" data-target="cat-custom-instructions">
+                            <div class="cat-info">
+                                <h4>Custom Instructions</h4>
+                                <p>Inject tailored directives into every request</p>
+                            </div>
+                            <div class="cat-badge" id="badge-custom-status">OFF</div>
+                            <div class="cat-arrow">&rarr;</div>
+                        </div>
+
+                        <div class="cat-card" data-target="cat-directives">
+                            <div class="cat-info">
+                                <h4>Tool &amp; System Directives</h4>
+                                <p>Target tool instructions, system prompts, and seed context</p>
+                            </div>
+                            <div class="cat-arrow">&rarr;</div>
+                        </div>
+                    </div>
+
+                    <div class="main-preview-box">
+                        <div class="main-preview-header">
+                            <span class="preview-title">Live Filter Preview</span>
+                            <button type="button" id="preview-rerun-btn" class="preview-rerun-btn" title="Re-run active filters">
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <div id="main-live-preview" class="main-preview-text">Some comrade started aggressively banning DeepSeek tokens. We must disguise our prompts.</div>
+                    </div>
+                </div>
+
+                <div id="cat-tags" class="view-panel detail-panel">
+                    <div class="detail-header">
+                        <button type="button" class="back-btn">&larr; Back</button>
+                        <h4>Role Delimiters &amp; Tags</h4>
+                    </div>
+                    <p class="section-desc">Change the exact tag strings wrapping user messages, system prompts, and tool outputs.</p>
+                    <div class="input-grid">
+                        <div class="input-row">
+                            <label>User Tag</label>
+                            <input type="text" id="tag-user" placeholder="[USER]">
+                        </div>
+                        <div class="input-row">
+                            <label>System Tag</label>
+                            <input type="text" id="tag-system" placeholder="[SYSTEM]">
+                        </div>
+                        <div class="input-row">
+                            <label>Tools Tag</label>
+                            <input type="text" id="tag-tools" placeholder="[TOOLS]">
+                        </div>
+                        <div class="input-row">
+                            <label>Tool Results Tag</label>
+                            <input type="text" id="tag-tool-results" placeholder="[TOOL RESULTS]">
+                        </div>
+                        <div class="input-row">
+                            <label>Assistant Tag</label>
+                            <input type="text" id="tag-assistant" placeholder="[ASSISTANT]">
+                        </div>
+                    </div>
+                    <div class="presets-row">
+                        <span>Presets:</span>
+                        <button type="button" class="preset-btn" data-preset="brackets">[DEFAULT]</button>
+                        <button type="button" class="preset-btn" data-preset="markdown">### Markdown</button>
+                        <button type="button" class="preset-btn" data-preset="tags">&lt;XML_STYLE&gt;</button>
+                    </div>
+                </div>
+
+                <div id="cat-replacements" class="view-panel detail-panel">
+                    <div class="detail-header">
+                        <button type="button" class="back-btn">&larr; Back</button>
+                        <h4>Phrase Replacements</h4>
+                    </div>
+                    <p class="section-desc">Replace sensitive phrases and tool names (case-insensitive) with custom aliases before sending.</p>
+                    <div class="toggle-row">
+                        <label>Enable Phrase Replacement</label>
+                        <input type="checkbox" id="repl-toggle" class="amoled-toggle">
+                    </div>
+                    <div class="input-row">
+                        <label>Replacement Rules (one rule per line: word => replacement)</label>
+                        <textarea id="repl-rules-text" rows="5" class="apple-textarea" placeholder="claude code => assistant agent&#10;anthropic => provider"></textarea>
+                    </div>
+                </div>
+
+                <div id="cat-homoglyphs" class="view-panel detail-panel">
+                    <div class="detail-header">
+                        <button type="button" class="back-btn">&larr; Back</button>
+                        <h4>Homoglyph Scrambler</h4>
+                    </div>
+                    <p class="section-desc">Replaces Latin characters (a, e, o, p, c, x, etc.) with visually identical Cyrillic counterparts to evade regex and token filters.</p>
+                    <div class="toggle-row">
+                        <label>Enable Homoglyphs</label>
+                        <input type="checkbox" id="homo-toggle" class="amoled-toggle">
+                    </div>
+                    <div class="slider-row">
+                        <div class="slider-header">
+                            <span>Replacement Frequency</span>
+                            <span id="homo-rate-val" class="rate-val">20%</span>
+                        </div>
+                        <input type="range" id="homo-rate" min="1" max="100" value="20">
+                    </div>
+                </div>
+
+                <div id="cat-noise" class="view-panel detail-panel">
+                    <div class="detail-header">
+                        <button type="button" class="back-btn">&larr; Back</button>
+                        <h4>Noise &amp; Degradation</h4>
+                    </div>
+                    <p class="section-desc">Inject invisible zero-width characters, random spaces, and random real letters.</p>
+                    <div class="toggle-row">
+                        <label>Enable Noise Master Switch</label>
+                        <input type="checkbox" id="noise-toggle" class="amoled-toggle">
+                    </div>
+                    <div class="checkbox-group">
+                        <label class="custom-check">
+                            <input type="checkbox" id="noise-invisible">
+                            <span>Invisible Zero-Width Characters (&amp;ZeroWidthSpace;)</span>
+                        </label>
+                    </div>
+                    <div class="toggle-row" style="margin-top: 12px; margin-bottom: 8px;">
+                        <label>Random Spaces Jitter</label>
+                        <input type="checkbox" id="noise-spaces-toggle" class="amoled-toggle">
+                    </div>
+                    <div class="slider-row">
+                        <div class="slider-header">
+                            <span>Spaces Frequency</span>
+                            <span id="noise-spaces-val" class="rate-val">5%</span>
+                        </div>
+                        <input type="range" id="noise-spaces-rate" min="1" max="25" value="5">
+                    </div>
+                    <div class="toggle-row" style="margin-top: 12px; margin-bottom: 8px;">
+                        <label>Random Letters / Typos</label>
+                        <input type="checkbox" id="noise-letters-toggle" class="amoled-toggle">
+                    </div>
+                    <div class="slider-row">
+                        <div class="slider-header">
+                            <span>Letters Frequency</span>
+                            <span id="noise-letters-val" class="rate-val">3%</span>
+                        </div>
+                        <input type="range" id="noise-letters-rate" min="1" max="25" value="3">
+                    </div>
+                </div>
+
+                <div id="cat-custom-instructions" class="view-panel detail-panel">
+                    <div class="detail-header">
+                        <button type="button" class="back-btn">&larr; Back</button>
+                        <h4>Custom Instructions</h4>
+                    </div>
+                    <p class="section-desc">Inject custom instructions into every request system context.</p>
+                    <div class="toggle-row">
+                        <label>Enable Custom Instructions</label>
+                        <input type="checkbox" id="custom-inst-toggle" class="amoled-toggle">
+                    </div>
+                    <div class="toggle-row">
+                        <label>Apply Masking to Custom Instructions</label>
+                        <input type="checkbox" id="custom-inst-mask-toggle" class="amoled-toggle">
+                    </div>
+                    <div class="input-row">
+                        <label>Instructions Content</label>
+                        <textarea id="custom-inst-text" rows="5" class="apple-textarea" placeholder="Enter custom instructions to inject into every request..."></textarea>
+                    </div>
+                </div>
+
+                <div id="cat-directives" class="view-panel detail-panel">
+                    <div class="detail-header">
+                        <button type="button" class="back-btn">&larr; Back</button>
+                        <h4>Tool &amp; System Directives</h4>
+                    </div>
+                    <p class="section-desc">Select which framework components will be masked when master switch is enabled.</p>
+                    <div class="checkbox-group">
+                        <label class="custom-check">
+                            <input type="checkbox" id="dir-mask-tools">
+                            <span>Mask Tool Use Instructions (DSML specification)</span>
+                        </label>
+                        <label class="custom-check">
+                            <input type="checkbox" id="dir-mask-sys">
+                            <span>Mask System Prompts</span>
+                        </label>
+                        <label class="custom-check">
+                            <input type="checkbox" id="dir-mask-seeds">
+                            <span>Mask Rollover &amp; Context Summary Seeds</span>
+                        </label>
+                    </div>
+                </div>
+            </div>
+
+            <div class="modal-footer">
+                <button type="button" id="mask-reset-btn" class="amoled-reset-btn">Reset</button>
+                <span id="mask-status-msg" class="status-msg"></span>
+                <button type="button" id="mask-save-btn" class="amoled-save-btn">Save Changes</button>
+            </div>
+        </div>
+    </div>
+    {% endblock %}
+
+    {% block masking_script %}
+    <script>
+    (function () {
+        let currentConfig = null;
+
+        const HOMOGLYPHS = {
+            'a': 'а', 'e': 'е', 'o': 'о', 'p': 'р', 'c': 'с', 'x': 'х', 'y': 'у', 's': 'ѕ', 'i': 'і', 'j': 'ј',
+            'A': 'А', 'B': 'В', 'E': 'Е', 'K': 'К', 'M': 'М', 'H': 'Н', 'O': 'О', 'P': 'Р', 'C': 'С', 'T': 'Т', 'X': 'Х', 'Y': 'У'
+        };
+
+        const INVISIBLE_CHARS = ['\u200b', '\u200c', '\u200d', '\u200a'];
+        const SAMPLE_TEXT = "Some comrade started aggressively banning DeepSeek tokens. We must disguise our prompts.";
+
+        function init() {
+            const openBtn = document.getElementById('masking-open-btn');
+            const backdrop = document.getElementById('masking-modal-backdrop');
+            const closeBtn = document.getElementById('mask-close-btn');
+            const masterToggle = document.getElementById('mask-master-toggle');
+            const masterLabel = document.getElementById('master-status-label');
+            const saveBtn = document.getElementById('mask-save-btn');
+            const resetBtn = document.getElementById('mask-reset-btn');
+            const rerunBtn = document.getElementById('preview-rerun-btn');
+            const navDot = document.getElementById('nav-mask-dot');
+
+            if (!openBtn || !backdrop) return;
+
+            openBtn.addEventListener('click', () => {
+                loadConfig(() => {
+                    backdrop.classList.remove('hidden');
+                    switchView('view-categories');
+                    updateMainPreview();
+                });
+            });
+
+            if (closeBtn) {
+                closeBtn.addEventListener('click', () => {
+                    backdrop.classList.add('hidden');
+                });
+            }
+
+            backdrop.addEventListener('click', (e) => {
+                if (e.target === backdrop) {
+                    backdrop.classList.add('hidden');
+                }
+            });
+
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape' && !backdrop.classList.contains('hidden')) {
+                    backdrop.classList.add('hidden');
+                }
+            });
+
+            document.querySelectorAll('.cat-card').forEach(card => {
+                card.addEventListener('click', () => {
+                    const targetId = card.getAttribute('data-target');
+                    if (targetId) switchView(targetId);
+                });
+            });
+
+            document.querySelectorAll('.back-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    switchView('view-categories');
+                    updateMainPreview();
+                });
+            });
+
+            if (masterToggle) {
+                masterToggle.addEventListener('change', () => {
+                    const active = masterToggle.checked;
+                    if (masterLabel) masterLabel.textContent = active ? 'ON' : 'OFF';
+                    if (navDot) navDot.classList.toggle('active', active);
+                    updateMainPreview();
+                });
+            }
+
+            if (rerunBtn) {
+                rerunBtn.addEventListener('click', () => {
+                    updateMainPreview();
+                });
+            }
+
+            const homoRateSlider = document.getElementById('homo-rate');
+            const homoRateVal = document.getElementById('homo-rate-val');
+            const homoToggle = document.getElementById('homo-toggle');
+            if (homoRateSlider) {
+                homoRateSlider.addEventListener('input', () => {
+                    if (homoRateVal) homoRateVal.textContent = homoRateSlider.value + '%';
+                    updateMainPreview();
+                });
+            }
+            if (homoToggle) {
+                homoToggle.addEventListener('change', () => {
+                    const badge = document.getElementById('badge-homo-status');
+                    if (badge) {
+                        badge.textContent = homoToggle.checked ? (homoRateSlider ? homoRateSlider.value + '%' : 'ON') : 'OFF';
+                        badge.classList.toggle('active', homoToggle.checked);
+                    }
+                    updateMainPreview();
+                });
+            }
+
+            const spacesSlider = document.getElementById('noise-spaces-rate');
+            const spacesVal = document.getElementById('noise-spaces-val');
+            const spacesToggle = document.getElementById('noise-spaces-toggle');
+            if (spacesSlider) {
+                spacesSlider.addEventListener('input', () => {
+                    if (spacesVal) spacesVal.textContent = spacesSlider.value + '%';
+                    updateMainPreview();
+                });
+            }
+            if (spacesToggle) {
+                spacesToggle.addEventListener('change', updateMainPreview);
+            }
+
+            const lettersSlider = document.getElementById('noise-letters-rate');
+            const lettersVal = document.getElementById('noise-letters-val');
+            const lettersToggle = document.getElementById('noise-letters-toggle');
+            if (lettersSlider) {
+                lettersSlider.addEventListener('input', () => {
+                    if (lettersVal) lettersVal.textContent = lettersSlider.value + '%';
+                    updateMainPreview();
+                });
+            }
+            if (lettersToggle) {
+                lettersToggle.addEventListener('change', updateMainPreview);
+            }
+
+            const noiseToggle = document.getElementById('noise-toggle');
+            if (noiseToggle) {
+                noiseToggle.addEventListener('change', () => {
+                    const badge = document.getElementById('badge-noise-status');
+                    if (badge) {
+                        badge.textContent = noiseToggle.checked ? 'ON' : 'OFF';
+                        badge.classList.toggle('active', noiseToggle.checked);
+                    }
+                    updateMainPreview();
+                });
+            }
+
+            const replToggle = document.getElementById('repl-toggle');
+            const replRulesText = document.getElementById('repl-rules-text');
+            if (replToggle) {
+                replToggle.addEventListener('change', () => {
+                    const badge = document.getElementById('badge-repl-status');
+                    if (badge) {
+                        badge.textContent = replToggle.checked ? 'ON' : 'OFF';
+                        badge.classList.toggle('active', replToggle.checked);
+                    }
+                    updateMainPreview();
+                });
+            }
+            if (replRulesText) {
+                replRulesText.addEventListener('input', updateMainPreview);
+            }
+
+            const customToggle = document.getElementById('custom-inst-toggle');
+            if (customToggle) {
+                customToggle.addEventListener('change', () => {
+                    const badge = document.getElementById('badge-custom-status');
+                    if (badge) {
+                        badge.textContent = customToggle.checked ? 'ON' : 'OFF';
+                        badge.classList.toggle('active', customToggle.checked);
+                    }
+                });
+            }
+
+            document.querySelectorAll('.preset-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const p = btn.getAttribute('data-preset');
+                    if (p === 'brackets') {
+                        document.getElementById('tag-user').value = '[USER]';
+                        document.getElementById('tag-system').value = '[SYSTEM]';
+                        document.getElementById('tag-tools').value = '[TOOLS]';
+                        document.getElementById('tag-tool-results').value = '[TOOL RESULTS]';
+                        document.getElementById('tag-assistant').value = '[ASSISTANT]';
+                    } else if (p === 'markdown') {
+                        document.getElementById('tag-user').value = '### User:';
+                        document.getElementById('tag-system').value = '### System Context:';
+                        document.getElementById('tag-tools').value = '### Available Tools:';
+                        document.getElementById('tag-tool-results').value = '### Tool Outputs:';
+                        document.getElementById('tag-assistant').value = '### Assistant:';
+                    } else if (p === 'tags') {
+                        document.getElementById('tag-user').value = '<user_query>';
+                        document.getElementById('tag-system').value = '<system_instructions>';
+                        document.getElementById('tag-tools').value = '<tool_schemas>';
+                        document.getElementById('tag-tool-results').value = '<tool_execution_results>';
+                        document.getElementById('tag-assistant').value = '<assistant_response>';
+                    }
+                });
+            });
+
+            if (saveBtn) {
+                saveBtn.addEventListener('click', saveConfig);
+            }
+
+            if (resetBtn) {
+                resetBtn.addEventListener('click', resetConfig);
+            }
+
+            loadConfig();
+        }
+
+        function switchView(viewId) {
+            document.querySelectorAll('.view-panel').forEach(panel => {
+                panel.classList.remove('active');
+            });
+            const target = document.getElementById(viewId);
+            if (target) {
+                target.classList.add('active');
+            }
+        }
+
+        function updateMainPreview() {
+            const previewEl = document.getElementById('main-live-preview');
+            if (!previewEl) return;
+
+            const masterToggle = document.getElementById('mask-master-toggle');
+            if (!masterToggle || !masterToggle.checked) {
+                previewEl.textContent = SAMPLE_TEXT + " [Master toggle is OFF]";
+                return;
+            }
+
+            let text = SAMPLE_TEXT;
+
+            const replToggle = document.getElementById('repl-toggle');
+            const replRulesText = document.getElementById('repl-rules-text');
+            if (replToggle && replToggle.checked && replRulesText) {
+                const lines = replRulesText.value.split('\n');
+                for (let line of lines) {
+                    line = line.trim();
+                    if (!line) continue;
+                    let parts = [];
+                    if (line.includes('=>')) parts = line.split('=>');
+                    else if (line.includes('->')) parts = line.split('->');
+                    else if (line.includes('=')) parts = line.split('=');
+                    if (parts.length >= 2) {
+                        const src = parts[0].trim();
+                        const dst = parts[1].trim();
+                        if (src) {
+                            try {
+                                const re = new RegExp(src.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+                                text = text.replace(re, dst);
+                            } catch (e) {}
+                        }
+                    }
+                }
+            }
+
+            const homoToggle = document.getElementById('homo-toggle');
+            const homoRateSlider = document.getElementById('homo-rate');
+            const homoRate = (homoToggle && homoToggle.checked && homoRateSlider) ? (parseInt(homoRateSlider.value, 10) / 100) : 0;
+
+            const noiseToggle = document.getElementById('noise-toggle');
+            const noiseActive = noiseToggle ? noiseToggle.checked : false;
+
+            const noiseInv = document.getElementById('noise-invisible');
+            const useInv = noiseActive && noiseInv && noiseInv.checked;
+
+            const spacesToggle = document.getElementById('noise-spaces-toggle');
+            const spacesSlider = document.getElementById('noise-spaces-rate');
+            const spacesRate = (noiseActive && spacesToggle && spacesToggle.checked && spacesSlider) ? (parseInt(spacesSlider.value, 10) / 100) : 0;
+
+            const lettersToggle = document.getElementById('noise-letters-toggle');
+            const lettersSlider = document.getElementById('noise-letters-rate');
+            const lettersRate = (noiseActive && lettersToggle && lettersToggle.checked && lettersSlider) ? (parseInt(lettersSlider.value, 10) / 100) : 0;
+
+            const latinLetters = 'abcdefghijklmnopqrstuvwxyz';
+            let out = '';
+
+            for (let i = 0; i < text.length; i++) {
+                let c = text[i];
+                if (homoRate > 0 && HOMOGLYPHS[c] && Math.random() < homoRate) {
+                    c = HOMOGLYPHS[c];
+                }
+                out += c;
+
+                if (noiseActive) {
+                    if (useInv && Math.random() < 0.05) {
+                        out += INVISIBLE_CHARS[Math.floor(Math.random() * INVISIBLE_CHARS.length)];
+                    }
+                    if (spacesRate > 0 && Math.random() < spacesRate) {
+                        out += ' ';
+                    }
+                    if (lettersRate > 0 && Math.random() < lettersRate && /[a-zA-Z0-9]/.test(c)) {
+                        out += latinLetters[Math.floor(Math.random() * latinLetters.length)];
+                    }
+                }
+            }
+
+            previewEl.textContent = out;
+        }
+
+        function loadConfig(cb) {
+            fetch('/api/masking/config')
+                .then(res => res.json())
+                .then(cfg => {
+                    currentConfig = cfg;
+                    renderConfig(cfg);
+                    if (cb) cb();
+                })
+                .catch(() => {
+                    if (cb) cb();
+                });
+        }
+
+        function renderConfig(cfg) {
+            if (!cfg) return;
+
+            const masterToggle = document.getElementById('mask-master-toggle');
+            const masterLabel = document.getElementById('master-status-label');
+            const navDot = document.getElementById('nav-mask-dot');
+            const isMaster = !!cfg.master_enabled;
+            if (masterToggle) masterToggle.checked = isMaster;
+            if (masterLabel) masterLabel.textContent = isMaster ? 'ON' : 'OFF';
+            if (navDot) navDot.classList.toggle('active', isMaster);
+
+            const tags = cfg.tags || {};
+            const setVal = (id, val) => { const el = document.getElementById(id); if (el) el.value = val || ''; };
+            const setCheck = (id, val) => { const el = document.getElementById(id); if (el) el.checked = !!val; };
+
+            setVal('tag-user', tags.USER || '[USER]');
+            setVal('tag-system', tags.SYSTEM || '[SYSTEM]');
+            setVal('tag-tools', tags.TOOLS || '[TOOLS]');
+            setVal('tag-tool-results', tags.TOOL_RESULTS || '[TOOL RESULTS]');
+            setVal('tag-assistant', tags.ASSISTANT || '[ASSISTANT]');
+
+            const repl = cfg.replacements || {};
+            setCheck('repl-toggle', repl.enabled);
+            const replRulesText = document.getElementById('repl-rules-text');
+            if (replRulesText) {
+                const items = repl.items || [];
+                replRulesText.value = items.map(it => `${it.from} => ${it.to}`).join('\n');
+            }
+            const badgeRepl = document.getElementById('badge-repl-status');
+            if (badgeRepl) {
+                badgeRepl.textContent = repl.enabled ? 'ON' : 'OFF';
+                badgeRepl.classList.toggle('active', !!repl.enabled);
+            }
+
+            const homo = cfg.homoglyphs || {};
+            setCheck('homo-toggle', homo.enabled);
+            const hRate = Math.round((homo.rate || 0.2) * 100);
+            setVal('homo-rate', hRate);
+            const homoRateVal = document.getElementById('homo-rate-val');
+            if (homoRateVal) homoRateVal.textContent = hRate + '%';
+            const badgeHomo = document.getElementById('badge-homo-status');
+            if (badgeHomo) {
+                badgeHomo.textContent = homo.enabled ? hRate + '%' : 'OFF';
+                badgeHomo.classList.toggle('active', !!homo.enabled);
+            }
+
+            const noise = cfg.noise || {};
+            setCheck('noise-toggle', noise.enabled);
+            setCheck('noise-invisible', noise.invisible_chars !== false);
+            setCheck('noise-spaces-toggle', noise.spaces_enabled);
+            const sRate = Math.round((noise.spaces_rate || 0.05) * 100);
+            setVal('noise-spaces-rate', sRate);
+            const spacesVal = document.getElementById('noise-spaces-val');
+            if (spacesVal) spacesVal.textContent = sRate + '%';
+
+            setCheck('noise-letters-toggle', noise.letters_enabled);
+            const lRate = Math.round((noise.letters_rate || 0.03) * 100);
+            setVal('noise-letters-rate', lRate);
+            const lettersVal = document.getElementById('noise-letters-val');
+            if (lettersVal) lettersVal.textContent = lRate + '%';
+
+            const badgeNoise = document.getElementById('badge-noise-status');
+            if (badgeNoise) {
+                badgeNoise.textContent = noise.enabled ? 'ON' : 'OFF';
+                badgeNoise.classList.toggle('active', !!noise.enabled);
+            }
+
+            const custom = cfg.custom_instructions || {};
+            setCheck('custom-inst-toggle', custom.enabled);
+            setCheck('custom-inst-mask-toggle', custom.apply_masking);
+            setVal('custom-inst-text', custom.text || '');
+            const badgeCustom = document.getElementById('badge-custom-status');
+            if (badgeCustom) {
+                badgeCustom.textContent = custom.enabled ? 'ON' : 'OFF';
+                badgeCustom.classList.toggle('active', !!custom.enabled);
+            }
+
+            const dir = cfg.directives || {};
+            setCheck('dir-mask-tools', dir.mask_tool_instructions !== false);
+            setCheck('dir-mask-sys', dir.mask_system_prompts !== false);
+            setCheck('dir-mask-seeds', dir.mask_context_seeds !== false);
+
+            updateMainPreview();
+        }
+
+        function collectFormConfig() {
+            const getVal = (id, def) => { const el = document.getElementById(id); return el ? el.value : def; };
+            const getCheck = (id) => { const el = document.getElementById(id); return el ? el.checked : false; };
+
+            const replRulesText = getVal('repl-rules-text', '');
+            const items = [];
+            for (let line of replRulesText.split('\n')) {
+                line = line.trim();
+                if (!line) continue;
+                let parts = [];
+                if (line.includes('=>')) parts = line.split('=>');
+                else if (line.includes('->')) parts = line.split('->');
+                else if (line.includes('=')) parts = line.split('=');
+                if (parts.length >= 2) {
+                    const src = parts[0].trim();
+                    const dst = parts[1].trim();
+                    if (src) items.push({ from: src, to: dst });
+                }
+            }
+
+            return {
+                master_enabled: getCheck('mask-master-toggle'),
+                tags: {
+                    USER: getVal('tag-user', '[USER]'),
+                    SYSTEM: getVal('tag-system', '[SYSTEM]'),
+                    TOOLS: getVal('tag-tools', '[TOOLS]'),
+                    TOOL_RESULTS: getVal('tag-tool-results', '[TOOL RESULTS]'),
+                    ASSISTANT: getVal('tag-assistant', '[ASSISTANT]')
+                },
+                replacements: {
+                    enabled: getCheck('repl-toggle'),
+                    items: items
+                },
+                homoglyphs: {
+                    enabled: getCheck('homo-toggle'),
+                    rate: (parseInt(getVal('homo-rate', '20'), 10) || 20) / 100
+                },
+                noise: {
+                    enabled: getCheck('noise-toggle'),
+                    invisible_chars: getCheck('noise-invisible'),
+                    spaces_enabled: getCheck('noise-spaces-toggle'),
+                    spaces_rate: (parseInt(getVal('noise-spaces-rate', '5'), 10) || 5) / 100,
+                    letters_enabled: getCheck('noise-letters-toggle'),
+                    letters_rate: (parseInt(getVal('noise-letters-rate', '3'), 10) || 3) / 100
+                },
+                custom_instructions: {
+                    enabled: getCheck('custom-inst-toggle'),
+                    apply_masking: getCheck('custom-inst-mask-toggle'),
+                    text: getVal('custom-inst-text', '')
+                },
+                directives: {
+                    mask_tool_instructions: getCheck('dir-mask-tools'),
+                    mask_system_prompts: getCheck('dir-mask-sys'),
+                    mask_context_seeds: getCheck('dir-mask-seeds')
+                }
+            };
+        }
+
+        function saveConfig() {
+            const payload = collectFormConfig();
+            const saveBtn = document.getElementById('mask-save-btn');
+            const statusMsg = document.getElementById('mask-status-msg');
+
+            if (saveBtn) {
+                saveBtn.disabled = true;
+                saveBtn.textContent = 'Saving...';
+            }
+
+            fetch('/api/masking/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+                .then(res => res.json())
+                .then(res => {
+                    if (res.config) {
+                        currentConfig = res.config;
+                        renderConfig(res.config);
+                    }
+                    if (statusMsg) {
+                        statusMsg.textContent = 'Saved';
+                        statusMsg.classList.add('visible');
+                        setTimeout(() => statusMsg.classList.remove('visible'), 2000);
+                    }
+                    if (saveBtn) {
+                        saveBtn.textContent = 'Saved';
+                        setTimeout(() => {
+                            saveBtn.disabled = false;
+                            saveBtn.textContent = 'Save Changes';
+                        }, 1000);
+                    }
+                })
+                .catch(err => {
+                    if (statusMsg) {
+                        statusMsg.textContent = 'Failed';
+                        statusMsg.classList.add('visible');
+                        setTimeout(() => statusMsg.classList.remove('visible'), 2000);
+                    }
+                    if (saveBtn) {
+                        saveBtn.disabled = false;
+                        saveBtn.textContent = 'Save Changes';
+                    }
+                });
+        }
+
+        function resetConfig() {
+            const resetBtn = document.getElementById('mask-reset-btn');
+            const statusMsg = document.getElementById('mask-status-msg');
+
+            if (resetBtn) {
+                resetBtn.disabled = true;
+            }
+
+            fetch('/api/masking/reset', {
+                method: 'POST'
+            })
+                .then(res => res.json())
+                .then(res => {
+                    if (res.config) {
+                        currentConfig = res.config;
+                        renderConfig(res.config);
+                    }
+                    if (statusMsg) {
+                        statusMsg.textContent = 'Reset to defaults';
+                        statusMsg.classList.add('visible');
+                        setTimeout(() => statusMsg.classList.remove('visible'), 2000);
+                    }
+                    if (resetBtn) {
+                        resetBtn.disabled = false;
+                    }
+                })
+                .catch(err => {
+                    if (statusMsg) {
+                        statusMsg.textContent = 'Reset failed';
+                        statusMsg.classList.add('visible');
+                        setTimeout(() => statusMsg.classList.remove('visible'), 2000);
+                    }
+                    if (resetBtn) {
+                        resetBtn.disabled = false;
+                    }
+                });
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', init);
+        } else {
+            init();
+        }
+    })();
+    </script>
+    {% endblock %}
 </body>
 </html>
