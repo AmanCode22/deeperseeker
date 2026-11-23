@@ -74,7 +74,7 @@ packaging==26.3
     #   wheel
 patchright==1.64.4
     # via -r requirements.in
-pip-tools==7.6.2
+pip-tools==7.7.0
     # via -r requirements-dev.in
 pluggy==1.6.0
     # via pytest
