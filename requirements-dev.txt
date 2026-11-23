@@ -106,7 +106,7 @@ python-dotenv==1.2.4
     # via -r requirements.in
 python-multipart==0.0.33
     # via -r requirements.in
-ruff==0.17.4
+ruff==0.17.6
     # via -r requirements-dev.in
 starlette==1.7.0
     # via fastapi
