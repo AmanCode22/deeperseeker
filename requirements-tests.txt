@@ -30,7 +30,7 @@ curl-cffi==0.17.0
     # via -r requirements.in
 deepseek-tokenizer==0.3.0
     # via -r requirements.in
-fastapi==0.163.1
+fastapi==0.165.0
     # via -r requirements.in
 frozenlist==1.8.0
     # via
