@@ -1,4 +1,8 @@
 # DeeperSeeker
+
+## Archiving the repo
+Due to restrictions and limits applied on deepseek after November start it's very difficult to maintain this reverse proxy so I am archiving it.
+
 ## Important Update [See Issue https://github.com/AmanCode22/deeperseeker/issues/106 , https://github.com/AmanCode22/deeperseeker/issues/105 & PR https://github.com/AmanCode22/deeperseeker/pull/107]
 Deepseek has brutally being rolling anti bot and anti reverse engineer code constantly and currently we are working to fix it as soon as possible. For tracking development u can track the 2 issue and a pr mentioned above. If u also wanna contribute u are also welcome . First discuss in https://github.com/AmanCode22/deeperseeker/issues/106 then work as u might get advice from me[ [@AmanCode22](https://github.com/amancode22) ], [@1515asd](https://github.com/1515asd) and [@artyom08-dev](https://github.com/artyom08-dev).
 
